@@ -1,0 +1,8 @@
+# Accounts are Claude config dirs (CLAUDE_CONFIG_DIR). fallback names the next
+# account to use when this one is marked limited (`curia limit <name>`).
+
+[accounts.main]
+config_dir = "~/.claude"
+plan = ""
+purpose = ""
+fallback = ""

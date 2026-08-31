@@ -1,0 +1,13 @@
+# Seats. kind = office | crew | fleet. Jurisdictions are concerns, not repos.
+# Fleet seats carry managed_by and are never launched directly.
+# pronouns are declared by the seat itself; record them here when it does.
+
+[seats.example_office]
+title = "Example"
+kind = "office"
+model = "claude-fable-5"
+account = "main"
+home = "estate"
+pronouns = ""
+summary = "What this office does, in one line."
+active = false

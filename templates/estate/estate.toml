@@ -1,0 +1,7 @@
+name = "{{ESTATE}}"
+principal = "{{PRINCIPAL}}"
+mechanism = "{{MECHANISM}}"
+naming_family = "choose one per estate so a seat name is never ambiguous"
+created = "YYYY-MM-DD"
+# Words the mechanism repo must never contain. The fence test reads these.
+denylist = ["{{ESTATE}}", "{{PRINCIPAL}}"]

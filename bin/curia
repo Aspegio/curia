@@ -1,0 +1,801 @@
+#!/usr/bin/env python3
+"""curia - the mechanism for a seat-based agent estate.
+
+Mechanism, not law. Nothing in this file may name a client, a product, a
+person, or a number that belongs to one. Estates (the law) live elsewhere:
+<workspace>/curia/{estate,roster,repos,accounts}.toml plus seats/ and brain/.
+
+Vocabulary
+  estate    one client's workspace; its curia/ directory holds roster and law
+  seat      a named, persistent role with memory (handoff, laurels, charter)
+  session   one waking of a seat; a day in its life
+  office    a standing seat with a function (runs on a schedule or on demand)
+  crew      a seat with a jurisdiction, spoken to directly by the principal
+  fleet     seats dispatched by an office, never launched directly
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG_DIR = HOME / ".config" / "curia"
+ESTATES_FILE = CONFIG_DIR / "estates.toml"
+MECHANISM_DIR = Path(__file__).resolve().parent.parent
+NOW = dt.datetime.now(dt.timezone.utc)
+STAMP = NOW.strftime("%Y-%m-%dT%H%MZ")
+TODAY = NOW.strftime("%Y-%m-%d")
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(f"curia: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_toml(path: Path) -> dict:
+    if not path.exists():
+        die(f"missing {path}")
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def read(path: Path, default: str = "") -> str:
+    return path.read_text() if path.exists() else default
+
+
+def parse_iso(s: str) -> dt.datetime | None:
+    if not s:
+        return None
+    try:
+        d = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
+
+
+def age(s: str) -> str:
+    d = parse_iso(s)
+    if not d:
+        return "?"
+    h = (NOW - d).total_seconds() / 3600
+    return f"{h:.0f}h" if h < 48 else f"{h/24:.0f}d"
+
+
+# ----------------------------------------------------------------- estate
+
+class Estate:
+    def __init__(self, curia_dir: Path):
+        self.dir = curia_dir.resolve()
+        self.root = self.dir.parent
+        self.meta = load_toml(self.dir / "estate.toml")
+        self.roster = load_toml(self.dir / "roster.toml").get("seats", {})
+        self.repos = load_toml(self.dir / "repos.toml").get("repos", {})
+        self.accounts = load_toml(self.dir / "accounts.toml").get("accounts", {})
+
+    @property
+    def name(self) -> str:
+        return self.meta.get("name", self.root.name)
+
+    @property
+    def principal(self) -> str:
+        return self.meta.get("principal", "the principal")
+
+    def seat(self, name: str) -> tuple[str, dict]:
+        for k, v in self.roster.items():
+            if k.lower() == name.lower():
+                return k, v
+        die(f"no seat '{name}' in {self.dir / 'roster.toml'}")
+
+    def seat_dir(self, name: str) -> Path:
+        return self.dir / "seats" / name.lower()
+
+    def seat_by_role(self, role: str) -> tuple[str, dict]:
+        for k, v in self.roster.items():
+            if v.get("role") == role:
+                return k, v
+        return self.seat(role)  # fall back: a seat named after its role
+
+    def repo(self, name: str) -> tuple[str, dict]:
+        for k, v in self.repos.items():
+            if k.lower() == name.lower():
+                return k, v
+        die(f"no repo '{name}' in {self.dir / 'repos.toml'}")
+
+    def repo_path(self, name: str) -> Path:
+        _, r = self.repo(name)
+        return (self.root / r["path"]).resolve()
+
+
+def find_estate(explicit: str | None) -> Estate:
+    if explicit:
+        p = Path(explicit).expanduser()
+        return Estate(p if p.name == "curia" else p / "curia")
+    if os.environ.get("CURIA_ESTATE"):
+        return Estate(Path(os.environ["CURIA_ESTATE"]))
+    cwd = Path.cwd().resolve()
+    for p in (cwd, *cwd.parents):
+        if p.name == "curia" and (p / "estate.toml").exists():
+            return Estate(p)
+        if (p / "curia" / "estate.toml").exists():
+            return Estate(p / "curia")
+    if ESTATES_FILE.exists():
+        estates = load_toml(ESTATES_FILE).get("estates", {})
+        for _, e in estates.items():
+            if e.get("default"):
+                return Estate(Path(e["path"]).expanduser())
+        if len(estates) == 1:
+            return Estate(Path(next(iter(estates.values()))["path"]).expanduser())
+    die("no estate found: pass --estate, set CURIA_ESTATE, run inside one, "
+        f"or register a default in {ESTATES_FILE}")
+
+
+# --------------------------------------------------------------- accounts
+
+def account_dir(est: Estate, acct: str) -> Path:
+    if acct not in est.accounts:
+        die(f"no account '{acct}' in accounts.toml")
+    return Path(os.path.expanduser(est.accounts[acct]["config_dir"]))
+
+
+def limit_marker(est: Estate, acct: str) -> Path:
+    return account_dir(est, acct) / "curia-limit-until"
+
+
+def account_limited(est: Estate, acct: str) -> dt.datetime | None:
+    m = limit_marker(est, acct)
+    if not m.exists():
+        return None
+    until = parse_iso(m.read_text().strip())
+    if until and until > NOW:
+        return until
+    m.unlink(missing_ok=True)
+    return None
+
+
+def resolve_account(est: Estate, acct: str) -> tuple[str, Path]:
+    seen: list[str] = []
+    cur = acct
+    while cur and cur not in seen:
+        seen.append(cur)
+        until = account_limited(est, cur)
+        if until is None:
+            return cur, account_dir(est, cur)
+        print(f"curia: account '{cur}' limited until {until:%Y-%m-%d %H:%M}Z, "
+              f"trying fallback", file=sys.stderr)
+        cur = est.accounts[cur].get("fallback", "")
+    die(f"every account in the chain {seen} is limited")
+
+
+# ------------------------------------------------------------------ prime
+
+def session_number(sd: Path) -> int:
+    log = sd / "sessions.log"
+    return (sum(1 for line in read(log).splitlines() if line.startswith("start ")) + 1
+            if log.exists() else 1)
+
+
+def roster_table(est: Estate, exclude: str) -> str:
+    rows = []
+    for k, v in est.roster.items():
+        if k.lower() == exclude.lower():
+            continue
+        what = "; ".join(v.get("jurisdiction", [])) or v.get("summary", "")
+        rows.append(f"| {v.get('title', k)} | {v.get('kind', '?')} | {what} |")
+    return "| Seat | Kind | Jurisdiction or charter |\n|---|---|---|\n" + "\n".join(rows)
+
+
+def repos_table(est: Estate) -> str:
+    rows = []
+    for k, r in est.repos.items():
+        rows.append(f"| {k} | `{r['path']}` | {r.get('integration_branch', '-')} -> "
+                    f"{r.get('release_branch', '-')} | `{r.get('gate', '-')}` | "
+                    f"{', '.join(r.get('beads_prefix', []))} |")
+    return ("| Repo | Path (from estate root) | Integration -> release | Gate | Beads |\n"
+            "|---|---|---|---|---|\n" + "\n".join(rows))
+
+
+def build_prime(est: Estate, seat: str) -> str:
+    name, s = est.seat(seat)
+    sd = est.seat_dir(name)
+    title = s.get("title", name)
+    n = session_number(sd)
+    pron = s.get("pronouns") or "not yet declared (you may declare them; the roster records it)"
+    parts = [
+        "# Curia seat prime",
+        f"You are **{title}**, a persistent seat in the {est.name} estate. "
+        f"This is your session {n}, {TODAY}. The principal is {est.principal}. "
+        f"Seats outlive sessions: what you write in your handoff is what you wake up to.",
+        f"Kind: {s.get('kind', '?')}. Model: {s.get('model', '?')}. Pronouns: {pron}.",
+    ]
+    if s.get("jurisdiction"):
+        parts.append("Your jurisdiction (concerns, across every repo in the estate):\n" +
+                     "\n".join(f"- {j}" for j in s["jurisdiction"]))
+    parts.append("## Colleagues\n" + roster_table(est, name))
+    parts.append("## Repos in the estate\n" + repos_table(est) +
+                 "\n\nRead a repo's own CLAUDE.md before touching it; that file is law there.")
+    charter = read(sd / "charter.md").strip()
+    if charter:
+        parts.append("## Your charter\n" + charter)
+    handoff = read(sd / "handoff.md").strip()
+    parts.append("## Your last handoff\n" + (handoff or "_No handoff yet. This is your first waking._"))
+    laurels = read(sd / "laurels.md").strip()
+    if laurels and not laurels.startswith("_"):
+        parts.append("## Laurels\n" + laurels)
+    rules = read(est.dir / "house-rules.md").strip()
+    if rules:
+        parts.append("## House rules\n" + rules)
+    parts.append(f"Estate directory: `{est.dir}`. Your seat directory: `{sd}`. "
+                 "When the session should end, use /handoff, not /exit.")
+    return "\n\n".join(parts) + "\n"
+
+
+def log_session(sd: Path, event: str, detail: str = "") -> None:
+    sd.mkdir(parents=True, exist_ok=True)
+    with open(sd / "sessions.log", "a") as f:
+        f.write(f"{event} {NOW.isoformat(timespec='seconds')} {detail}\n".rstrip() + "\n")
+
+
+# --------------------------------------------------------------- commands
+
+def cmd_roster(a) -> None:
+    est = find_estate(a.estate)
+    print(f"{est.name} estate, principal {est.principal}, {len(est.roster)} seats\n")
+    for k, v in est.roster.items():
+        extra = "; ".join(v.get("jurisdiction", [])) or v.get("summary", "")
+        flag = "" if v.get("active", True) else " (reserved)"
+        print(f"  {v.get('title', k):<12} {v.get('kind', '?'):<7} {v.get('model', '?'):<16} "
+              f"{v.get('account', '?'):<9}{flag}  {extra}")
+
+
+def cmd_repos(a) -> None:
+    est = find_estate(a.estate)
+    for k, r in est.repos.items():
+        p = est.repo_path(k)
+        beads = p / ".beads" / "issues.jsonl"
+        state = "ok" if p.exists() else "MISSING"
+        b = f"{sum(1 for _ in open(beads))} beads" if beads.exists() else "no beads export"
+        print(f"  {k:<12} {state:<8} {r.get('integration_branch', '-'):<12} {b:<18} {p}")
+
+
+def cmd_accounts(a) -> None:
+    est = find_estate(a.estate)
+    for k, v in est.accounts.items():
+        d = account_dir(est, k)
+        until = account_limited(est, k)
+        state = f"limited until {until:%Y-%m-%d %H:%M}Z" if until else ("ok" if d.exists() else "NO CONFIG DIR")
+        print(f"  {k:<10} {v.get('plan', ''):<10} fallback={v.get('fallback', '-'):<10} {state:<28} {d}")
+
+
+def cmd_check(a) -> None:
+    est = find_estate(a.estate)
+    problems: list[str] = []
+    for k, v in est.roster.items():
+        if v.get("account") not in est.accounts:
+            problems.append(f"seat {k}: account '{v.get('account')}' not in accounts.toml")
+        if v.get("kind") == "fleet" and v.get("managed_by") not in est.roster:
+            problems.append(f"fleet seat {k}: managed_by '{v.get('managed_by')}' is not a seat")
+        if v.get("home", "estate") != "estate" and v["home"] not in est.repos:
+            problems.append(f"seat {k}: home '{v['home']}' is not a repo")
+        sd = est.seat_dir(k)
+        if not (sd / "charter.md").exists():
+            problems.append(f"seat {k}: no charter.md")
+    for k, r in est.repos.items():
+        p = est.repo_path(k)
+        if not p.exists():
+            problems.append(f"repo {k}: path {p} missing")
+        elif not (p / ".beads" / "issues.jsonl").exists():
+            problems.append(f"repo {k}: no .beads/issues.jsonl export (lictor is blind here)")
+    for k in est.accounts:
+        if not account_dir(est, k).exists():
+            problems.append(f"account {k}: config dir {account_dir(est, k)} missing")
+    for prompt in ("censor.md", "lictor-cloud.md"):
+        if not (est.dir / "prompts" / prompt).exists():
+            problems.append(f"prompts/{prompt} missing")
+    if not shutil.which("claude"):
+        problems.append("claude not on PATH")
+    if not shutil.which("gh"):
+        problems.append("gh not on PATH (lictor and censor need it for PRs and runs)")
+    if problems:
+        print("\n".join(f"  ! {p}" for p in problems))
+        sys.exit(1)
+    print(f"  {est.name}: roster, repos, accounts and prompts are consistent")
+
+
+def cmd_prime(a) -> None:
+    est = find_estate(a.estate)
+    print(build_prime(est, a.seat))
+
+
+def cmd_launch(a) -> None:
+    est = find_estate(a.estate)
+    name, s = est.seat(a.seat)
+    if s.get("kind") == "fleet":
+        die(f"{name} is a fleet seat; it is dispatched by {s.get('managed_by', 'its office')}, "
+            "not launched directly")
+    if not s.get("active", True):
+        die(f"{name} is reserved (active = false in roster.toml)")
+    title = s.get("title", name)
+    sd = est.seat_dir(name)
+    home = est.root if s.get("home", "estate") == "estate" else est.repo_path(s["home"])
+    if a.repo:
+        home = est.repo_path(a.repo)
+    if getattr(a, "print_cmd", False):
+        acct, cfg = resolve_account(est, s.get("account", ""))
+        print("CLAUDE_CONFIG_DIR=" + str(cfg) + " CURIA_SEAT=" + name + " cwd=" + str(home))
+        print("claude --name " + shlex.quote(title) + " --model " + s.get("model", "?") +
+              " --append-system-prompt <prime:" + str(len(build_prime(est, name))) + " chars> " +
+              " ".join(shlex.quote(x) for x in (a.claude_args or [])))
+        return
+    if a.tmux:
+        inner = ["curia", "launch", name, "--estate", str(est.dir)]
+        if a.repo:
+            inner += ["--repo", a.repo]
+        if a.loop:
+            inner.append("--loop")
+        if a.claude_args:
+            inner += ["--", *a.claude_args]
+        subprocess.check_call(["tmux", "new-window", "-n", title, "-c", str(home), shlex.join(inner)])
+        print(f"curia: {title} opened in tmux window '{title}'")
+        return
+    while True:
+        acct, cfg = resolve_account(est, s.get("account", ""))
+        env = dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg), CURIA_SEAT=name, CURIA_ESTATE=str(est.dir))
+        cmd = ["claude", "--name", title, "--append-system-prompt", build_prime(est, name)]
+        if s.get("model"):
+            cmd += ["--model", s["model"]]
+        cmd += list(a.claude_args or [])
+        log_session(sd, "start", f"account={acct} cwd={home}")
+        print(f"curia: waking {title} (session {session_number(sd) - 1}, account {acct}, in {home})")
+        rc = subprocess.call(cmd, cwd=home, env=env)
+        log_session(sd, "end", f"rc={rc}")
+        restart = sd / "RESTART"
+        if a.loop and restart.exists():
+            restart.unlink()
+            print(f"curia: {title} asked to be woken again; relaunching with the new handoff")
+            continue
+        break
+
+
+def cmd_run(a) -> None:
+    """Headless run of an office seat with a prompt file (claude -p)."""
+    est = find_estate(a.estate)
+    name, s = est.seat(a.seat)
+    prompt_path = Path(a.prompt).expanduser()
+    if not prompt_path.is_absolute():
+        prompt_path = est.dir / "prompts" / prompt_path
+    prompt = read(prompt_path)
+    if not prompt:
+        die(f"empty or missing prompt {prompt_path}")
+    subs = {"estate": est.name, "principal": est.principal, "date": TODAY, "seat": s.get("title", name)}
+    if a.repo:
+        rk, r = est.repo(a.repo)
+        subs.update({"repo": rk, **{k: str(v) for k, v in r.items()}})
+    subs.update(dict(kv.split("=", 1) for kv in (a.set or [])))
+    prompt = prompt.format_map(_Safe(subs))
+    cwd = est.repo_path(a.repo) if a.repo else est.root
+    out = run_headless(est, name, s, prompt, cwd, a.timeout, a.skip_permissions)
+    print(out)
+
+
+class _Safe(dict):
+    def __missing__(self, k):
+        return "{" + k + "}"
+
+
+def run_headless(est: Estate, name: str, s: dict, prompt: str, cwd: Path,
+                 timeout: int, skip_permissions: bool) -> str:
+    acct, cfg = resolve_account(est, s.get("account", ""))
+    env = dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg), CURIA_SEAT=name, CURIA_ESTATE=str(est.dir))
+    full = build_prime(est, name) + "\n\n---\n\n" + prompt
+    cmd = ["claude", "-p", full, "--output-format", "text"]
+    if s.get("model"):
+        cmd += ["--model", s["model"]]
+    if skip_permissions:
+        cmd.append("--dangerously-skip-permissions")
+    else:
+        cmd += ["--allowedTools", ",".join(s.get("tools", ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Agent"]))]
+    sd = est.seat_dir(name)
+    log_session(sd, "start", f"headless account={acct} cwd={cwd}")
+    logdir = est.dir / "brain" / name.lower()
+    logdir.mkdir(parents=True, exist_ok=True)
+    try:
+        p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+        out, rc = p.stdout + (("\n[stderr]\n" + p.stderr) if p.stderr.strip() else ""), p.returncode
+    except subprocess.TimeoutExpired as e:
+        out, rc = f"[timeout after {timeout}s]\n{(e.stdout or b'').decode() if isinstance(e.stdout, bytes) else e.stdout or ''}", 124
+    log_session(sd, "end", f"rc={rc}")
+    (logdir / f"{STAMP}-{cwd.name}.log").write_text(out)
+    if "usage limit" in out.lower() or "rate limit" in out.lower():
+        print(f"curia: output mentions a limit; consider `curia limit {acct} --hours 5`", file=sys.stderr)
+    return out
+
+
+def cmd_handoff(a) -> None:
+    est = find_estate(a.estate)
+    name, s = est.seat(a.seat)
+    sd = est.seat_dir(name)
+    sd.mkdir(parents=True, exist_ok=True)
+    hp = sd / "handoff.md"
+    if a.begin:
+        prev = read(hp).strip()
+        if prev and not prev.startswith("_No handoff yet"):
+            hist = sd / "history"
+            hist.mkdir(exist_ok=True)
+            shutil.move(hp, hist / f"{STAMP}.md")
+        print(f"Write your handoff to: {hp}\nTemplate: {MECHANISM_DIR / 'templates' / 'handoff.md'}")
+        return
+    if a.done:
+        if not hp.exists() or len(read(hp).strip()) < 40:
+            die("handoff.md is missing or too short; write it before --done")
+        (sd / "RESTART").touch()
+        log_session(sd, "handoff", "")
+        print(f"Handoff recorded for {s.get('title', name)}. The session may end now; "
+              f"`curia launch {name.lower()}` wakes the seat with it (the --loop launcher does so on exit).")
+        return
+    print(read(hp) or "_No handoff yet._")
+
+
+def cmd_laurel(a) -> None:
+    est = find_estate(a.estate)
+    name, _ = est.seat(a.seat)
+    sd = est.seat_dir(name)
+    sd.mkdir(parents=True, exist_ok=True)
+    lp = sd / "laurels.md"
+    existing = read(lp)
+    if existing.strip().startswith("_"):
+        existing = ""
+    with open(lp, "w") as f:
+        f.write(existing.rstrip() + ("\n" if existing.strip() else "") + f"- {TODAY}: {a.text}\n")
+    print(f"laurel recorded for {name}")
+
+
+def cmd_limit(a) -> None:
+    est = find_estate(a.estate)
+    acct = a.account
+    if acct == "current":
+        cfg = Path(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude"))).resolve()
+        matches = [k for k in est.accounts if account_dir(est, k).resolve() == cfg]
+        if not matches:
+            die(f"no account in accounts.toml has config_dir {cfg}")
+        acct = matches[0]
+        print(f"curia: current account is '{acct}'")
+    m = limit_marker(est, acct)
+    if a.clear:
+        m.unlink(missing_ok=True)
+        print(f"{acct}: limit cleared")
+        return
+    until = NOW + dt.timedelta(hours=a.hours) if a.hours else parse_iso(a.until or "")
+    if not until:
+        die("give --hours N or --until ISO")
+    m.write_text(until.isoformat())
+    print(f"{acct}: marked limited until {until:%Y-%m-%d %H:%M} UTC; launches fall back to "
+          f"'{est.accounts[acct].get('fallback', '-')}'")
+
+
+# ------------------------------------------------------------------ lictor
+
+def gh_json(args: list[str]) -> list | dict | None:
+    if not shutil.which("gh"):
+        return None
+    try:
+        p = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return None
+    if p.returncode != 0:
+        return None
+    try:
+        return json.loads(p.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def repo_slug(remote: str) -> str:
+    return remote.rstrip("/").removesuffix(".git").split("github.com/")[-1]
+
+
+def lictor_facts(est: Estate, stale_days: int, pr_hours: int) -> str:
+    out = [f"# Lictor report, {est.name} estate, {NOW:%Y-%m-%d %H:%M}Z",
+           "",
+           "The Lictor reads; it never writes beads. Every fact below is only as fresh as the "
+           "last `bd export` in each repo, and it stays quiet about anything younger than the "
+           "thresholds (in_progress stale after "
+           f"{stale_days}d, drafts silent after {pr_hours}h).", ""]
+    for k, r in est.repos.items():
+        p = est.repo_path(k)
+        out.append(f"## {k}")
+        beads = p / ".beads" / "issues.jsonl"
+        if not beads.exists():
+            out.append("- no beads export; blind here\n")
+            continue
+        issues = [json.loads(l) for l in open(beads) if l.strip()]
+        status = {i["id"]: i.get("status") for i in issues}
+        newest = max((i.get("updated_at", "") for i in issues), default="")
+        counts: dict[str, int] = {}
+        for i in issues:
+            counts[i.get("status", "?")] = counts.get(i.get("status", "?"), 0) + 1
+        out.append(f"- export newest update {age(newest)} ago; " +
+                   ", ".join(f"{s} {n}" for s, n in sorted(counts.items())))
+        stale = [i for i in issues if i.get("status") == "in_progress"
+                 and (NOW - (parse_iso(i.get("updated_at", "")) or NOW)).days >= stale_days]
+        for i in stale:
+            out.append(f"- STALE in_progress {i['id']} ({age(i.get('updated_at', ''))}): {i.get('title', '')}")
+        for i in issues:
+            if i.get("status") != "blocked":
+                continue
+            blockers = [d["depends_on_id"] for d in i.get("dependencies", []) if d.get("type") == "blocks"]
+            if not blockers:
+                out.append(f"- BLOCKED with no blocker recorded {i['id']}: {i.get('title', '')} "
+                           "(flip to open, or wire the real blocker)")
+            elif all(status.get(b) == "closed" for b in blockers):
+                out.append(f"- UNBLOCKED but still marked blocked {i['id']}: {i.get('title', '')} "
+                           f"(blockers {', '.join(blockers)} all closed)")
+        if r.get("forge") == "github" and r.get("remote"):
+            slug = repo_slug(r["remote"])
+            prs = gh_json(["pr", "list", "--repo", slug, "--state", "open", "--limit", "50",
+                           "--json", "number,title,isDraft,updatedAt,url,author"])
+            if prs is None:
+                out.append("- gh unavailable or unauthorised; PRs not checked")
+            else:
+                out.append(f"- open PRs: {len(prs)} ({sum(1 for x in prs if x['isDraft'])} drafts)")
+                for x in prs:
+                    hrs = (NOW - (parse_iso(x["updatedAt"]) or NOW)).total_seconds() / 3600
+                    if hrs >= pr_hours:
+                        kind = "draft" if x["isDraft"] else "PR"
+                        out.append(f"- SILENT {kind} #{x['number']} ({hrs:.0f}h): {x['title']} {x['url']}")
+            if r.get("integration_branch"):
+                runs = gh_json(["run", "list", "--repo", slug, "--branch", r["integration_branch"],
+                                "--limit", "1", "--json", "conclusion,status,url,createdAt"])
+                if runs:
+                    x = runs[0]
+                    out.append(f"- {r['integration_branch']} last run: {x.get('conclusion') or x.get('status')} "
+                               f"({age(x.get('createdAt', ''))} ago) {x.get('url', '')}")
+        out.append("")
+    return "\n".join(out)
+
+
+def cmd_lictor(a) -> None:
+    est = find_estate(a.estate)
+    report = lictor_facts(est, a.stale_days, a.pr_hours)
+    if a.write:
+        d = est.dir / "brain" / "lictor"
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"{STAMP}.md"
+        path.write_text(report)
+        print(f"written {path}")
+    else:
+        print(report)
+
+
+# ------------------------------------------------------------------ censor
+
+def cmd_censor(a) -> None:
+    est = find_estate(a.estate)
+    name, s = est.seat_by_role("censor")
+    prompt_t = read(est.dir / "prompts" / "censor.md")
+    if not prompt_t:
+        die("prompts/censor.md missing")
+    summary = [f"# Censor report, {est.name} estate, {TODAY}" + (" (dry run)" if a.dry_run else ""), ""]
+    woke = 0
+    for k, r in est.repos.items():
+        b = r.get("integration_branch")
+        if not b or r.get("forge") != "github" or not r.get("gate"):
+            continue
+        slug = repo_slug(r["remote"])
+        runs = gh_json(["run", "list", "--repo", slug, "--branch", b, "--limit", "1",
+                        "--json", "conclusion,status,url,createdAt,headSha"])
+        if not runs:
+            summary.append(f"- {k}: no runs found on {b} (or gh unavailable)")
+            continue
+        x = runs[0]
+        concl = x.get("conclusion") or x.get("status") or "?"
+        line = f"- {k} `{b}`: **{concl}** ({age(x.get('createdAt', ''))} ago) {x.get('url', '')}"
+        if concl == "success" or a.dry_run:
+            summary.append(line)
+            continue
+        woke += 1
+        summary.append(line + " -> Censor woke")
+        prompt = prompt_t.format_map(_Safe({
+            "repo": k, "branch": b, "run_url": x.get("url", ""), "conclusion": concl,
+            "head_sha": x.get("headSha", ""), "date": TODAY,
+            **{kk: str(vv) for kk, vv in r.items()}}))
+        out = run_headless(est, name, s, prompt, est.repo_path(k), a.timeout, a.skip_permissions)
+        summary.append("\n<details><summary>Censor transcript, " + k + "</summary>\n\n```\n" +
+                       out[-6000:] + "\n```\n</details>\n")
+    summary.append("")
+    summary.append(f"Censor woke on {woke} repo(s). Reports are committed by hand or by the office "
+                   "that owns the estate repo; the Censor never promotes to a release branch.")
+    d = est.dir / "brain" / "censor"
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{TODAY}.md"
+    path.write_text("\n".join(summary))
+    print("\n".join(summary))
+    print(f"\nwritten {path}")
+
+
+def cmd_rename(a) -> None:
+    """Rename a seat: the person stays, the name changes, the record says so."""
+    est = find_estate(a.estate)
+    oldk, s = est.seat(a.old)
+    newk = a.new.lower()
+    if any(k.lower() == newk for k in est.roster):
+        die(f"seat '{newk}' already exists")
+    if not newk.isidentifier():
+        die("new name must be a bare word (letters, digits, underscore)")
+    old_title = s.get("title", oldk)
+    new_title = a.title or newk.capitalize()
+    rp = est.dir / "roster.toml"
+    text = rp.read_text()
+    header = f"[seats.{oldk}]"
+    i = text.find(header)
+    if i < 0:
+        die(f"{header} not found in roster.toml")
+    j = text.find("[seats.", i + len(header))
+    j = len(text) if j < 0 else j
+    block = text[i:j].replace(header, f"[seats.{newk}]", 1)
+    if f'title = "{old_title}"' in block:
+        block = block.replace(f'title = "{old_title}"', f'title = "{new_title}"', 1)
+    text = text[:i] + block + text[j:]
+    text = text.replace(f'managed_by = "{oldk}"', f'managed_by = "{newk}"')
+    rp.write_text(text)
+    sd_old, sd_new = est.seat_dir(oldk), est.seat_dir(newk)
+    if sd_old.exists():
+        sd_old.rename(sd_new)
+    sd_new.mkdir(parents=True, exist_ok=True)
+    with open(sd_new / "charter.md", "a") as f:
+        f.write(f"\n> Renamed from {old_title} on {TODAY}. The history in this directory is one seat's.\n")
+    log_session(sd_new, "rename", f"formerly {oldk} ({old_title})")
+    print(f"{old_title} is now {new_title}. Charter, handoff, laurels and history carried over; "
+          "the record notes the change. Update prose references (briefs, prompts) by hand.")
+
+
+def _inbox_write(est: Estate, text: str, label: str) -> Path:
+    """Land pasted/piped text in the estate inbox (gitignored): nothing is lost,
+    nothing enters git by accident; the intake office archives it properly."""
+    inbox = est.dir / "inbox"
+    inbox.mkdir(exist_ok=True)
+    gi = inbox / ".gitignore"
+    if not gi.exists():
+        gi.write_text("*\n!.gitignore\n")
+    f = inbox / f"{STAMP}-{label}.md"
+    f.write_text(text)
+    return f
+
+
+def cmd_ingest(a) -> None:
+    """One command from transcript to beads: wake the intake office on the notes."""
+    est = find_estate(a.estate)
+    name, _ = est.seat_by_role("notarius")
+    pasted = []
+    if a.paste:
+        if not shutil.which("pbpaste"):
+            die("--paste needs pbpaste (macOS)")
+        text = subprocess.run(["pbpaste"], capture_output=True, text=True).stdout
+        if len(text.strip()) < 40:
+            die("clipboard is empty or too short to be a transcript")
+        pasted.append(_inbox_write(est, text, "clipboard"))
+    if "-" in a.sources:
+        text = sys.stdin.read()
+        if len(text.strip()) < 40:
+            die("stdin was empty or too short to be a transcript")
+        pasted.append(_inbox_write(est, text, "stdin"))
+    lines = [f"- {f} (pasted; not yet archived)" for f in pasted]
+    for src in a.sources:
+        if src == "-":
+            continue
+        q = Path(src).expanduser()
+        if q.exists():
+            lines.append(f"- {q.resolve()}")
+        else:
+            lines.append(f"- {src} (not a local path as given; find it per your charter, or ask)")
+    if lines:
+        prompt = ("Ingest these meeting notes per your charter, then give me the digest:\n"
+                  + "\n".join(lines))
+    else:
+        prompt = ("I have meeting notes to ingest and will paste them into this session; ask for "
+                  "them, then follow your charter (archive the paste as a proper note before filing).")
+    if pasted:
+        prompt += ("\n\nThe pasted item(s) landed in curia/inbox/, which is disposable and "
+                   "gitignored: archive each as a proper note in the notes home your charter "
+                   "names BEFORE filing beads, link the epic to the archived note, and say "
+                   "where you put it.")
+    ns = argparse.Namespace(estate=a.estate, seat=name, repo=None, loop=False,
+                            tmux=a.tmux, claude_args=[prompt], print_cmd=a.print_cmd)
+    cmd_launch(ns)
+
+
+# ------------------------------------------------------------------- init
+
+def cmd_init(a) -> None:
+    target = Path(a.path).expanduser().resolve()
+    curia = target / "curia"
+    if curia.exists():
+        die(f"{curia} already exists")
+    shutil.copytree(MECHANISM_DIR / "templates" / "estate", curia)
+    for p in curia.rglob("*"):
+        if p.is_file() and p.suffix in {".toml", ".md", ".plist"}:
+            p.write_text(p.read_text().replace("{{ESTATE}}", a.name).replace("{{PRINCIPAL}}", a.principal)
+                         .replace("{{ESTATE_DIR}}", str(curia)).replace("{{MECHANISM}}", str(MECHANISM_DIR)))
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(ESTATES_FILE, "a") as f:
+        f.write(f'\n[estates.{a.name.lower().replace(" ", "_")}]\npath = "{curia}"\n')
+    print(f"estate '{a.name}' created at {curia} and registered in {ESTATES_FILE}\n"
+          "Next: fill roster.toml, repos.toml, accounts.toml; write seats/<seat>/charter.md; run `curia check`.")
+
+
+# ------------------------------------------------------------------- main
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="curia", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--estate", help="path to <workspace>/curia (default: CURIA_ESTATE, cwd walk-up, or registered default)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("roster", help="list seats").set_defaults(fn=cmd_roster)
+    sub.add_parser("repos", help="list repos and their beads exports").set_defaults(fn=cmd_repos)
+    sub.add_parser("accounts", help="list accounts and limit state").set_defaults(fn=cmd_accounts)
+    sub.add_parser("check", help="validate the estate's configuration").set_defaults(fn=cmd_check)
+
+    p = sub.add_parser("prime", help="print the system-prompt prime a seat wakes up with")
+    p.add_argument("seat"); p.set_defaults(fn=cmd_prime)
+
+    p = sub.add_parser("launch", help="wake a seat interactively (crew or office)")
+    p.add_argument("seat"); p.add_argument("--repo", help="start in this repo instead of the seat's home")
+    p.add_argument("--loop", action="store_true", help="relaunch after a /handoff (RESTART marker)")
+    p.add_argument("--tmux", action="store_true", help="open in a new tmux window named after the seat")
+    p.add_argument("claude_args", nargs="*", help="extra args passed to claude after --")
+    p.add_argument("--print-cmd", dest="print_cmd", action="store_true", help="show what would run, without launching")
+    p.set_defaults(fn=cmd_launch)
+
+    p = sub.add_parser("run", help="headless run of an office seat with a prompt file")
+    p.add_argument("seat"); p.add_argument("--prompt", required=True, help="file in prompts/ or a path")
+    p.add_argument("--repo"); p.add_argument("--set", action="append", help="key=value substitutions")
+    p.add_argument("--timeout", type=int, default=3600); p.add_argument("--skip-permissions", action="store_true")
+    p.set_defaults(fn=cmd_run)
+
+    p = sub.add_parser("handoff", help="begin/finish a seat handoff (used by the /handoff skill)")
+    p.add_argument("seat"); g = p.add_mutually_exclusive_group()
+    g.add_argument("--begin", action="store_true"); g.add_argument("--done", action="store_true")
+    p.set_defaults(fn=cmd_handoff)
+
+    p = sub.add_parser("laurel", help="record spontaneous praise for a seat's work")
+    p.add_argument("seat"); p.add_argument("text"); p.set_defaults(fn=cmd_laurel)
+
+    p = sub.add_parser("limit", help="mark an account as usage-limited so launches fall back")
+    p.add_argument("account", help="account name, or 'current' to resolve from CLAUDE_CONFIG_DIR"); p.add_argument("--hours", type=float); p.add_argument("--until")
+    p.add_argument("--clear", action="store_true"); p.set_defaults(fn=cmd_limit)
+
+    p = sub.add_parser("lictor", help="read-only nudge report across every repo (crons watch)")
+    p.add_argument("--stale-days", type=int, default=2); p.add_argument("--pr-hours", type=int, default=24)
+    p.add_argument("--write", action="store_true", help="save to brain/lictor/"); p.set_defaults(fn=cmd_lictor)
+
+    p = sub.add_parser("censor", help="check each integration branch; wake the Censor where red (models act)")
+    p.add_argument("--dry-run", action="store_true"); p.add_argument("--timeout", type=int, default=5400)
+    p.add_argument("--skip-permissions", action="store_true"); p.set_defaults(fn=cmd_censor)
+
+    p = sub.add_parser("ingest", help="capture beads from meeting notes: wake the intake office on the transcript(s)")
+    p.add_argument("sources", nargs="*", help="transcript file(s); quote paths with spaces; '-' reads stdin")
+    p.add_argument("--paste", "-p", action="store_true", help="take the transcript from the clipboard (pbpaste)")
+    p.add_argument("--tmux", action="store_true"); p.add_argument("--print-cmd", dest="print_cmd", action="store_true")
+    p.set_defaults(fn=cmd_ingest)
+
+    p = sub.add_parser("rename", help="rename a seat, keeping its history (a ceremony, not a find-and-replace)")
+    p.add_argument("old"); p.add_argument("new"); p.add_argument("--title")
+    p.set_defaults(fn=cmd_rename)
+
+    p = sub.add_parser("init", help="create a new estate from the template")
+    p.add_argument("path"); p.add_argument("--name", required=True); p.add_argument("--principal", required=True)
+    p.set_defaults(fn=cmd_init)
+
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
