@@ -161,6 +161,35 @@ def account_limited(est: Estate, acct: str) -> dt.datetime | None:
     return None
 
 
+def ensure_skills(cfg: Path) -> list[str]:
+    """Link the mechanism's skills into an account's config dir.
+
+    Claude Code reads user skills from $CLAUDE_CONFIG_DIR/skills, and a seat
+    runs under whichever account it resolved to - so a skill linked only into
+    ~/.claude is invisible to every seat on every other account. Linking is
+    idempotent and happens at launch, which is the moment the account is known.
+    """
+    home = MECHANISM_DIR / "skills"
+    if not home.is_dir():
+        return []
+    dest = cfg / "skills"
+    linked = []
+    for skill in sorted(home.iterdir()):
+        if not skill.is_dir() or skill.name.startswith("."):
+            continue
+        link = dest / skill.name
+        if link.is_symlink() and link.resolve() == skill.resolve():
+            continue
+        if link.exists() and not link.is_symlink():
+            print(f"curia: {link} exists and is not a link; leaving it alone", file=sys.stderr)
+            continue
+        dest.mkdir(parents=True, exist_ok=True)
+        link.unlink(missing_ok=True)
+        link.symlink_to(skill)
+        linked.append(skill.name)
+    return linked
+
+
 def resolve_account(est: Estate, acct: str) -> tuple[str, Path]:
     seen: list[str] = []
     cur = acct
@@ -303,9 +332,18 @@ def cmd_check(a) -> None:
             problems.append(f"repo {k}: path {p} missing")
         elif not (p / ".beads" / "issues.jsonl").exists():
             problems.append(f"repo {k}: no .beads/issues.jsonl export (lictor is blind here)")
+    wanted = {d.name for d in (MECHANISM_DIR / "skills").iterdir()
+              if d.is_dir() and not d.name.startswith(".")} \
+        if (MECHANISM_DIR / "skills").is_dir() else set()
     for k in est.accounts:
-        if not account_dir(est, k).exists():
-            problems.append(f"account {k}: config dir {account_dir(est, k)} missing")
+        cfg = account_dir(est, k)
+        if not cfg.exists():
+            problems.append(f"account {k}: config dir {cfg} missing")
+            continue
+        missing = sorted(s for s in wanted if not (cfg / "skills" / s).exists())
+        if missing:
+            problems.append(f"account {k}: skills not linked into {cfg / 'skills'}: "
+                            + ", ".join(missing) + " (a launch links them; `curia check` only reports)")
     for prompt in ("censor.md", "lictor-cloud.md"):
         if not (est.dir / "prompts" / prompt).exists():
             problems.append(f"prompts/{prompt} missing")
@@ -357,6 +395,8 @@ def cmd_launch(a) -> None:
         return
     while True:
         acct, cfg = resolve_account(est, s.get("account", ""))
+        for linked in ensure_skills(cfg):
+            print(f"curia: linked the {linked} skill into {cfg.name}")
         env = dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg), CURIA_SEAT=name, CURIA_ESTATE=str(est.dir))
         cmd = ["claude", "--name", title, "--append-system-prompt", build_prime(est, name)]
         if s.get("model"):
@@ -403,6 +443,7 @@ class _Safe(dict):
 def run_headless(est: Estate, name: str, s: dict, prompt: str, cwd: Path,
                  timeout: int, skip_permissions: bool) -> str:
     acct, cfg = resolve_account(est, s.get("account", ""))
+    ensure_skills(cfg)
     env = dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg), CURIA_SEAT=name, CURIA_ESTATE=str(est.dir))
     full = build_prime(est, name) + "\n\n---\n\n" + prompt
     cmd = ["claude", "-p", full, "--output-format", "text"]
