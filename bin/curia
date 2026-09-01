@@ -23,6 +23,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import textwrap
 import tomllib
 from pathlib import Path
 
@@ -248,11 +249,20 @@ def log_session(sd: Path, event: str, detail: str = "") -> None:
 def cmd_roster(a) -> None:
     est = find_estate(a.estate)
     print(f"{est.name} estate, principal {est.principal}, {len(est.roster)} seats\n")
+    cols = shutil.get_terminal_size().columns
     for k, v in est.roster.items():
         extra = "; ".join(v.get("jurisdiction", [])) or v.get("summary", "")
-        flag = "" if v.get("active", True) else " (reserved)"
-        print(f"  {v.get('title', k):<12} {v.get('kind', '?'):<7} {v.get('model', '?'):<16} "
-              f"{v.get('account', '?'):<9}{flag}  {extra}")
+        if not v.get("active", True):
+            extra = f"(reserved) {extra}".rstrip()
+        lead = (f"  {v.get('title', k):<12} {v.get('kind', '?'):<7} "
+                f"{v.get('model', '?'):<16} {v.get('account', '?'):<10}  ")
+        if not extra:
+            print(lead.rstrip())
+            continue
+        # hanging indent: wrapped description lines stay in their column
+        width = max(cols, len(lead) + 20)
+        print(textwrap.fill(extra, width=width, initial_indent=lead,
+                            subsequent_indent=" " * len(lead)))
 
 
 def cmd_repos(a) -> None:
@@ -711,6 +721,69 @@ def cmd_ingest(a) -> None:
     cmd_launch(ns)
 
 
+# ------------------------------------------------------------------- help
+
+HELP_OVERVIEW = """\
+curia - the mechanism for a seat-based agent estate
+
+An estate is one client's workspace; its curia/ directory holds the law
+(roster, repos, accounts, each seat's memory, the brain). This tool is the
+mechanism every estate shares. Seats outlive sessions: a seat wakes primed
+with its charter, last handoff and laurels, and goes to sleep by writing the
+handoff the next session wakes up to.
+
+Vocabulary
+  seat      a named, persistent role with memory; survives sessions
+  session   one waking of a seat; a day in its life
+  office    a standing seat with a function; scheduled or on demand
+  crew      a seat with a jurisdiction; the principal talks to it directly
+  fleet     seats an office dispatches; never launched directly
+  prime     the system prompt a seat wakes with
+  handoff   the note a seat writes on its way to sleep
+  laurel    praise recorded so the seat sees it on waking; carries no work
+
+Looking around
+  roster                    who is on the estate
+  repos                     the repos and their beads exports
+  accounts                  accounts and their limit state
+  check                     is the estate consistent
+
+Waking seats
+  launch <seat>             wake a crew seat or office, primed (--loop, --tmux, --repo)
+  prime <seat>              print the prime a seat would wake with
+  run <seat> --prompt <f>   headless run of an office with a prompt file
+  ingest <notes...>         capture beads from meeting notes (--paste; '-' reads stdin)
+
+Watching (crons watch, models act)
+  lictor                    read-only nudge report across every repo
+  censor                    check integration branches; wake the Censor where red
+
+The record
+  handoff <seat>            show a seat's handoff (--begin/--done belong to the skill)
+  laurel <seat> "text"      record praise for a seat's work
+  limit <account> --hours N mark an account limited; launches fall back down the chain
+  rename <old> <new>        rename a seat, keeping its history
+
+Estates
+  init <path> --name N --principal P   create a new estate from the template
+
+The estate is found from --estate, CURIA_ESTATE, a walk up from the working
+directory, or the default registered in ~/.config/curia/estates.toml.
+
+`curia help <command>` explains one command in full. The law - house rules,
+rulings, charters - lives in the estate's own curia/ directory, not here."""
+
+
+def cmd_help(a) -> None:
+    if a.command:
+        choices = a.subparsers.choices
+        if a.command not in choices:
+            die(f"no command '{a.command}'; `curia help` lists them")
+        choices[a.command].print_help()
+        return
+    print(HELP_OVERVIEW)
+
+
 # ------------------------------------------------------------------- init
 
 def cmd_init(a) -> None:
@@ -792,6 +865,10 @@ def main() -> None:
     p = sub.add_parser("init", help="create a new estate from the template")
     p.add_argument("path"); p.add_argument("--name", required=True); p.add_argument("--principal", required=True)
     p.set_defaults(fn=cmd_init)
+
+    p = sub.add_parser("help", help="the vocabulary and the rhythm; `help <command>` for one in full")
+    p.add_argument("command", nargs="?", help="a subcommand to explain in full")
+    p.set_defaults(fn=cmd_help, subparsers=sub)
 
     a = ap.parse_args()
     a.fn(a)

@@ -40,6 +40,7 @@ ln -s "$PWD/skills/handoff" ~/.claude/skills/handoff     # user-level skill
 ## Daily use
 
 ```sh
+curia help                       # the vocabulary and the rhythm; `curia help <command>` for one in full
 curia roster                     # who is on the estate
 curia check                      # is the estate consistent
 curia launch <seat>              # wake a crew seat, primed with its handoff
