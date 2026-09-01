@@ -375,8 +375,11 @@ def cmd_launch(a) -> None:
     home = est.root if s.get("home", "estate") == "estate" else est.repo_path(s["home"])
     if a.repo:
         home = est.repo_path(a.repo)
+    want = getattr(a, "account", None) or s.get("account", "")
+    if want not in est.accounts:
+        die(f"account '{want}' is not in accounts.toml ({', '.join(est.accounts)})")
     if getattr(a, "print_cmd", False):
-        acct, cfg = resolve_account(est, s.get("account", ""))
+        acct, cfg = resolve_account(est, want)
         print("CLAUDE_CONFIG_DIR=" + str(cfg) + " CURIA_SEAT=" + name + " cwd=" + str(home))
         print("claude --name " + shlex.quote(title) + " --model " + s.get("model", "?") +
               " --append-system-prompt <prime:" + str(len(build_prime(est, name))) + " chars> " +
@@ -384,6 +387,8 @@ def cmd_launch(a) -> None:
         return
     if a.tmux:
         inner = ["curia", "launch", name, "--estate", str(est.dir)]
+        if getattr(a, "account", None):
+            inner += ["--account", a.account]
         if a.repo:
             inner += ["--repo", a.repo]
         if a.loop:
@@ -394,7 +399,7 @@ def cmd_launch(a) -> None:
         print(f"curia: {title} opened in tmux window '{title}'")
         return
     while True:
-        acct, cfg = resolve_account(est, s.get("account", ""))
+        acct, cfg = resolve_account(est, want)
         for linked in ensure_skills(cfg):
             print(f"curia: linked the {linked} skill into {cfg.name}")
         env = dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg), CURIA_SEAT=name, CURIA_ESTATE=str(est.dir))
@@ -758,6 +763,7 @@ def cmd_ingest(a) -> None:
                    "names BEFORE filing beads, link the epic to the archived note, and say "
                    "where you put it.")
     ns = argparse.Namespace(estate=a.estate, seat=name, repo=None, loop=False,
+                            account=getattr(a, "account", None),
                             tmux=a.tmux, claude_args=[prompt], print_cmd=a.print_cmd)
     cmd_launch(ns)
 
@@ -814,6 +820,136 @@ directory, or the default registered in ~/.config/curia/estates.toml.
 `curia help <command>` explains one command in full. The law - house rules,
 rulings, charters - lives in the estate's own curia/ directory, not here."""
 
+# What each command does in full: shown by `curia help <command>` and
+# `curia <command> -h`, between the usage line and the options. Mechanism
+# only - name no client, no person, no repo; seats appear here by role.
+HELP_DETAIL = {
+    "roster": """\
+Read roster.toml and print one line per seat: title, kind (office, crew,
+fleet), model, account, then the seat's jurisdiction or summary. Reserved
+seats (active = false) are marked. Read-only.""",
+
+    "repos": """\
+Read repos.toml and print each repo: whether its path exists, its
+integration branch, and the size of its .beads/issues.jsonl export (the
+lictor is blind in a repo without one). Read-only.""",
+
+    "accounts": """\
+Print each account in accounts.toml: plan, fallback account, and limit
+state. An account is limited while its config dir holds a curia-limit-until
+marker set in the future; an expired marker is removed on read.""",
+
+    "check": """\
+Validate the estate against itself: every seat's account exists, every
+fleet seat has a managing office, every home is a real repo, every seat has
+a charter; every repo path exists and exports beads; skills are linked into
+each account's config dir; the censor and lictor prompts exist; claude and
+gh are on PATH. Prints what is wrong and exits 1; fixes nothing.""",
+
+    "prime": """\
+Print the system prompt the seat would wake with: charter, last handoff,
+laurels, colleagues, standing instructions. This is exactly what `curia
+launch` passes to claude; read it when a seat behaves oddly on waking.""",
+
+    "launch": """\
+Wake a crew seat or office interactively. Resolves the account (walking the
+fallback chain past any limited account), links the mechanism's skills into
+that account's config dir, builds the prime, and runs claude in the seat's
+home with CURIA_SEAT set. Fleet seats and reserved seats refuse to launch;
+fleet is dispatched by its office. Account fallback happens here, at
+launch - a running session never changes account.""",
+
+    "run": """\
+Run an office seat headless: prepend the seat's prime to a prompt file and
+invoke `claude -p`. The prompt is looked up in the estate's prompts/
+directory unless given as a path; {placeholders} in it are filled from the
+estate, the --repo entry in repos.toml, and --set pairs (unknown ones are
+left intact). Output is printed and logged under brain/<seat>/. Without
+--skip-permissions the seat gets the tool list from its roster entry.""",
+
+    "handoff": """\
+With no flag, print the seat's current handoff note - the note the next
+session wakes up to. --begin and --done belong to the /handoff skill:
+--begin archives the old note to history/ and says where to write the new
+one; --done checks the note was written and touches the RESTART marker
+that a --loop launcher relaunches on.""",
+
+    "laurel": """\
+Append one dated line of praise to the seat's laurels.md. The seat reads
+its laurels in its prime on every waking. A laurel carries no work; if it
+asks for something, it is a task, not a laurel.""",
+
+    "limit": """\
+Write a marker into the account's config dir so launches skip it until the
+time passes and fall back down the chain (give --hours or --until; --clear
+removes the marker early). 'current' names the account whose config dir is
+CLAUDE_CONFIG_DIR. A running session is unaffected: fallback happens at
+launch, never mid-session.""",
+
+    "lictor": """\
+Read-only report across every repo: stale in_progress beads, blocked beads
+whose blockers are missing or all closed, silent PRs and drafts, the last
+gate run on each integration branch. Reads the beads exports and gh; never
+writes to a repo or a board. Crons watch, models act: the lictor only ever
+nudges the seats that do.""",
+
+    "censor": """\
+For each repo with a gate and an integration branch, read the last run.
+Where it is red, wake the seat holding the censor role headless on that
+repo with prompts/censor.md; where green, just report. The day's summary
+lands in brain/censor/. The Censor diagnoses and opens fix drafts; it
+never promotes to a release branch.""",
+
+    "ingest": """\
+Turn meeting notes into beads: wake the seat holding the notarius role on
+the transcript(s). Files are passed as paths; '-' reads stdin and --paste
+takes the clipboard, both landing in curia/inbox/ (gitignored, disposable)
+for the office to archive properly before filing. With no source at all,
+the office wakes and asks for a paste. --account starts it somewhere other
+than the office's usual account - say one with headroom; it is a starting
+point on the fallback chain, not a pin, so a limited account still falls
+through. Nothing here measures usage: only a `curia limit` marker makes a
+launch skip an account.""",
+
+    "rename": """\
+A ceremony, not a find-and-replace: rewrite the seat's block in roster.toml
+under the new name, move its seat directory, repoint managed_by, and note
+the change in the charter and session log. Charter, handoff, laurels and
+history carry over - the seat keeps its memory. Prose references (briefs,
+prompts) are yours to update by hand.""",
+
+    "init": """\
+Copy the estate template to <path>/curia, stamp in the estate's name and
+principal, and register it in ~/.config/curia/estates.toml. Then: fill
+roster.toml, repos.toml and accounts.toml, write each seat's charter, and
+run `curia check`.""",
+
+    "help": """\
+With no argument, the overview: vocabulary, the daily rhythm, every
+command. With a command, that command's page in full.""",
+}
+
+HELP_EXAMPLES = {
+    "launch": """\
+examples:
+  curia launch <seat> --loop --tmux    the overnight shape: own window, relaunch on /handoff
+  curia launch <seat> --repo <repo>    start in a repo that is not the seat's home
+  curia launch <seat> --print-cmd      show account, cwd and prompt without launching""",
+    "run": """\
+examples:
+  curia run <seat> --prompt <name>.md --repo <repo>
+  curia run <seat> --prompt /tmp/oneoff.md --set date=2026-01-01""",
+    "limit": """\
+examples:
+  curia limit current --hours 5        after claude reports a usage limit
+  curia limit <account> --clear        the limit lifted early""",
+    "ingest": """\
+examples:
+  curia ingest notes/<file>.md         wake the intake office on a file
+  curia ingest --paste                 the transcript is on the clipboard
+  pbpaste | curia ingest -             the same, via stdin""",
+}
+
 
 def cmd_help(a) -> None:
     if a.command:
@@ -851,64 +987,91 @@ def main() -> None:
     ap.add_argument("--estate", help="path to <workspace>/curia (default: CURIA_ESTATE, cwd walk-up, or registered default)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("roster", help="list seats").set_defaults(fn=cmd_roster)
-    sub.add_parser("repos", help="list repos and their beads exports").set_defaults(fn=cmd_repos)
-    sub.add_parser("accounts", help="list accounts and limit state").set_defaults(fn=cmd_accounts)
-    sub.add_parser("check", help="validate the estate's configuration").set_defaults(fn=cmd_check)
+    def parser(name: str, summary: str) -> argparse.ArgumentParser:
+        return sub.add_parser(name, help=summary, description=HELP_DETAIL.get(name),
+                              epilog=HELP_EXAMPLES.get(name),
+                              formatter_class=argparse.RawDescriptionHelpFormatter)
 
-    p = sub.add_parser("prime", help="print the system-prompt prime a seat wakes up with")
-    p.add_argument("seat"); p.set_defaults(fn=cmd_prime)
+    parser("roster", "list seats").set_defaults(fn=cmd_roster)
+    parser("repos", "list repos and their beads exports").set_defaults(fn=cmd_repos)
+    parser("accounts", "list accounts and limit state").set_defaults(fn=cmd_accounts)
+    parser("check", "validate the estate's configuration").set_defaults(fn=cmd_check)
 
-    p = sub.add_parser("launch", help="wake a seat interactively (crew or office)")
-    p.add_argument("seat"); p.add_argument("--repo", help="start in this repo instead of the seat's home")
+    p = parser("prime", "print the system-prompt prime a seat wakes up with")
+    p.add_argument("seat", help="a seat name from roster.toml (any case)"); p.set_defaults(fn=cmd_prime)
+
+    p = parser("launch", "wake a seat interactively (crew or office)")
+    p.add_argument("seat", help="a seat name from roster.toml (any case)")
+    p.add_argument("--repo", help="start in this repo instead of the seat's home")
     p.add_argument("--loop", action="store_true", help="relaunch after a /handoff (RESTART marker)")
+    p.add_argument("--account", help="start on this account instead of the seat's, e.g. one with headroom")
     p.add_argument("--tmux", action="store_true", help="open in a new tmux window named after the seat")
     p.add_argument("claude_args", nargs="*", help="extra args passed to claude after --")
     p.add_argument("--print-cmd", dest="print_cmd", action="store_true", help="show what would run, without launching")
     p.set_defaults(fn=cmd_launch)
 
-    p = sub.add_parser("run", help="headless run of an office seat with a prompt file")
-    p.add_argument("seat"); p.add_argument("--prompt", required=True, help="file in prompts/ or a path")
-    p.add_argument("--repo"); p.add_argument("--set", action="append", help="key=value substitutions")
-    p.add_argument("--timeout", type=int, default=3600); p.add_argument("--skip-permissions", action="store_true")
+    p = parser("run", "headless run of an office seat with a prompt file")
+    p.add_argument("seat", help="the office seat to run")
+    p.add_argument("--prompt", required=True, help="file in the estate's prompts/, or a path")
+    p.add_argument("--repo", help="run in this repo; its repos.toml values become {placeholders}")
+    p.add_argument("--set", action="append", help="key=value substitution for the prompt (repeatable)")
+    p.add_argument("--timeout", type=int, default=3600, help="seconds before the run is cut off (default 3600)")
+    p.add_argument("--skip-permissions", action="store_true",
+                   help="run with --dangerously-skip-permissions instead of the seat's tool list")
     p.set_defaults(fn=cmd_run)
 
-    p = sub.add_parser("handoff", help="begin/finish a seat handoff (used by the /handoff skill)")
-    p.add_argument("seat"); g = p.add_mutually_exclusive_group()
-    g.add_argument("--begin", action="store_true"); g.add_argument("--done", action="store_true")
+    p = parser("handoff", "show a seat's handoff; --begin/--done belong to the /handoff skill")
+    p.add_argument("seat", help="the seat whose handoff to show"); g = p.add_mutually_exclusive_group()
+    g.add_argument("--begin", action="store_true", help="archive the old note; say where the new one goes")
+    g.add_argument("--done", action="store_true", help="confirm the note is written; mark the seat ready to relaunch")
     p.set_defaults(fn=cmd_handoff)
 
-    p = sub.add_parser("laurel", help="record spontaneous praise for a seat's work")
-    p.add_argument("seat"); p.add_argument("text"); p.set_defaults(fn=cmd_laurel)
+    p = parser("laurel", "record spontaneous praise for a seat's work")
+    p.add_argument("seat", help="the seat being praised")
+    p.add_argument("text", help="the praise, one line, quoted"); p.set_defaults(fn=cmd_laurel)
 
-    p = sub.add_parser("limit", help="mark an account as usage-limited so launches fall back")
-    p.add_argument("account", help="account name, or 'current' to resolve from CLAUDE_CONFIG_DIR"); p.add_argument("--hours", type=float); p.add_argument("--until")
-    p.add_argument("--clear", action="store_true"); p.set_defaults(fn=cmd_limit)
+    p = parser("limit", "mark an account as usage-limited so launches fall back")
+    p.add_argument("account", help="account name, or 'current' to resolve from CLAUDE_CONFIG_DIR")
+    p.add_argument("--hours", type=float, help="limited for this many hours from now")
+    p.add_argument("--until", help="limited until this ISO timestamp (UTC assumed)")
+    p.add_argument("--clear", action="store_true", help="remove the marker early")
+    p.set_defaults(fn=cmd_limit)
 
-    p = sub.add_parser("lictor", help="read-only nudge report across every repo (crons watch)")
-    p.add_argument("--stale-days", type=int, default=2); p.add_argument("--pr-hours", type=int, default=24)
-    p.add_argument("--write", action="store_true", help="save to brain/lictor/"); p.set_defaults(fn=cmd_lictor)
+    p = parser("lictor", "read-only nudge report across every repo (crons watch)")
+    p.add_argument("--stale-days", type=int, default=2, help="in_progress is stale after this many days (default 2)")
+    p.add_argument("--pr-hours", type=int, default=24, help="a PR or draft is silent after this many hours (default 24)")
+    p.add_argument("--write", action="store_true", help="save to brain/lictor/ instead of printing")
+    p.set_defaults(fn=cmd_lictor)
 
-    p = sub.add_parser("censor", help="check each integration branch; wake the Censor where red (models act)")
-    p.add_argument("--dry-run", action="store_true"); p.add_argument("--timeout", type=int, default=5400)
-    p.add_argument("--skip-permissions", action="store_true"); p.set_defaults(fn=cmd_censor)
+    p = parser("censor", "check each integration branch; wake the Censor where red (models act)")
+    p.add_argument("--dry-run", action="store_true", help="report branch states without waking anyone")
+    p.add_argument("--timeout", type=int, default=5400, help="seconds per repo before a waking is cut off (default 5400)")
+    p.add_argument("--skip-permissions", action="store_true",
+                   help="run with --dangerously-skip-permissions instead of the seat's tool list")
+    p.set_defaults(fn=cmd_censor)
 
-    p = sub.add_parser("ingest", help="capture beads from meeting notes: wake the intake office on the transcript(s)")
+    p = parser("ingest", "capture beads from meeting notes: wake the intake office on the transcript(s)")
     p.add_argument("sources", nargs="*", help="transcript file(s); quote paths with spaces; '-' reads stdin")
     p.add_argument("--paste", "-p", action="store_true", help="take the transcript from the clipboard (pbpaste)")
-    p.add_argument("--tmux", action="store_true"); p.add_argument("--print-cmd", dest="print_cmd", action="store_true")
+    p.add_argument("--account", help="start on this account instead of the office's, e.g. one with headroom")
+    p.add_argument("--tmux", action="store_true", help="open in a new tmux window")
+    p.add_argument("--print-cmd", dest="print_cmd", action="store_true", help="show what would run, without launching")
     p.set_defaults(fn=cmd_ingest)
 
-    p = sub.add_parser("rename", help="rename a seat, keeping its history (a ceremony, not a find-and-replace)")
-    p.add_argument("old"); p.add_argument("new"); p.add_argument("--title")
+    p = parser("rename", "rename a seat, keeping its history (a ceremony, not a find-and-replace)")
+    p.add_argument("old", help="the seat's current name")
+    p.add_argument("new", help="the new name: a bare word, not yet on the roster")
+    p.add_argument("--title", help="display title (default: the new name, capitalised)")
     p.set_defaults(fn=cmd_rename)
 
-    p = sub.add_parser("init", help="create a new estate from the template")
-    p.add_argument("path"); p.add_argument("--name", required=True); p.add_argument("--principal", required=True)
+    p = parser("init", "create a new estate from the template")
+    p.add_argument("path", help="workspace directory; the estate lands at <path>/curia")
+    p.add_argument("--name", required=True, help="the estate's name")
+    p.add_argument("--principal", required=True, help="whose estate it is")
     p.set_defaults(fn=cmd_init)
 
-    p = sub.add_parser("help", help="the vocabulary and the rhythm; `help <command>` for one in full")
-    p.add_argument("command", nargs="?", help="a subcommand to explain in full")
+    p = parser("help", "the vocabulary and the rhythm; `help <command>` for one in full")
+    p.add_argument("command", nargs="?", help="a command to explain in full")
     p.set_defaults(fn=cmd_help, subparsers=sub)
 
     a = ap.parse_args()
