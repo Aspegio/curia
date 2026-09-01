@@ -796,10 +796,10 @@ Looking around
   check                     is the estate consistent
 
 Waking seats
-  launch <seat>             wake a crew seat or office, primed (--loop, --tmux, --repo)
+  launch <seat>             wake a crew seat or office, primed (--loop, --tmux, --repo, --account)
   prime <seat>              print the prime a seat would wake with
   run <seat> --prompt <f>   headless run of an office with a prompt file
-  ingest <notes...>         capture beads from meeting notes (--paste; '-' reads stdin)
+  ingest <notes...>         capture beads from meeting notes (--paste, --account; '-' reads stdin)
 
 Watching (crons watch, models act)
   lictor                    read-only nudge report across every repo
@@ -856,8 +856,14 @@ Wake a crew seat or office interactively. Resolves the account (walking the
 fallback chain past any limited account), links the mechanism's skills into
 that account's config dir, builds the prime, and runs claude in the seat's
 home with CURIA_SEAT set. Fleet seats and reserved seats refuse to launch;
-fleet is dispatched by its office. Account fallback happens here, at
-launch - a running session never changes account.""",
+fleet is dispatched by its office.
+
+Account fallback happens here, at launch - a running session never changes
+account. It is DECLARED, not measured: the chain skips an account only
+while a `curia limit` marker says to, and nothing reads how much of a plan
+is left. --account starts the walk somewhere other than the seat's usual
+account, for when you know one is nearly spent; it is a starting point, not
+a pin, so a limited account still falls through to its own fallback.""",
 
     "run": """\
 Run an office seat headless: prepend the seat's prime to a prompt file and
@@ -884,7 +890,12 @@ Write a marker into the account's config dir so launches skip it until the
 time passes and fall back down the chain (give --hours or --until; --clear
 removes the marker early). 'current' names the account whose config dir is
 CLAUDE_CONFIG_DIR. A running session is unaffected: fallback happens at
-launch, never mid-session.""",
+launch, never mid-session.
+
+A marker says an account IS limited, and every seat on it is then skipped.
+To send one session somewhere else, use `launch --account` instead: marking
+an account that is not limited steers the session by putting a falsehood in
+the record.""",
 
     "lictor": """\
 Read-only report across every repo: stale in_progress beads, blocked beads
@@ -934,7 +945,8 @@ HELP_EXAMPLES = {
 examples:
   curia launch <seat> --loop --tmux    the overnight shape: own window, relaunch on /handoff
   curia launch <seat> --repo <repo>    start in a repo that is not the seat's home
-  curia launch <seat> --print-cmd      show account, cwd and prompt without launching""",
+  curia launch <seat> --print-cmd      show account, cwd and prompt without launching
+  curia launch <seat> --account <acct> start on a named account, not the seat's usual""",
     "run": """\
 examples:
   curia run <seat> --prompt <name>.md --repo <repo>
@@ -947,7 +959,8 @@ examples:
 examples:
   curia ingest notes/<file>.md         wake the intake office on a file
   curia ingest --paste                 the transcript is on the clipboard
-  pbpaste | curia ingest -             the same, via stdin""",
+  pbpaste | curia ingest -             the same, via stdin
+  curia ingest -p --account <acct>     the usual account is nearly spent""",
 }
 
 

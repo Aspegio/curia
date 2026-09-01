@@ -51,6 +51,7 @@ curia lictor                     # read-only nudge report (crons watch)
 curia censor                     # check integration branches; wake the Censor where red (models act)
 curia laurel <seat> "a user said the new page finally makes sense"
 curia limit <account> --hours 5  # an account hit its limit; launches fall back down the chain
+curia launch <seat> --account <acct>   # start on a named account, e.g. one with headroom
 ```
 
 The estate is found from `--estate`, `CURIA_ESTATE`, walking up from the

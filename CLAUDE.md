@@ -25,7 +25,8 @@ weaken it to get green.
 ## Layout
 
 - `bin/curia` - the whole CLI, one stdlib-only Python file (3.11+ for tomllib)
-- `skills/handoff/` - the `/handoff` skill, symlinked into `~/.claude/skills/`
+- `skills/` - skills every seat gets; `launch` links them into the RESOLVED
+  account's `$CLAUDE_CONFIG_DIR/skills`, not just `~/.claude/skills`
 - `templates/estate/` - what `curia init` copies for a new client
 - `templates/handoff.md` - the note shape a seat writes at sleep
 - `tests/` - the fence
@@ -41,6 +42,19 @@ weaken it to get green.
 - Adding a command: a `cmd_*` function plus a subparser in `main()`, and a line
   in the README's daily-use block. Offices are looked up by `role`, not name,
   so a renamed seat keeps working - keep it that way.
+- **`curia help` is part of the change, not documentation of it.** Any new
+  command, new flag, or changed behaviour updates the help in the same commit.
+  There are four places and they are easy to half-do:
+  - `HELP_OVERVIEW` - the command list; a flag worth knowing goes in the
+    parenthetical after its command
+  - `HELP_DETAIL[<cmd>]` - the prose page behind `curia help <cmd>`; say what
+    the command does and what it will NOT do
+  - `HELP_EXAMPLES[<cmd>]` - the epilog; real invocations, aligned to column 40
+  - the `add_argument` help string, which is what `-h` shows
+  Read it back (`curia help <cmd>`) rather than trusting the diff - argparse
+  reflows prose and swallows misalignment. Help that lies is worse than absent:
+  a seat reads it as law. The fence applies here too - no client, person or
+  repo names, so examples use `<seat>`, `<repo>`, `<acct>` placeholders.
 - Prompts the CLI composes are read by a model with the seat's prime already in
   context. Say what is forbidden and what to do, not how to phrase it.
 
@@ -53,13 +67,18 @@ weaken it to get green.
   the harness, not a gap to paper over.
 - Read-only offices stay read-only. If a command starts writing to a board,
   that is a new office, not a flag.
+- Skills are linked per ACCOUNT, at launch. Claude Code reads user skills from
+  `$CLAUDE_CONFIG_DIR/skills`, and a seat runs under whichever account it
+  resolved to - so linking into one config dir by hand leaves every seat on
+  every other account without them (which is how `/handoff` went missing for a
+  whole account's seats). Launch is the moment the account is known; link there.
 - The estate is discovered (`--estate`, `CURIA_ESTATE`, a walk up from the
   working directory, then the registered default), so no command needs a
   particular working directory.
 
 ## State that lives outside this repo
 
-`~/.config/curia/estates.toml` (which estates exist on this machine),
-`~/.claude/skills/handoff` and `~/.local/bin/curia` (symlinks into here), each
-estate's own directory, and any launchd units an estate installs. Changing a
-path here can break those; check before you move something.
+`~/.config/curia/estates.toml` (which estates exist on this machine), each
+account's `$CLAUDE_CONFIG_DIR/skills/*` and `~/.local/bin/curia` (symlinks into
+here), each estate's own directory, and any launchd units an estate installs.
+Changing a path here can break those; check before you move something.
