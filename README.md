@@ -47,6 +47,7 @@ curia launch <seat>              # wake a crew seat, primed with its handoff
 curia launch <office> --loop     # wake an office; relaunch after each /handoff
 curia ingest <notes...>          # capture beads from meeting notes (wakes the intake office)
 curia ingest --paste             # ...from the clipboard; `... ingest -` reads stdin
+curia ingest --paste --repo <repo>   # ...when the notes concern one repo: start and file there
 curia lictor                     # read-only nudge report (crons watch)
 curia censor                     # check integration branches; wake the Censor where red (models act)
 curia laurel <seat> "a user said the new page finally makes sense"

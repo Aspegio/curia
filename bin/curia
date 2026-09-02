@@ -730,6 +730,10 @@ def cmd_ingest(a) -> None:
     """One command from transcript to beads: wake the intake office on the notes."""
     est = find_estate(a.estate)
     name, _ = est.seat_by_role("notarius")
+    repo = None
+    if getattr(a, "repo", None):
+        repo, _r = est.repo(a.repo)  # dies on an unknown repo before anything is pasted
+        prefixes = ", ".join(f"{x}-" for x in _r.get("beads_prefix", [])) or "no prefix declared"
     pasted = []
     if a.paste:
         if not shutil.which("pbpaste"):
@@ -763,7 +767,14 @@ def cmd_ingest(a) -> None:
                    "gitignored: archive each as a proper note in the notes home your charter "
                    "names BEFORE filing beads, link the epic to the archived note, and say "
                    "where you put it.")
-    ns = argparse.Namespace(estate=a.estate, seat=name, repo=None, loop=False,
+    if repo:
+        prompt += (f"\n\nThese notes concern the {repo} repo (beads {prefixes}): file there unless "
+                   "an item plainly belongs to another repo, in which case it goes to its own repo "
+                   f"with a related edge back, per your charter. You are starting in {repo}, so bd "
+                   "reads and writes land in its database; for any other repo change directory "
+                   "(or bd -C <path>) first - a bead filed from the wrong directory gets the wrong "
+                   "prefix with no error.")
+    ns = argparse.Namespace(estate=a.estate, seat=name, repo=repo, loop=False,
                             account=getattr(a, "account", None),
                             tmux=a.tmux, say=prompt, print_cmd=a.print_cmd)
     cmd_launch(ns)
@@ -800,7 +811,7 @@ Waking seats
   launch <seat>             wake a crew seat or office, primed (--loop, --account, --say, --repo)
   prime <seat>              print the prime a seat would wake with
   run <seat> --prompt <f>   headless run of an office with a prompt file
-  ingest <notes...>         capture beads from meeting notes (--paste, --account; '-' reads stdin)
+  ingest <notes...>         capture beads from meeting notes (--paste, --repo, --account; '-' reads stdin)
 
 Watching (crons watch, models act)
   lictor                    read-only nudge report across every repo
@@ -919,11 +930,16 @@ Turn meeting notes into beads: wake the seat holding the notarius role on
 the transcript(s). Files are passed as paths; '-' reads stdin and --paste
 takes the clipboard, both landing in curia/inbox/ (gitignored, disposable)
 for the office to archive properly before filing. With no source at all,
-the office wakes and asks for a paste. --account starts it somewhere other
-than the office's usual account - say one with headroom; it is a starting
-point on the fallback chain, not a pin, so a limited account still falls
-through. Nothing here measures usage: only a `curia limit` marker makes a
-launch skip an account.""",
+the office wakes and asks for a paste. --repo says which repo the notes
+concern: the office starts there, so that repo's beads database is the one
+bd reads and writes by default, and the prompt says to file there unless
+an item plainly belongs elsewhere. Without it the office starts in the
+estate root and decides the repo from the transcript alone; that works,
+but the estate root is its own beads database, and a write made there
+lands in it. --account starts it somewhere other than the office's usual
+account - say one with headroom; it is a starting point on the fallback
+chain, not a pin, so a limited account still falls through. Nothing here
+measures usage: only a `curia limit` marker makes a launch skip an account.""",
 
     "rename": """\
 A ceremony, not a find-and-replace: rewrite the seat's block in roster.toml
@@ -964,6 +980,7 @@ examples:
   curia ingest notes/<file>.md         wake the intake office on a file
   curia ingest --paste                 the transcript is on the clipboard
   pbpaste | curia ingest -             the same, via stdin
+  curia ingest -p --repo <repo>        the notes concern one repo: start and file there
   curia ingest -p --account <acct>     the usual account is nearly spent""",
 }
 
@@ -1070,6 +1087,7 @@ def main() -> None:
     p = parser("ingest", "capture beads from meeting notes: wake the intake office on the transcript(s)")
     p.add_argument("sources", nargs="*", help="transcript file(s); quote paths with spaces; '-' reads stdin")
     p.add_argument("--paste", "-p", action="store_true", help="take the transcript from the clipboard (pbpaste)")
+    p.add_argument("--repo", help="the notes concern this repo: start there, file there by default")
     p.add_argument("--account", help="start on this account instead of the office's, e.g. one with headroom")
     p.add_argument("--tmux", action="store_true", help="open in a new tmux window")
     p.add_argument("--print-cmd", dest="print_cmd", action="store_true", help="show what would run, without launching")
