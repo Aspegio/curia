@@ -75,6 +75,12 @@ weaken it to get green.
 - The estate is discovered (`--estate`, `CURIA_ESTATE`, a walk up from the
   working directory, then the registered default), so no command needs a
   particular working directory.
+- The working directory chooses the repo. `launch`, `run` and `ingest`
+  default `--repo` to the registered repo containing the cwd (the most
+  specific where repos nest); the roster home applies only from outside any
+  repo, and `ingest` treats the estate root as plain home, not a repo hint.
+  Discovery still needs no particular directory; this is about where a seat
+  starts, not whether it can.
 
 ## State that lives outside this repo
 

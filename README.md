@@ -44,6 +44,7 @@ curia help                       # the vocabulary and the rhythm; `curia help <c
 curia roster                     # who is on the estate
 curia check                      # is the estate consistent
 curia launch <seat>              # wake a crew seat, primed with its handoff
+cd <repo> && curia launch <seat>  # ...in the repo you are in; --repo <repo> names one from anywhere
 curia launch <office> --loop     # wake an office; relaunch after each /handoff
 curia ingest <notes...>          # capture beads from meeting notes (wakes the intake office)
 curia ingest --paste             # ...from the clipboard; `... ingest -` reads stdin

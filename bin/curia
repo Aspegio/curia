@@ -115,6 +115,18 @@ class Estate:
         _, r = self.repo(name)
         return (self.root / r["path"]).resolve()
 
+    def repo_here(self) -> str | None:
+        """The registered repo whose path contains the working directory - the
+        most specific one where repos nest - or None from outside the estate."""
+        cwd = Path.cwd().resolve()
+        best = None
+        for k, r in self.repos.items():
+            path = (self.root / r["path"]).resolve()
+            if cwd == path or path in cwd.parents:
+                if best is None or len(path.parts) > len(best[1].parts):
+                    best = (k, path)
+        return best[0] if best else None
+
 
 def find_estate(explicit: str | None) -> Estate:
     if explicit:
@@ -374,8 +386,9 @@ def cmd_launch(a) -> None:
     title = s.get("title", name)
     sd = est.seat_dir(name)
     home = est.root if s.get("home", "estate") == "estate" else est.repo_path(s["home"])
-    if a.repo:
-        home = est.repo_path(a.repo)
+    repo = a.repo or est.repo_here()
+    if repo:
+        home = est.repo_path(repo)
     want = getattr(a, "account", None) or s.get("account", "")
     if want not in est.accounts:
         die(f"account '{want}' is not in accounts.toml ({', '.join(est.accounts)})")
@@ -390,8 +403,8 @@ def cmd_launch(a) -> None:
         inner = ["curia", "launch", name, "--estate", str(est.dir)]
         if getattr(a, "account", None):
             inner += ["--account", a.account]
-        if a.repo:
-            inner += ["--repo", a.repo]
+        if repo:
+            inner += ["--repo", repo]
         if a.loop:
             inner.append("--loop")
         if getattr(a, "say", None):
@@ -439,12 +452,13 @@ def cmd_run(a) -> None:
     if not prompt:
         die(f"empty or missing prompt {prompt_path}")
     subs = {"estate": est.name, "principal": est.principal, "date": TODAY, "seat": s.get("title", name)}
-    if a.repo:
-        rk, r = est.repo(a.repo)
+    repo = a.repo or est.repo_here()
+    if repo:
+        rk, r = est.repo(repo)
         subs.update({"repo": rk, **{k: str(v) for k, v in r.items()}})
     subs.update(dict(kv.split("=", 1) for kv in (a.set or [])))
     prompt = fill_placeholders(prompt, subs)
-    cwd = est.repo_path(a.repo) if a.repo else est.root
+    cwd = est.repo_path(repo) if repo else est.root
     out = run_headless(est, name, s, prompt, cwd, a.timeout, a.skip_permissions)
     print(out)
 
@@ -734,8 +748,13 @@ def cmd_ingest(a) -> None:
     est = find_estate(a.estate)
     name, _ = est.seat_by_role("notarius")
     repo = None
-    if getattr(a, "repo", None):
-        repo, _r = est.repo(a.repo)  # dies on an unknown repo before anything is pasted
+    want = getattr(a, "repo", None)
+    if not want:
+        here = est.repo_here()
+        if here and est.repo_path(here) != est.root:
+            want = here  # standing in a product repo counts; the estate root is just home
+    if want:
+        repo, _r = est.repo(want)  # dies on an unknown repo before anything is pasted
         prefixes = ", ".join(f"{x}-" for x in _r.get("beads_prefix", [])) or "no prefix declared"
     pasted = []
     if a.paste:
@@ -869,11 +888,14 @@ launch` passes to claude; read it when a seat behaves oddly on waking.""",
     "launch": """\
 Wake a crew seat or office interactively. Resolves the account (walking the
 fallback chain past any limited account), links the mechanism's skills into
-that account's config dir, builds the prime, and runs claude in the seat's
-home with CURIA_SEAT set. Fleet seats and reserved seats refuse to launch;
-fleet is dispatched by its office. --say gives the seat an opening message -
-the night's orders - so a looped launch needs no typing; without it the seat
-wakes on its prime alone and waits for you.
+that account's config dir, builds the prime, and runs claude with CURIA_SEAT
+set in the repo you launched from - the registered repo whose path contains
+the working directory, the most specific one where repos nest - or, from
+outside any repo, in the seat's roster home. --repo names one from anywhere.
+Fleet seats and reserved seats refuse to launch; fleet is dispatched by its
+office. --say gives the seat an opening message - the night's orders - so a
+looped launch needs no typing; without it the seat wakes on its prime alone
+and waits for you.
 
 Account fallback happens here, at launch - a running session never changes
 account. It is DECLARED, not measured: the chain skips an account only
@@ -888,8 +910,9 @@ Run a seat headless: prepend the seat's prime to a prompt file and invoke
 crew seat: a subagent spawned inside a session inherits that session's
 account and model, whereas `run` resolves the seat's OWN account from the
 roster (walking its fallback chain), links the skills there, and prepends
-the seat's own prime - charter, last handoff, laurels. The prompt is looked
-up in the estate's prompts/ directory unless given as a path; {placeholders}
+the seat's own prime - charter, last handoff, laurels. It runs in the repo
+you are in, or the one --repo names, or else the estate root. The prompt is
+looked up in the estate's prompts/ directory unless given as a path; {placeholders}
 in it are filled from the estate, the --repo entry in repos.toml, and --set
 pairs (unknown ones, and any other braces, are left intact). Output is
 printed and logged under brain/<seat>/, and the seat's sessions.log records
@@ -942,13 +965,15 @@ for the office to archive properly before filing. With no source at all,
 the office wakes and asks for a paste. --repo says which repo the notes
 concern: the office starts there, so that repo's beads database is the one
 bd reads and writes by default, and the prompt says to file there unless
-an item plainly belongs elsewhere. Without it the office starts in the
-estate root and decides the repo from the transcript alone; that works,
-but the estate root is its own beads database, and a write made there
-lands in it. --account starts it somewhere other than the office's usual
-account - say one with headroom; it is a starting point on the fallback
-chain, not a pin, so a limited account still falls through. Nothing here
-measures usage: only a `curia limit` marker makes a launch skip an account.""",
+an item plainly belongs elsewhere. Without it, a product repo you are
+standing in counts as --repo; from the estate root or outside it, the
+office starts in the estate root and decides the repo from the transcript
+alone. That works, but the estate root is its own beads database, and a
+write made there lands in it. --account starts it somewhere other than the
+office's usual account - say one with headroom; it is a starting point on
+the fallback chain, not a pin, so a limited account still falls through.
+Nothing here measures usage: only a `curia limit` marker makes a launch
+skip an account.""",
 
     "rename": """\
 A ceremony, not a find-and-replace: rewrite the seat's block in roster.toml
@@ -972,7 +997,8 @@ HELP_EXAMPLES = {
     "launch": """\
 examples:
   curia launch <seat> --loop --tmux    the overnight shape: own window, relaunch on /handoff
-  curia launch <seat> --repo <repo>    start in a repo that is not the seat's home
+  cd <repo> && curia launch <seat>     the seat starts in the repo you are in
+  curia launch <seat> --repo <repo>    name the repo from anywhere
   curia launch <seat> --print-cmd      show account, cwd and prompt without launching
   curia launch <seat> --account <acct> start on a named account, not the seat's usual
   curia launch <seat> --loop --say "..."  wake it with orders and relaunch on /handoff""",
@@ -1046,7 +1072,7 @@ def main() -> None:
 
     p = parser("launch", "wake a seat interactively (crew or office)")
     p.add_argument("seat", help="a seat name from roster.toml (any case)")
-    p.add_argument("--repo", help="start in this repo instead of the seat's home")
+    p.add_argument("--repo", help="start in this repo (default: the repo you are in, else the seat's home)")
     p.add_argument("--loop", action="store_true", help="relaunch after a /handoff (RESTART marker)")
     p.add_argument("--account", help="start on this account instead of the seat's, e.g. one with headroom")
     p.add_argument("--tmux", action="store_true", help="open in a new tmux window named after the seat")
@@ -1057,7 +1083,7 @@ def main() -> None:
     p = parser("run", "headless run of a seat with a prompt file; how an office wakes a crew seat")
     p.add_argument("seat", help="the seat to run: an office, or a crew seat an office is waking")
     p.add_argument("--prompt", required=True, help="file in the estate's prompts/, or a path")
-    p.add_argument("--repo", help="run in this repo; its repos.toml values become {placeholders}")
+    p.add_argument("--repo", help="run in this repo (default: the repo you are in, else the estate root); its repos.toml values become {placeholders}")
     p.add_argument("--set", action="append", help="key=value substitution for the prompt (repeatable)")
     p.add_argument("--timeout", type=int, default=3600, help="seconds before the run is cut off (default 3600)")
     p.add_argument("--skip-permissions", action="store_true",
@@ -1097,7 +1123,7 @@ def main() -> None:
     p = parser("ingest", "capture beads from meeting notes: wake the intake office on the transcript(s)")
     p.add_argument("sources", nargs="*", help="transcript file(s); quote paths with spaces; '-' reads stdin")
     p.add_argument("--paste", "-p", action="store_true", help="take the transcript from the clipboard (pbpaste)")
-    p.add_argument("--repo", help="the notes concern this repo: start there, file there by default")
+    p.add_argument("--repo", help="the notes concern this repo: start there, file there by default (default: the product repo you are in)")
     p.add_argument("--account", help="start on this account instead of the office's, e.g. one with headroom")
     p.add_argument("--tmux", action="store_true", help="open in a new tmux window")
     p.add_argument("--print-cmd", dest="print_cmd", action="store_true", help="show what would run, without launching")
