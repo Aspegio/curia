@@ -5,7 +5,7 @@
 [seats.example_office]
 title = "Example"
 kind = "office"
-model = "claude-fable-5"
+model = "claude-fable-5-1"
 account = "main"
 home = "estate"
 pronouns = ""
