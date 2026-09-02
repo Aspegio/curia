@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import re
 import os
 import shlex
 import shutil
@@ -420,6 +421,13 @@ def cmd_launch(a) -> None:
         break
 
 
+def fill_placeholders(text: str, subs: dict) -> str:
+    """Fill {name} placeholders from subs. Only bare identifiers are touched, so
+    braces inside code, JSON or prose in a prompt or brief pass through intact
+    (str.format_map would raise on them)."""
+    return re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", lambda m: str(subs.get(m.group(1), m.group(0))), text)
+
+
 def cmd_run(a) -> None:
     """Headless run of an office seat with a prompt file (claude -p)."""
     est = find_estate(a.estate)
@@ -435,15 +443,10 @@ def cmd_run(a) -> None:
         rk, r = est.repo(a.repo)
         subs.update({"repo": rk, **{k: str(v) for k, v in r.items()}})
     subs.update(dict(kv.split("=", 1) for kv in (a.set or [])))
-    prompt = prompt.format_map(_Safe(subs))
+    prompt = fill_placeholders(prompt, subs)
     cwd = est.repo_path(a.repo) if a.repo else est.root
     out = run_headless(est, name, s, prompt, cwd, a.timeout, a.skip_permissions)
     print(out)
-
-
-class _Safe(dict):
-    def __missing__(self, k):
-        return "{" + k + "}"
 
 
 def run_headless(est: Estate, name: str, s: dict, prompt: str, cwd: Path,
@@ -659,10 +662,10 @@ def cmd_censor(a) -> None:
             continue
         woke += 1
         summary.append(line + " -> Censor woke")
-        prompt = prompt_t.format_map(_Safe({
+        prompt = fill_placeholders(prompt_t, {
             "repo": k, "branch": b, "run_url": x.get("url", ""), "conclusion": concl,
             "head_sha": x.get("headSha", ""), "date": TODAY,
-            **{kk: str(vv) for kk, vv in r.items()}}))
+            **{kk: str(vv) for kk, vv in r.items()}})
         out = run_headless(est, name, s, prompt, est.repo_path(k), a.timeout, a.skip_permissions)
         summary.append("\n<details><summary>Censor transcript, " + k + "</summary>\n\n```\n" +
                        out[-6000:] + "\n```\n</details>\n")
@@ -810,7 +813,7 @@ Looking around
 Waking seats
   launch <seat>             wake a crew seat or office, primed (--loop, --account, --say, --repo)
   prime <seat>              print the prime a seat would wake with
-  run <seat> --prompt <f>   headless run of an office with a prompt file
+  run <seat> --prompt <f>   headless run of a seat with a prompt file; how an office wakes a crew seat
   ingest <notes...>         capture beads from meeting notes (--paste, --repo, --account; '-' reads stdin)
 
 Watching (crons watch, models act)
@@ -880,12 +883,18 @@ account, for when you know one is nearly spent; it is a starting point, not
 a pin, so a limited account still falls through to its own fallback.""",
 
     "run": """\
-Run an office seat headless: prepend the seat's prime to a prompt file and
-invoke `claude -p`. The prompt is looked up in the estate's prompts/
-directory unless given as a path; {placeholders} in it are filled from the
-estate, the --repo entry in repos.toml, and --set pairs (unknown ones are
-left intact). Output is printed and logged under brain/<seat>/. Without
---skip-permissions the seat gets the tool list from its roster entry.""",
+Run a seat headless: prepend the seat's prime to a prompt file and invoke
+`claude -p`. Any seat, not only an office. This is how an office wakes a
+crew seat: a subagent spawned inside a session inherits that session's
+account and model, whereas `run` resolves the seat's OWN account from the
+roster (walking its fallback chain), links the skills there, and prepends
+the seat's own prime - charter, last handoff, laurels. The prompt is looked
+up in the estate's prompts/ directory unless given as a path; {placeholders}
+in it are filled from the estate, the --repo entry in repos.toml, and --set
+pairs (unknown ones, and any other braces, are left intact). Output is
+printed and logged under brain/<seat>/, and the seat's sessions.log records
+a headless waking. Without --skip-permissions the seat gets the tool list
+from its roster entry, or Bash, Read, Edit, Write, Glob, Grep and Agent.""",
 
     "handoff": """\
 With no flag, print the seat's current handoff note - the note the next
@@ -970,7 +979,8 @@ examples:
     "run": """\
 examples:
   curia run <seat> --prompt <name>.md --repo <repo>
-  curia run <seat> --prompt /tmp/oneoff.md --set date=2026-01-01""",
+  curia run <seat> --prompt /tmp/oneoff.md --set date=2026-01-01
+  curia run <crew> --prompt /abs/brief.md --repo <repo>   an office waking a crew seat on the crew seat's account""",
     "limit": """\
 examples:
   curia limit current --hours 5        after claude reports a usage limit
@@ -1044,8 +1054,8 @@ def main() -> None:
     p.add_argument("--print-cmd", dest="print_cmd", action="store_true", help="show what would run, without launching")
     p.set_defaults(fn=cmd_launch)
 
-    p = parser("run", "headless run of an office seat with a prompt file")
-    p.add_argument("seat", help="the office seat to run")
+    p = parser("run", "headless run of a seat with a prompt file; how an office wakes a crew seat")
+    p.add_argument("seat", help="the seat to run: an office, or a crew seat an office is waking")
     p.add_argument("--prompt", required=True, help="file in the estate's prompts/, or a path")
     p.add_argument("--repo", help="run in this repo; its repos.toml values become {placeholders}")
     p.add_argument("--set", action="append", help="key=value substitution for the prompt (repeatable)")
