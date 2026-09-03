@@ -105,9 +105,10 @@ weaken it to get green.
   to a reviewer seat, before the gate.
 - `--everything` reads the board and never writes it. Each waking's orders come
   from the repo's beads export, the seat is told to export before handing off,
-  and the loop ends on exactly two conditions: nothing remains that is not
-  waiting on a human, or two wakings in a row left the board untouched. Do not
-  add a third that needs judgment; that is the seat's, in its handoff.
+  and the loop ends on mechanical conditions only - the board clear, the board
+  unmoved for two wakings, the deadline reached, the budget reached - and none
+  of them needs judgment; do not add one that does. That is the seat's, in its
+  handoff.
 - Mail is a file the reader archives. `seats/<seat>/mail.md` is read into the
   prime at every waking until the seat runs `curia mail <seat> --archive`;
   nothing archives it silently, and a seat mails a seat, never the outside.

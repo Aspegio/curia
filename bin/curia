@@ -65,8 +65,11 @@ WATCH_SECONDS = 5
 # launch prefers the next account in the chain past this. handoff_at: the Stop
 # hook tells a seat to hand off past this. limited_at: a launch treats the
 # account as limited past this, marker or none. shift_hours: the Stop hook
-# tells a seat to hand off after this long awake (0: never).
-THRESHOLDS = {"rotate_at": 70.0, "handoff_at": 85.0, "limited_at": 95.0, "shift_hours": 6.0}
+# tells a seat to hand off after this long awake (0: never). wrap_minutes: how
+# long before --until to start wrapping up. budget_wrap_at: percent of --budget
+# at which to start wrapping up.
+THRESHOLDS = {"rotate_at": 70.0, "handoff_at": 85.0, "limited_at": 95.0, "shift_hours": 6.0,
+              "wrap_minutes": 45.0, "budget_wrap_at": 90.0}
 # Labels that say a bead waits on a person; estate.toml `human_labels` overrides.
 HUMAN_LABELS = ["needs-principal", "needs-human", "blocked-by-human"]
 
@@ -110,6 +113,31 @@ def parse_iso(s: str) -> dt.datetime | None:
     except ValueError:
         return None
     return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
+
+
+def parse_until(s: str) -> dt.datetime:
+    """Parse an --until argument: HH:MM (next occurrence, local wall clock),
+    or ISO datetime (UTC assumed if naive). For HH:MM, we assume the time given
+    is in the system's local timezone and convert to UTC."""
+    if not s:
+        die("--until requires a time")
+    iso = parse_iso(s)
+    if iso:
+        if iso <= now():
+            die(f"--until {s} is in the past")
+        return iso
+    m = re.match(r'^(\d{1,2}):(\d{2})$', s)
+    if not m:
+        die(f"--until wants HH:MM or an ISO datetime, got '{s}'")
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if not (0 <= hour < 24 and 0 <= minute < 60):
+        die(f"--until {s} is not a valid time")
+    utc_now = now()
+    local_now = utc_now.astimezone()
+    target_time = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target_time <= local_now:
+        target_time += dt.timedelta(days=1)
+    return target_time.astimezone(dt.timezone.utc)
 
 
 def age(s: str) -> str:
@@ -1010,11 +1038,29 @@ def board(est: Estate, repo: str) -> dict:
     return out
 
 
-def everything_orders(repo: str, b: dict) -> str:
+def night_orders(until: dt.datetime | None = None, budget: float | None = None,
+                 wrap_minutes: float = 45.0, budget_wrap_at: float = 90.0) -> str:
+    """The seat's orders about a night with a deadline and/or budget."""
+    parts = []
+    if until:
+        local = until.astimezone().strftime("%H:%M")
+        z = until.strftime("%H:%M")
+        parts.append(f"The night ends at {local} local ({z}Z); the shift hook tells you when to wrap up, "
+                    f"{int(wrap_minutes)} minutes before. Inside that margin start nothing new: no dispatch, "
+                    "no review, no gate you cannot wait out. Finish or park what is in hand, make the board on "
+                    "disk true, and hand off. Whatever your charter says closes a night (a push, a promotion) "
+                    "must start early enough to finish before the deadline, not before the margin.")
+    if budget:
+        parts.append(f"The night's budget is ${budget:.0f} of recorded spend; the shift hook tells you to "
+                    f"wrap up at {int(budget_wrap_at)}%.")
+    return " ".join(parts) if parts else ""
+
+
+def everything_orders(repo: str, b: dict, night: str = "") -> str:
     """Tonight's orders for a seat working a board until it is clear."""
     def ids(xs: list) -> str:
         return (", ".join(i["id"] for i in xs[:12]) + (" ..." if len(xs) > 12 else "")) or "none"
-    return (f"Tonight's orders: work {repo}'s board until nothing remains that is not waiting on a human. "
+    board_orders = (f"Tonight's orders: work {repo}'s board until nothing remains that is not waiting on a human. "
             f"As of this waking: {len(b['ready'])} ready ({ids(b['ready'])}), {len(b['working'])} in progress "
             f"({ids(b['working'])}), {len(b['blocked'])} blocked by other beads on the board, "
             f"{len(b['human'])} waiting on a human ({ids(b['human'])}; leave those alone, and say in your "
@@ -1023,20 +1069,27 @@ def everything_orders(repo: str, b: dict) -> str:
             "so, or when the board is clear, make sure the board on disk is true (`bd export -o .beads/issues.jsonl`, or this "
             "repo's sync), then /handoff: the launcher wakes you again with the board as it then stands, and "
             "stops when nothing remains. Never close a bead that did not land.")
+    if night:
+        return night + "\n\n" + board_orders
+    return board_orders
 
 
 def cmd_launch(a) -> None:
     est = find_estate(a.estate)
     launch_seat(est, a.seat, repo=a.repo, loop=a.loop, account=a.account, tmux=a.tmux,
-                say=a.say, print_cmd=a.print_cmd, carry=a.carry, everything=a.everything)
+                say=a.say, print_cmd=a.print_cmd, carry=a.carry, everything=a.everything,
+                until=a.until, budget=a.budget)
 
 
 def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, loop: bool = False,
                 account: str | None = None, tmux: bool = False, say: str | None = None,
-                print_cmd: bool = False, carry: bool = False, everything: bool = False) -> None:
+                print_cmd: bool = False, carry: bool = False, everything: bool = False,
+                until: str | None = None, budget: str | None = None) -> None:
     """Wake a seat interactively. `launch` and `ingest` both come here. `repo`
     is where the session starts; several are only for --everything, which
     works their boards in that order."""
+    if (until or budget) and not loop and not everything:
+        die("a deadline needs a loop to end; add --loop or --everything")
     name, s = est.seat(seat)
     if s.get("kind") == "fleet":
         die(f"{name} is a fleet seat; it is dispatched by {s.get('managed_by', 'its office')}, "
@@ -1087,9 +1140,40 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
             inner.append("--everything")
         if say:
             inner += ["--say", say]
+        if until:
+            inner += ["--until", until]
+        if budget:
+            inner += ["--budget", budget]
         subprocess.check_call(["tmux", "new-window", "-n", title, "-c", str(home), shlex.join(inner)])
         print(f"curia: {title} opened in tmux window '{title}'")
         return
+    until_dt = parse_until(until) if until else None
+    budget_float = float(budget) if budget else None
+    if budget_float is not None and budget_float <= 0:
+        die("--budget must be above zero")
+    wrap_minutes = est.threshold("wrap_minutes")
+    budget_wrap_at = est.threshold("budget_wrap_at")
+    night_terms = {}
+    if until_dt:
+        night_terms["until"] = until_dt
+        night_terms["wrap_minutes"] = wrap_minutes
+        local = until_dt.astimezone().strftime("%H:%M")
+        z = until_dt.strftime("%H:%M")
+        print(f"curia: {title}'s night ends at {local} local ({z}Z)")
+    if budget_float is not None:
+        night_terms["budget"] = budget_float
+        night_terms["budget_wrap_at"] = budget_wrap_at
+    night_ord = night_orders(**night_terms) if night_terms else ""
+    if night_terms:
+        log_fields = {}
+        if until_dt:
+            log_fields["until"] = until_dt.isoformat()
+        if budget_float is not None:
+            log_fields["budget"] = f"{budget_float:.2f}"
+        if wrap_minutes > 0:
+            log_fields["wrap"] = f"{int(wrap_minutes)}"
+        log_session(sd, "night", " ".join(f"{k}={v}" for k, v in log_fields.items()))
+    spent = 0.0
     restart = sd / "RESTART"
     if restart.exists():
         restart.unlink()
@@ -1098,10 +1182,38 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
         (sd / stale).unlink(missing_ok=True)   # left by a session that is over
     limited_marker = sd / "LIMITED"
     resume: dict | None = None   # a cut session to carry to the next account (--carry)
-    orders = say
+    orders = night_ord if night_ord else say
+    if night_ord and say:
+        orders = night_ord + "\n\nAlso, from the principal: " + say
     seen_board: tuple | None = None
     idle_rounds = 0
     queue = repos[1:]   # --everything: the boards still to work after this one
+
+    def check_night_over() -> bool:
+        """Check if the night should end due to deadline or budget."""
+        if until_dt and now() >= until_dt - dt.timedelta(minutes=wrap_minutes):
+            local = until_dt.astimezone().strftime("%H:%M")
+            z = until_dt.strftime("%H:%M")
+            msg = f"{title}'s night ends at {local} ({z}Z)"
+            if everything:
+                b = board(est, repo)
+                remaining = b["ready"] + b["working"] + b["blocked"]
+                msg += f"; {len(remaining)} ready, {len(b['working'])} in progress remain in {repo}"
+            print(f"curia: {msg}; not waking it again")
+            log_session(sd, "deadline", f"until={until_dt.isoformat()} remaining={len(remaining) if everything else '?'}")
+            notify(est, f"{title}: night ended at the deadline", msg)
+            return True
+        if budget_float is not None and spent >= budget_float:
+            msg = f"{title}'s night spent ${spent:.2f} of the ${budget_float:.2f} budget"
+            if everything:
+                b = board(est, repo)
+                remaining = b["ready"] + b["working"] + b["blocked"]
+                msg += f"; {len(remaining)} ready, {len(b['working'])} in progress remain in {repo}"
+            print(f"curia: {msg}; not waking it again")
+            log_session(sd, "budget", f"spent={spent:.2f} budget={budget_float:.2f}")
+            notify(est, f"{title}: night ended on budget", msg)
+            return True
+        return False
 
     def next_board() -> bool:
         """Move --everything on to the next repo given, if any: a fresh board,
@@ -1117,6 +1229,8 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
         return True
 
     while True:
+        if check_night_over():
+            break
         if everything:
             b = board(est, repo)
             remaining = b["ready"] + b["working"] + b["blocked"]
@@ -1143,7 +1257,7 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
                 if next_board():
                     continue
                 break
-            orders = everything_orders(repo, b) + (f"\n\nAlso, from the principal: {say}" if say else "")
+            orders = everything_orders(repo, b, night_ord) + (f"\n\nAlso, from the principal: {say}" if say else "")
         free, limited = walk_chain(est, want, own)
         if free is None and loop and limited:
             until = min(u for _, u in limited)
@@ -1159,6 +1273,11 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
         for linked in ensure_skills(cfg):
             print(f"curia: linked the {linked} skill into {cfg.name}")
         env = dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg), CURIA_SEAT=name, CURIA_ESTATE=str(est.dir))
+        if until_dt:
+            env["CURIA_UNTIL"] = until_dt.isoformat()
+        if budget_float is not None:
+            env["CURIA_BUDGET"] = str(budget_float)
+        env["CURIA_SPENT"] = str(spent)
         prime = prime_file(est, name)
         cmd = ["claude", "--name", title, "--append-system-prompt-file", str(prime), "--settings", seat_settings(est)]
         carried = resume is not None and carry_transcript(est, resume, cfg)
@@ -1188,6 +1307,7 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
         if usage:
             if isinstance(usage.get("cost_usd"), (int, float)):
                 tail += f" cost=${usage['cost_usd']:.2f}"
+                spent += usage["cost_usd"]
             if isinstance(usage.get("duration_ms"), (int, float)):
                 tail += f" minutes={usage['duration_ms'] / 60000:.1f}"
             (cfg / "curia-usage" / f"{sid}.json").unlink(missing_ok=True)
@@ -2372,10 +2492,11 @@ def hook_limited(est: Estate, seat: str, payload: dict) -> None:
 
 def hook_shift(est: Estate, seat: str, payload: dict) -> None:
     """Stop: at the end of a turn, is the shift over? Past handoff_at on the
-    account's fullest window, or past shift_hours awake, the seat is told
-    once to hand off; exit 2 keeps it going with that as its orders. The
-    SHIFT-OVER marker stops the nagging, and handoff --done or a launch
-    clears it. Headless there is no /handoff, so nothing is said."""
+    account's fullest window, past shift_hours awake, past the deadline, or
+    past budget, the seat is told once to hand off; exit 2 keeps it going
+    with that as its orders. The SHIFT-OVER marker stops the nagging, and
+    handoff --done or a launch clears it. Headless there is no /handoff, so
+    nothing is said."""
     if os.environ.get("CURIA_HEADLESS") or payload.get("stop_hook_active"):
         return
     sd = est.seat_dir(seat)
@@ -2395,6 +2516,28 @@ def hook_shift(est: Estate, seat: str, payload: dict) -> None:
     if hours > 0 and started and now() - started >= dt.timedelta(hours=hours):
         reasons.append(f"this session has been awake {(now() - started).total_seconds() / 3600:.1f}h "
                        f"(a shift is {hours:g}h)")
+    until = os.environ.get("CURIA_UNTIL")
+    if until:
+        until_dt = parse_iso(until)
+        if until_dt:
+            wrap_minutes = est.threshold("wrap_minutes")
+            if now() >= until_dt - dt.timedelta(minutes=wrap_minutes):
+                remaining_minutes = max(0, int((until_dt - now()).total_seconds() / 60))
+                reasons.append(f"the night ends at {until_dt:%H:%M}Z ({remaining_minutes} minutes remain)")
+    budget_str = os.environ.get("CURIA_BUDGET")
+    spent_str = os.environ.get("CURIA_SPENT")
+    if budget_str and spent_str:
+        budget = float(budget_str)
+        spent = float(spent_str)
+        wrap_at_pct = est.threshold("budget_wrap_at")
+        sid = str((payload.get("session_id") or "?"))
+        session_usage = read_json(cfg / "curia-usage" / f"{sid}.json")
+        session_cost = 0.0
+        if session_usage and isinstance(session_usage.get("cost_usd"), (int, float)):
+            session_cost = session_usage["cost_usd"]
+        total = spent + session_cost
+        if total >= budget * wrap_at_pct / 100:
+            reasons.append(f"recorded spend ${spent:.2f} of the night's ${budget:.2f} budget")
     if not reasons:
         return
     sd.mkdir(parents=True, exist_ok=True)
@@ -2464,7 +2607,7 @@ Looking around
   status                    who is awake, whose memory is how old, what the offices last said, what was spent
 
 Waking seats
-  launch <seat>             wake a crew seat or office, primed (--loop, --everything, --say, --repo, --account, --carry)
+  launch <seat>             wake a crew seat or office, primed (--loop, --everything, --say, --repo, --account, --carry, --until, --budget)
   prime <seat>              print the prime a seat would wake with
   run <seat> --prompt <f>   headless run of a seat with a prompt file; how an office wakes a crew seat (--model, --print-cmd)
   dispatch <fleet>          a fleet worker gets a worktree of its own and a job there (--bead <id>, --review <seat>, --repo)
@@ -2678,6 +2821,22 @@ sessions start there; the loop ends after the last, and each board's
 outcome is reported on its own. A session that dies at once ends the
 whole night, not just that board.
 
+--until and --budget cap the night: a deadline and a spend limit. Both require
+--loop or --everything. --until takes HH:MM (the next occurrence, local time)
+or an ISO datetime (UTC assumed if naive); the launcher reads it as UTC and
+prints both forms, e.g. "06:30 local (01:00Z)", because you type local and the
+record is UTC. An ISO time already past is an error. The seat is told to wrap
+up wrap_minutes before (default 45 minutes, estate.toml), so long turns and
+gates finish in time. --budget, in US dollars, is the recorded spend across
+this night's sessions; the seat is told to wrap at budget_wrap_at percent
+(default 90%). The launcher tracks spend, told in the environment (CURIA_SPENT),
+across the wakings that reported it. Neither ends the night mid-turn: the shift
+hook is what tells the seat to wrap; these set its alarm. The night ends across
+all boards (with several --repo) without moving to the next; the record says so.
+One short last waking that starts just before the margin is possible and a true
+record, not a fault. This is not a hard stop: a turn in flight finishes, but the
+margin makes the deadline hold in practice.
+
 The record: each session gets a fresh session id, written to sessions.log
 with its start and end, so a transcript can be found again (claude
 --resume <id> under that account). The end line carries the cost and
@@ -2861,8 +3020,10 @@ rotation thresholds are there too, with the mechanism's defaults: rotate_at
 (a launch prefers the next account past this), handoff_at (the shift hook
 says hand off past this), limited_at (a launch treats the account as
 limited past this), all percent of an account's fullest rate-limit window
-as its status line last read it, and shift_hours (the shift hook says hand
-off after this long awake; 0 never). `human_labels` names the labels that
+as its status line last read it, shift_hours (the shift hook says hand
+off after this long awake; 0 never), wrap_minutes (how long before --until
+the seat is told to wrap up; 0 means no margin), and budget_wrap_at (percent
+of --budget at which to wrap up). `human_labels` names the labels that
 say a bead waits on a person, which `launch --everything` leaves alone.
 In accounts.toml, `shared = false` marks a dedicated account.
 
@@ -2911,11 +3072,14 @@ line for the bar. That file is what rotation, the shift hook and `status`
 read. Nothing here asks the API anything.
 
 shift: at the end of every turn. Past handoff_at on the account's fullest
-window, or past shift_hours awake (estate.toml), it tells the seat once to
-hand off - exit 2, so the seat carries on with that as its orders - and
-leaves SHIFT-OVER so it is said once; handoff --done or a launch clears
-it. Headless, or when Claude is already continuing because of a stop
-hook, it says nothing.
+window, past shift_hours awake (estate.toml), past the deadline if --until
+is set (wrap_minutes before), or past the budget if --budget is set
+(budget_wrap_at percent), it tells the seat once to hand off - exit 2, so
+the seat carries on with that as its orders - and leaves SHIFT-OVER so it
+is said once; handoff --done or a launch clears it. The environment carries
+CURIA_UNTIL (ISO UTC), CURIA_BUDGET (USD), and CURIA_SPENT (recorded USD
+so far this night). Headless, or when Claude is already continuing because
+of a stop hook, it says nothing.
 
 limited: StopFailure on a rate limit, when a turn dies because the account
 is out of budget. Marks the account limited - until the retry-after the
@@ -2948,7 +3112,9 @@ examples:
   curia launch <seat> --loop --say "..."  wake it with orders and relaunch on /handoff
   curia launch <seat> --loop --carry   ...and carry a cut session to the next account (experimental)
   curia launch <office> --repo <repo> --everything   work the board until nothing remains but what waits on a human
-  curia launch <office> --everything --repo <repo> --repo <repo2>   ...several boards, in that order, one night""",
+  curia launch <office> --everything --repo <repo> --repo <repo2>   ...several boards, in that order, one night
+  curia launch <office> --repo <repo> --everything --until 06:30   ...the board, until 06:30 local time
+  curia launch <office> --repo <repo> --everything --budget 200   ...the board, until $200 of recorded spend""",
     "run": """\
 examples:
   curia run <seat> --prompt <name>.md --repo <repo>
@@ -3076,6 +3242,10 @@ def main() -> None:
     p.add_argument("--everything", action="store_true",
                    help="work the repo's board, or each --repo's in turn, until nothing remains that is not "
                         "waiting on a human (implies --loop)")
+    p.add_argument("--until", help="end the night at this time: HH:MM local, or ISO datetime (UTC assumed if naive); "
+                   "requires --loop or --everything")
+    p.add_argument("--budget", help="end the night when recorded spend reaches this USD amount; "
+                   "requires --loop or --everything")
     p.add_argument("--print-cmd", dest="print_cmd", action="store_true", help="show what would run, without launching")
     p.set_defaults(fn=cmd_launch)
 

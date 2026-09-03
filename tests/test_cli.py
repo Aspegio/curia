@@ -1279,3 +1279,45 @@ def test_run_falls_back_by_model_before_it_falls_back_by_account(curia, cli, est
     assert "fallback_model" not in curia.session_events(estate.seat_dir("muse"))[-1][2]
     rc, out, _ = cli(*E(estate), "run", "muse", "--prompt", str(brief), "--print-cmd")
     assert "(fallback model-z on a limit)" in out
+
+
+# ----------------------------------------------------------------- until and budget
+
+def test_parse_until_handles_hhmm_and_iso_formats(curia, monkeypatch):
+    """parse_until: HH:MM later today resolves to today; earlier resolves to tomorrow;
+    ISO with tz is kept; ISO naive is local; ISO in the past dies."""
+    now = dt.datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    monkeypatch.setattr(curia, "now", lambda: now)
+
+    # HH:MM much later today (adjusting for system timezone)
+    local_now = now.astimezone()
+    much_later_hour = (local_now.hour + 5) % 24
+    result = curia.parse_until(f"{much_later_hour:02d}:30")
+    # result should be today (or tomorrow if hour wrapped) at the specified local time
+    result_local = result.astimezone()
+    assert result_local.hour == much_later_hour and result_local.minute == 30
+
+    # HH:MM earlier today (should be tomorrow)
+    earlier_hour = (local_now.hour - 2) % 24
+    result = curia.parse_until(f"{earlier_hour:02d}:00")
+    result_local = result.astimezone()
+    assert result_local.hour == earlier_hour and result_local.minute == 0
+    assert result_local.date() > local_now.date() or (result_local.date() == local_now.date() and result_local < local_now)
+
+    # ISO with timezone
+    result = curia.parse_until("2026-01-02T06:00:00Z")
+    assert result.year == 2026 and result.month == 1 and result.day == 2
+
+    # ISO naive (assumed local)
+    result = curia.parse_until("2026-01-02T06:00:00")
+    assert result.year == 2026
+
+    # ISO in the past dies
+    with pytest.raises(SystemExit):
+        curia.parse_until("2025-12-31T10:00:00Z")
+
+
+def test_until_and_budget_without_loop_die(cli, estate):
+    rc, _, err = cli(*E(estate), "launch", "muse", "--until", "06:30")
+    assert rc == 2 and "loop to end" in err
+    rc, _, err = cli(*E(estate), "launch", "muse", "--budget", "200")

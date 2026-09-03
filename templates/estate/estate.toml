@@ -24,11 +24,15 @@ land_label = "reviewed"
 # handoff_at - the Stop hook tells a seat to hand off past this;
 # limited_at - a launch treats the account as limited past this, marker or none.
 # shift_hours - the Stop hook tells a seat to hand off after this long awake
-# (0: never). These are the mechanism's defaults; change them here.
+# (0: never); wrap_minutes - how long before --until to start wrapping up
+# (0: no margin); budget_wrap_at - percent of --budget at which to start
+# wrapping up. These are the mechanism's defaults; change them here.
 rotate_at = 70
 handoff_at = 85
 limited_at = 95
 shift_hours = 6
+wrap_minutes = 45
+budget_wrap_at = 90
 # Labels that say a bead waits on a person. `launch --everything` leaves those
 # beads alone and stops when nothing else remains.
 human_labels = ["needs-principal", "needs-human", "blocked-by-human"]
