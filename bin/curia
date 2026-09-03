@@ -1020,7 +1020,7 @@ def everything_orders(repo: str, b: dict) -> str:
             f"{len(b['human'])} waiting on a human ({ids(b['human'])}; leave those alone, and say in your "
             "handoff what would unblock each). Per your charter: claim what is ready, design and dispatch or "
             "implement, get it reviewed and landed, close it, and move to the next. When the shift hook says "
-            "so, or when the board is clear, make sure the board on disk is true (`bd export`, or this "
+            "so, or when the board is clear, make sure the board on disk is true (`bd export -o .beads/issues.jsonl`, or this "
             "repo's sync), then /handoff: the launcher wakes you again with the board as it then stands, and "
             "stops when nothing remains. Never close a bead that did not land.")
 
