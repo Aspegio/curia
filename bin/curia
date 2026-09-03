@@ -1031,10 +1031,12 @@ def cmd_launch(a) -> None:
                 say=a.say, print_cmd=a.print_cmd, carry=a.carry, everything=a.everything)
 
 
-def launch_seat(est: Estate, seat: str, *, repo: str | None = None, loop: bool = False,
+def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, loop: bool = False,
                 account: str | None = None, tmux: bool = False, say: str | None = None,
                 print_cmd: bool = False, carry: bool = False, everything: bool = False) -> None:
-    """Wake a seat interactively. `launch` and `ingest` both come here."""
+    """Wake a seat interactively. `launch` and `ingest` both come here. `repo`
+    is where the session starts; several are only for --everything, which
+    works their boards in that order."""
     name, s = est.seat(seat)
     if s.get("kind") == "fleet":
         die(f"{name} is a fleet seat; it is dispatched by {s.get('managed_by', 'its office')}, "
@@ -1044,7 +1046,13 @@ def launch_seat(est: Estate, seat: str, *, repo: str | None = None, loop: bool =
     title = s.get("title", name)
     sd = est.seat_dir(name)
     home = est.root if s.get("home", "estate") == "estate" else est.repo_path(s["home"])
-    repo = repo or est.repo_here()
+    repos = [repo] if isinstance(repo, str) else list(repo or [])
+    if not repos and est.repo_here():
+        repos = [est.repo_here()]
+    if len(repos) > 1 and not everything:
+        die("a session starts in one repo; only --everything takes several (their boards, in that order)")
+    repos = [est.repo(r)[0] for r in repos]   # every name checked before the first board is worked
+    repo = repos[0] if repos else None
     if repo:
         home = est.repo_path(repo)
     if everything:
@@ -1062,13 +1070,15 @@ def launch_seat(est: Estate, seat: str, *, repo: str | None = None, loop: bool =
               " --session-id <new uuid> --append-system-prompt-file <prime:" +
               str(len(build_prime(est, name))) + " chars> --settings <" + hooks_summary(est) + ">" +
               "".join(" " + x for x in envelope_args(s)) + " " + (shlex.quote(say) if say else ""))
+        if len(repos) > 1:
+            print("boards, in order: " + ", ".join(repos))
         return
     if tmux:
         inner = ["curia", "launch", name, "--estate", str(est.dir)]
         if account:
             inner += ["--account", account]
-        if repo:
-            inner += ["--repo", repo]
+        for r in repos:
+            inner += ["--repo", r]
         if loop:
             inner.append("--loop")
         if carry:
@@ -1091,6 +1101,21 @@ def launch_seat(est: Estate, seat: str, *, repo: str | None = None, loop: bool =
     orders = say
     seen_board: tuple | None = None
     idle_rounds = 0
+    queue = repos[1:]   # --everything: the boards still to work after this one
+
+    def next_board() -> bool:
+        """Move --everything on to the next repo given, if any: a fresh board,
+        a fresh count of idle wakings, and the sessions start there."""
+        nonlocal repo, home, seen_board, idle_rounds
+        if not queue:
+            return False
+        repo = queue.pop(0)
+        home = est.repo_path(repo)
+        seen_board, idle_rounds = None, 0
+        print(f"curia: {title} moves on to {repo}'s board ({len(queue)} more after it)")
+        log_session(sd, "next", f"repo={repo} after={len(queue)}")
+        return True
+
     while True:
         if everything:
             b = board(est, repo)
@@ -1101,16 +1126,22 @@ def launch_seat(est: Estate, seat: str, *, repo: str | None = None, loop: bool =
                 print("curia: " + msg)
                 log_session(sd, "clear", f"repo={repo} human={len(b['human'])} closed={b['closed']}")
                 notify(est, f"{title}: board clear in {repo}", msg)
+                if next_board():
+                    continue
                 break
             key = (tuple(sorted(i["id"] for i in remaining)), b["closed"])
             idle_rounds = idle_rounds + 1 if key == seen_board else 0
             seen_board = key
             if idle_rounds >= 2:
                 msg = (f"{title} has woken twice in {repo} without the board moving ({len(remaining)} remaining, "
-                       "the same set, nothing closed); stopping so someone can look, rather than spinning.")
+                       "the same set, nothing closed); "
+                       + ("moving on to the next board rather than spinning." if queue else
+                          "stopping so someone can look, rather than spinning."))
                 print("curia: " + msg, file=sys.stderr)
                 log_session(sd, "stalled", f"repo={repo} remaining={len(remaining)}")
                 notify(est, f"{title}: no progress in {repo}", msg)
+                if next_board():
+                    continue
                 break
             orders = everything_orders(repo, b) + (f"\n\nAlso, from the principal: {say}" if say else "")
         free, limited = walk_chain(est, want, own)
@@ -2641,7 +2672,11 @@ waiting on a human, or when two wakings in a row leave the board exactly
 as it was, so a stuck seat does not spin all night; the principal is told
 either way. A session that ends without a handoff is woken again while
 the board says so, unless it died at once. --say is appended to the
-orders.
+orders. Given --repo more than once, the boards are worked in that order:
+when one is clear or has stalled, the seat moves on to the next and its
+sessions start there; the loop ends after the last, and each board's
+outcome is reported on its own. A session that dies at once ends the
+whole night, not just that board.
 
 The record: each session gets a fresh session id, written to sessions.log
 with its start and end, so a transcript can be found again (claude
@@ -2912,7 +2947,8 @@ examples:
   curia launch <seat> --account <acct> start on a named account, not the seat's usual
   curia launch <seat> --loop --say "..."  wake it with orders and relaunch on /handoff
   curia launch <seat> --loop --carry   ...and carry a cut session to the next account (experimental)
-  curia launch <office> --repo <repo> --everything   work the board until nothing remains but what waits on a human""",
+  curia launch <office> --repo <repo> --everything   work the board until nothing remains but what waits on a human
+  curia launch <office> --everything --repo <repo> --repo <repo2>   ...several boards, in that order, one night""",
     "run": """\
 examples:
   curia run <seat> --prompt <name>.md --repo <repo>
@@ -3027,7 +3063,9 @@ def main() -> None:
 
     p = parser("launch", "wake a seat interactively (crew or office)")
     p.add_argument("seat", help="a seat name from roster.toml (any case)")
-    p.add_argument("--repo", help="start in this repo (default: the repo you are in, else the seat's home)")
+    p.add_argument("--repo", action="append",
+                   help="start in this repo (default: the repo you are in, else the seat's home); "
+                        "with --everything, repeatable: the boards to work, in that order")
     p.add_argument("--loop", action="store_true", help="relaunch after a /handoff (RESTART marker)")
     p.add_argument("--account", help="start on this account instead of the seat's, e.g. one with headroom")
     p.add_argument("--tmux", action="store_true", help="open in a new tmux window named after the seat")
@@ -3036,7 +3074,8 @@ def main() -> None:
                    help="experimental, with --loop: after a mid-session limit, copy the cut session's transcript "
                         "to the next account and --resume it there")
     p.add_argument("--everything", action="store_true",
-                   help="work the repo's board until nothing remains that is not waiting on a human (implies --loop)")
+                   help="work the repo's board, or each --repo's in turn, until nothing remains that is not "
+                        "waiting on a human (implies --loop)")
     p.add_argument("--print-cmd", dest="print_cmd", action="store_true", help="show what would run, without launching")
     p.set_defaults(fn=cmd_launch)
 

@@ -1195,6 +1195,49 @@ def test_everything_works_the_board_until_it_is_clear_or_stuck(curia, cli, estat
     assert rc == 2 and "wants a repo" in err
 
 
+def test_everything_works_several_boards_in_the_order_given(curia, cli, estate, monkeypatch, tmp_path):
+    def bead(i, status="open"):
+        return {"id": i, "status": status, "title": i, "labels": [], "dependencies": []}
+
+    boards = {"alpha": {"al-1": bead("al-1")}, "nested": {"su-1": bead("su-1")}}
+    exports = {k: estate.repo_path(k) / ".beads" / "issues.jsonl" for k in boards}
+
+    def write():
+        for k, rows in boards.items():
+            exports[k].write_text("".join(json.dumps(r) + "\n" for r in rows.values()))
+
+    write()
+    told = tmp_path / "told.txt"
+    meta = (estate.dir / "estate.toml").read_text().replace(
+        'notify = ""', f'notify = \'printf "%s;" "$CURIA_SUBJECT" >> {told}\'')
+    (estate.dir / "estate.toml").write_text(meta)
+    wakings = []
+
+    def fake(cmd, cwd, env, timeout=None, capture=False, watch=None):
+        wakings.append((Path(cwd).name, cmd[-1]))
+        if Path(cwd) == estate.repo_path("nested"):   # alpha never moves; nested is done in one waking
+            boards["nested"]["su-1"]["status"] = "closed"
+        write()
+        (estate.seat_dir("warden") / "RESTART").touch()
+        return 0
+
+    monkeypatch.setattr(curia, "invoke_claude", fake)
+    rc, out, err = cli(*E(estate), "launch", "warden", "--everything", "--repo", "alpha", "--repo", "nested")
+    assert rc == 0, err
+    assert [w[0] for w in wakings] == ["alpha", "alpha", "sub"]   # alpha stalls after two wakings, then nested
+    assert "work alpha's board" in wakings[0][1] and "work nested's board" in wakings[2][1]
+    assert "moving on to the next board" in err and "moves on to nested's board (0 more after it)" in out
+    assert told.read_text() == "Warden: no progress in alpha;Warden: board clear in nested;"
+    events = [e for e, _, _ in curia.session_events(estate.seat_dir("warden")) if e in ("clear", "stalled", "next")]
+    assert events == ["stalled", "next", "clear"]
+    # every name is checked before the first board is worked; a plain launch starts in one repo
+    wakings.clear()
+    rc, _, err = cli(*E(estate), "launch", "warden", "--everything", "--repo", "alpha", "--repo", "zeta")
+    assert rc == 2 and "no repo 'zeta'" in err and not wakings
+    rc, _, err = cli(*E(estate), "launch", "warden", "--repo", "alpha", "--repo", "nested")
+    assert rc == 2 and "only --everything takes several" in err and not wakings
+
+
 def test_run_falls_back_by_model_before_it_falls_back_by_account(curia, cli, estate, monkeypatch, tmp_path):
     roster = (estate.dir / "roster.toml").read_text().replace(
         'run_model = "model-y"\n', 'run_model = "model-y"\nfallback_model = "model-z"\n')

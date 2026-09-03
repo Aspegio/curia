@@ -53,6 +53,7 @@ cd <repo> && curia launch <seat>  # ...in the repo you are in; --repo <repo> nam
 curia launch <office> --loop     # wake an office; relaunch after each /handoff, and after a mid-session limit
 curia launch <seat> --loop --carry   # ...carrying a cut session's transcript to the next account (experimental)
 curia launch <office> --repo <repo> --everything   # work the board in a loop until nothing remains but what waits on a human
+curia launch <office> --everything --repo <repo> --repo <repo2>   # ...several boards, in that order, one night
 curia ingest <notes...>          # capture beads from meeting notes (wakes the intake office)
 curia ingest --paste             # ...from the clipboard; `... ingest -` reads stdin
 curia ingest --paste --repo <repo>   # ...when the notes concern one repo: start and file there
@@ -98,7 +99,7 @@ roam between estates.
 - The envelope is the roster's: `disallowed_tools` are refused in every session, `tools` are allowed without asking.
 - A headless run falls back by model before it falls back by account: a roster `fallback_model` is tried on the same account when the primary dies on a limit, and the record says which model answered.
 - Rotation is measured: each seat's status line records what Claude Code measures of its account's rate-limit windows; a launch takes the first account in the chain with headroom, a dedicated account (`shared = false`) is only ever its own seats'.
-- A night has a goal: `--everything` reads the board each waking, names what is ready and what waits on a human, and stops when the board is clear or has not moved in two wakings.
+- A night has a goal: `--everything` reads the board each waking, names what is ready and what waits on a human, and stops when the board is clear or has not moved in two wakings. Given several repos, it works their boards in that order.
 - The night does not die on a limit: a seat's Stop hook says "hand off now" past a threshold or a shift length, while it still has tokens to write the note; its StopFailure hook marks the account when a turn dies on the limit, and the looping launcher ends that session and relaunches on the fallback, telling the seat what happened and where the transcript is.
 - Fallback, not failure: an account at its limit hands its seats down the chain; a headless run marks the limit itself and retries, a looped seat waits it out.
 - The record is dated when it happens: the clock is read per event, never cached at start.
