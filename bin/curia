@@ -12,10 +12,13 @@ Vocabulary
   office    a standing seat with a function (runs on a schedule or on demand)
   crew      a seat with a jurisdiction, spoken to directly by the principal
   fleet     seats dispatched by an office, never launched directly
+  gate      a mechanical yes or no (the Portcullis); no model wakes for it
+  fence     a program that refuses what the law forbids (hooks.json)
 """
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import datetime as dt
 import json
 import re
@@ -24,17 +27,63 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
+import time
 import tomllib
+import uuid
 from pathlib import Path
 
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "curia"
 ESTATES_FILE = CONFIG_DIR / "estates.toml"
 MECHANISM_DIR = Path(__file__).resolve().parent.parent
-NOW = dt.datetime.now(dt.timezone.utc)
-STAMP = NOW.strftime("%Y-%m-%dT%H%MZ")
-TODAY = NOW.strftime("%Y-%m-%d")
+# The tool list a seat gets headless when its roster entry names none.
+DEFAULT_TOOLS = ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Agent"]
+# How long an account is marked limited when the banner names no reset time.
+LIMIT_DEFAULT_HOURS = 5
+# The banner claude prints when an account is out of budget; matched only on a
+# run that failed, so a seat merely discussing rate limits is not caught.
+LIMIT_RE = re.compile(r"hit your (?:\w+ )?limit\b|usage limit\b|rate limit\b", re.I)
+# "resets 4:30pm (Area/City)", "resets at 5pm", "resets 16:30". Needs minutes
+# or am/pm so a stray number after "resets" is not read as an hour.
+RESET_RE = re.compile(r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:\(([^)]+)\))?", re.I)
+# Text the estate template leaves for the owner to replace.
+TEMPLATE_TEXT_RE = re.compile(r"\{\{|Fill in for this estate|YYYY-MM-DD|choose one per estate")
+# The lictor's nudge lines; `lictor --write` and `status` count them.
+NUDGE_RE = re.compile(r"- (STALE|BLOCKED|UNBLOCKED|SILENT|UNRULED|UNENFORCED)\b")
+# A ruling's lifecycle, in order: custom becomes advisory, advisory becomes
+# written law, written law grows a program that enforces it, and a ruling
+# that is falsified is retired in place.
+RULING_STATUSES = ("proposed", "advisory", "enacted", "enforced", "retired")
+# Office prompts every estate carries; `check` wants them present and filled in.
+OFFICE_PROMPTS = ("censor.md", "lictor-cloud.md", "dispatch.md", "review.md")
+# How often a watching launcher looks for the seat's LIMITED marker, in seconds.
+WATCH_SECONDS = 5
+# Rotation thresholds, percent of an account's fullest rate-limit window as the
+# status line measures it; estate.toml overrides each by name. rotate_at: a
+# launch prefers the next account in the chain past this. handoff_at: the Stop
+# hook tells a seat to hand off past this. limited_at: a launch treats the
+# account as limited past this, marker or none. shift_hours: the Stop hook
+# tells a seat to hand off after this long awake (0: never).
+THRESHOLDS = {"rotate_at": 70.0, "handoff_at": 85.0, "limited_at": 95.0, "shift_hours": 6.0}
+# Labels that say a bead waits on a person; estate.toml `human_labels` overrides.
+HUMAN_LABELS = ["needs-principal", "needs-human", "blocked-by-human"]
+
+
+def now() -> dt.datetime:
+    """The time, read when asked. A looping launcher and a long headless run
+    outlive the moment they started, so nothing caches this at import: the
+    record would otherwise stamp every end with its start."""
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def stamp(t: dt.datetime | None = None) -> str:
+    return (t or now()).strftime("%Y-%m-%dT%H%M%SZ")
+
+
+def today(t: dt.datetime | None = None) -> str:
+    return (t or now()).strftime("%Y-%m-%d")
 
 
 def die(msg: str, code: int = 2) -> None:
@@ -67,8 +116,12 @@ def age(s: str) -> str:
     d = parse_iso(s)
     if not d:
         return "?"
-    h = (NOW - d).total_seconds() / 3600
+    h = (now() - d).total_seconds() / 3600
     return f"{h:.0f}h" if h < 48 else f"{h/24:.0f}d"
+
+
+def seat_tools(s: dict) -> list[str]:
+    return list(s.get("tools", DEFAULT_TOOLS))
 
 
 # ----------------------------------------------------------------- estate
@@ -89,6 +142,25 @@ class Estate:
     @property
     def principal(self) -> str:
         return self.meta.get("principal", "the principal")
+
+    @property
+    def worktrees_dir(self) -> Path:
+        """Where fleet workers' homes go: estate.toml `worktrees`, relative to
+        the estate root; default worktrees/."""
+        return (self.root / self.meta.get("worktrees", "worktrees")).resolve()
+
+    @property
+    def land_label(self) -> str:
+        """The PR label a reviewer adds to say 'land this': estate.toml
+        `land_label`, default 'reviewed'. An APPROVED review counts too."""
+        return self.meta.get("land_label", "reviewed")
+
+    def threshold(self, key: str) -> float:
+        """A rotation threshold from estate.toml, else the mechanism's default."""
+        v = self.meta.get(key, THRESHOLDS[key])
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            die(f"estate.toml {key} must be a number, not {v!r}")
+        return float(v)
 
     def seat(self, name: str) -> tuple[str, dict]:
         for k, v in self.roster.items():
@@ -168,10 +240,119 @@ def account_limited(est: Estate, acct: str) -> dt.datetime | None:
     if not m.exists():
         return None
     until = parse_iso(m.read_text().strip())
-    if until and until > NOW:
+    if until and until > now():
         return until
     m.unlink(missing_ok=True)
     return None
+
+
+def mark_limited(est: Estate, acct: str, until: dt.datetime) -> Path:
+    m = limit_marker(est, acct)
+    m.write_text(until.isoformat())
+    return m
+
+
+def looks_limited(text: str) -> bool:
+    return bool(LIMIT_RE.search(text))
+
+
+def current_account(est: Estate) -> str | None:
+    """The account whose config dir is CLAUDE_CONFIG_DIR, or None."""
+    cfg = Path(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude"))).resolve()
+    return next((k for k in est.accounts if account_dir(est, k).resolve() == cfg), None)
+
+
+def write_json(path: Path, obj: dict) -> None:
+    """Write a small JSON file whole: a reader never sees half of it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(obj, indent=1) + "\n")
+    os.replace(tmp, path)
+
+
+def read_json(path: Path) -> dict | None:
+    try:
+        d = json.loads(read(path) or "null")
+    except json.JSONDecodeError:
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def usage_path(cfg: Path) -> Path:
+    return cfg / "curia-usage.json"
+
+
+def usage_reading(cfg: Path) -> dict | None:
+    """The account's last status-line reading, written by `hook usage`: the
+    rate-limit windows Claude Code measures, and who read them when."""
+    return read_json(usage_path(cfg))
+
+
+def session_usage(cfg: Path, sid: str) -> dict | None:
+    """What the status line last reported for one session (cost, duration),
+    written by `hook usage` under <config dir>/curia-usage/."""
+    return read_json(cfg / "curia-usage" / f"{sid}.json")
+
+
+def worst_window(reading: dict | None) -> tuple[float | None, dt.datetime | None, str]:
+    """The fullest rate-limit window still open in a reading: (used percent,
+    when it resets, its name). A window whose reset time has passed has
+    emptied since and is ignored; no open window is (None, None, '')."""
+    best: tuple[float | None, dt.datetime | None, str] = (None, None, "")
+    for name in ("five_hour", "seven_day", "spend_limit"):
+        w = (reading or {}).get(name) or {}
+        used, resets = w.get("used_percentage"), w.get("resets_at")
+        if not isinstance(used, (int, float)) or not isinstance(resets, (int, float)):
+            continue
+        resets_dt = dt.datetime.fromtimestamp(resets, dt.timezone.utc)
+        if resets_dt <= now():
+            continue
+        if best[0] is None or used > best[0]:
+            best = (float(used), resets_dt, name)
+    return best
+
+
+def account_burn(est: Estate, acct: str) -> str:
+    """One phrase on what the status line last measured for an account."""
+    reading = usage_reading(account_dir(est, acct))
+    used, resets, window = worst_window(reading)
+    if used is not None and resets is not None:
+        mins = (resets - now()).total_seconds() / 60
+        left = f"{mins / 60:.1f}h" if mins >= 90 else f"{mins:.0f}m"
+        return (f"{window.replace('_', '-')} {used:.0f}% resets in {left} "
+                f"(read {age(str(reading.get('at', '')))} ago by {reading.get('seat') or '?'})")
+    if reading:
+        return f"windows all reset since the last reading ({age(str(reading.get('at', '')))} ago)"
+    return "no reading yet (a seat's status line writes one)"
+
+
+def limit_reset(text: str) -> dt.datetime | None:
+    """The reset time a limit banner names, as an aware UTC datetime, or None
+    when it names none we can read (the caller then uses LIMIT_DEFAULT_HOURS).
+    A clock time without a zone is read as UTC; a time already past today is
+    tomorrow's."""
+    m = RESET_RE.search(text)
+    if not m or not (m.group(2) or m.group(3)):
+        return None
+    hour, minute, ampm, zone = int(m.group(1)), int(m.group(2) or 0), (m.group(3) or "").lower(), m.group(4)
+    if ampm == "pm" and hour < 12:
+        hour += 12
+    if ampm == "am" and hour == 12:
+        hour = 0
+    if hour > 23 or minute > 59:
+        return None
+    tz: dt.tzinfo = dt.timezone.utc
+    if zone:
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(zone.strip())
+        except Exception:
+            return None
+    local = now().astimezone(tz)
+    reset = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if reset <= local:
+        reset += dt.timedelta(days=1)
+    return reset.astimezone(dt.timezone.utc)
 
 
 def ensure_skills(cfg: Path) -> list[str]:
@@ -203,18 +384,57 @@ def ensure_skills(cfg: Path) -> list[str]:
     return linked
 
 
-def resolve_account(est: Estate, acct: str) -> tuple[str, Path]:
+def walk_chain(est: Estate, acct: str, own: str | None = None) -> tuple[str | None, list[tuple[str, dt.datetime]]]:
+    """Walk the fallback chain from acct and choose an account. In chain
+    order, the first account that is not limited and whose fullest measured
+    window is under rotate_at; failing that, the emptiest account that is not
+    limited; None when every account is limited. Limited means a `curia
+    limit` marker, or a status-line reading past limited_at, which counts
+    until that window resets. An account marked `shared = false` is chosen
+    only for a seat whose own roster account it is (own): it is somebody's
+    dedicated account, never a fallback. Returned with the limited accounts
+    passed and when each lifts."""
+    rotate_at, limited_at = est.threshold("rotate_at"), est.threshold("limited_at")
     seen: list[str] = []
+    limited: list[tuple[str, dt.datetime]] = []
+    candidates: list[tuple[str, float]] = []
     cur = acct
     while cur and cur not in seen:
         seen.append(cur)
+        if cur not in est.accounts:
+            die(f"account '{cur}' in the fallback chain is not in accounts.toml")
+        a = est.accounts[cur]
+        if a.get("shared", True) is False and cur != own:
+            cur = a.get("fallback", "")
+            continue
         until = account_limited(est, cur)
         if until is None:
-            return cur, account_dir(est, cur)
-        print(f"curia: account '{cur}' limited until {until:%Y-%m-%d %H:%M}Z, "
+            used, resets, _ = worst_window(usage_reading(account_dir(est, cur)))
+            if used is not None and resets is not None and used >= limited_at:
+                until = resets   # measured full: as good as a marker, lifting when the window does
+            elif used is None or used < rotate_at:
+                return cur, limited
+            else:
+                candidates.append((cur, used))
+        if until is not None:
+            limited.append((cur, until))
+        cur = a.get("fallback", "")
+    if candidates:
+        return min(candidates, key=lambda c: c[1])[0], limited
+    return None, limited
+
+
+def resolve_account(est: Estate, acct: str, own: str | None = None) -> tuple[str, Path]:
+    free, limited = walk_chain(est, acct, own)
+    for name, until in limited:
+        print(f"curia: account '{name}' limited until {until:%Y-%m-%d %H:%M}Z, "
               f"trying fallback", file=sys.stderr)
-        cur = est.accounts[cur].get("fallback", "")
-    die(f"every account in the chain {seen} is limited")
+    if free is None and not limited:
+        die(f"no account in the chain from '{acct}' is open to this seat (dedicated accounts, shared = false, "
+            "are only their own seats')")
+    if free is None:
+        die(f"every account in the chain {[n for n, _ in limited]} is limited")
+    return free, account_dir(est, free)
 
 
 # ------------------------------------------------------------------ prime
@@ -245,7 +465,31 @@ def repos_table(est: Estate) -> str:
             "|---|---|---|---|---|\n" + "\n".join(rows))
 
 
-def build_prime(est: Estate, seat: str) -> str:
+def journal_entries(sd: Path, n: int) -> list[tuple[str, str]]:
+    """The seat's last n journal entries, oldest first: (file stem, text). A
+    headless waking writes one file per run, so entries never race."""
+    jd = sd / "journal"
+    if not jd.is_dir():
+        return []
+    files = sorted(f for f in jd.iterdir() if f.suffix == ".md" and not f.name.startswith("."))
+    return [(f.stem, f.read_text().strip()) for f in files[-n:] if f.read_text().strip()]
+
+
+def handoff_written(sd: Path) -> bool:
+    text = read(sd / "handoff.md").strip()
+    return bool(text) and not text.startswith("_") and len(text) >= 40
+
+
+def handoff_sections() -> list[str]:
+    """The section headings templates/handoff.md asks for."""
+    tpl = read(MECHANISM_DIR / "templates" / "handoff.md")
+    return [line[3:].strip() for line in tpl.splitlines() if line.startswith("## ")]
+
+
+def build_prime(est: Estate, seat: str, journal_path: Path | None = None, model: str | None = None) -> str:
+    """The system prompt a seat wakes with. journal_path marks a headless
+    waking: the closing line then points at the journal instead of /handoff,
+    and model is the one actually in use for the run."""
     name, s = est.seat(seat)
     sd = est.seat_dir(name)
     title = s.get("title", name)
@@ -254,9 +498,11 @@ def build_prime(est: Estate, seat: str) -> str:
     parts = [
         "# Curia seat prime",
         f"You are **{title}**, a persistent seat in the {est.name} estate. "
-        f"This is your session {n}, {TODAY}. The principal is {est.principal}. "
+        f"This is your session {n}, {today()}. The principal is {est.principal}. "
         f"Seats outlive sessions: what you write in your handoff is what you wake up to.",
-        f"Kind: {s.get('kind', '?')}. Model: {s.get('model', '?')}. Pronouns: {pron}.",
+        f"Kind: {s.get('kind', '?')}. Model: {model or s.get('model', '?')}"
+        + (f" (headless runs: {s['run_model']})" if s.get("run_model") and not model else "")
+        + f". Pronouns: {pron}.",
     ]
     if s.get("jurisdiction"):
         parts.append("Your jurisdiction (concerns, across every repo in the estate):\n" +
@@ -269,21 +515,169 @@ def build_prime(est: Estate, seat: str) -> str:
         parts.append("## Your charter\n" + charter)
     handoff = read(sd / "handoff.md").strip()
     parts.append("## Your last handoff\n" + (handoff or "_No handoff yet. This is your first waking._"))
+    entries = journal_entries(sd, 3)
+    if entries:
+        parts.append("## Your journal (headless wakings, newest last)\n" +
+                     "\n\n".join(f"### {stem}\n{body}" for stem, body in entries))
     laurels = read(sd / "laurels.md").strip()
     if laurels and not laurels.startswith("_"):
         parts.append("## Laurels\n" + laurels)
+    mail = read(sd / "mail.md").strip()
+    if mail:
+        parts.append("## Mail (unread)\n" + mail +
+                     f"\n\nAct on it or park it in your handoff, then `curia mail {name.lower()} --archive` "
+                     "so it is not read to you again; nothing archives it for you.")
+    cut = read_json(sd / "LAST-LIMITED") if (sd / "LAST-LIMITED").exists() else None
+    if cut is not None:
+        parts.append("## Your last session ended on a usage limit\n"
+                     f"On {cut.get('at', '?')} account `{cut.get('account', '?')}` hit its limit mid-session and "
+                     "the harness ended the session: no handoff was written, so the handoff above is from the "
+                     f"session before. The cut session's transcript is at `{cut.get('transcript_path') or '?'}` "
+                     "(under that account's config dir) if you need what it knew; do not re-derive what you can "
+                     "read there. Carry on, and hand off properly this time; that clears this notice.")
     rules = read(est.dir / "house-rules.md").strip()
     if rules:
         parts.append("## House rules\n" + rules)
-    parts.append(f"Estate directory: `{est.dir}`. Your seat directory: `{sd}`. "
-                 "When the session should end, use /handoff, not /exit.")
+    where = f"Estate directory: `{est.dir}`. Your seat directory: `{sd}`. "
+    if journal_path:
+        parts.append(where + "This is a headless waking: there is no /handoff here. Your journal entry at "
+                     f"`{journal_path}` is your memory; the orders at the end of your prompt say what goes in it.")
+    else:
+        parts.append(where + "When the session should end, use /handoff, not /exit.")
     return "\n\n".join(parts) + "\n"
 
 
 def log_session(sd: Path, event: str, detail: str = "") -> None:
     sd.mkdir(parents=True, exist_ok=True)
     with open(sd / "sessions.log", "a") as f:
-        f.write(f"{event} {NOW.isoformat(timespec='seconds')} {detail}\n".rstrip() + "\n")
+        f.write(f"{event} {now().isoformat(timespec='seconds')} {detail}\n".rstrip() + "\n")
+
+
+def session_events(sd: Path) -> list[tuple[str, str, str]]:
+    """sessions.log as (event, iso time, detail) triples, in order."""
+    out = []
+    for line in read(sd / "sessions.log").splitlines():
+        bits = line.split(" ", 2)
+        if len(bits) >= 2:
+            out.append((bits[0], bits[1], bits[2] if len(bits) > 2 else ""))
+    return out
+
+
+def detail_field(detail: str, key: str) -> str:
+    """The value of key=value in a sessions.log detail, or ''."""
+    m = re.search(rf"(?:^|\s){re.escape(key)}=(\S+)", detail)
+    return m.group(1) if m else ""
+
+
+def open_sessions(sd: Path) -> list[dict]:
+    """Starts in sessions.log with no end: sid, pid (None before pids were
+    recorded), at (iso), detail. An end pairs with its start by session id,
+    else with the oldest start that has none, else the oldest open start."""
+    open_: list[dict] = []
+    for ev, t, detail in session_events(sd):
+        if ev == "start":
+            pid = detail_field(detail, "pid")
+            open_.append({"sid": detail_field(detail, "session"), "pid": int(pid) if pid.isdigit() else None,
+                          "at": t, "detail": detail})
+        elif ev == "end" and open_:
+            sid = detail_field(detail, "session")
+            match = (next((o for o in open_ if sid and o["sid"] == sid), None)
+                     or next((o for o in open_ if not o["sid"]), None) or open_[0])
+            open_.remove(match)
+    return open_
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def spend(est: Estate) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Headless spend from every seat's sessions.log, by account and by seat:
+    wakings, cost, turns, minutes. The end line carries the cost, the start
+    line the account; they pair by session id, else by order."""
+    by_acct: dict[str, dict] = {}
+    by_seat: dict[str, dict] = {}
+    for k, v in est.roster.items():
+        open_: list[tuple[str, str]] = []   # (sid, account)
+        for ev, _t, detail in session_events(est.seat_dir(k)):
+            if ev == "start":
+                open_.append((detail_field(detail, "session"), detail_field(detail, "account")))
+                continue
+            if ev != "end":
+                continue
+            sid = detail_field(detail, "session")
+            i = next((i for i, o in enumerate(open_) if sid and o[0] == sid), None)
+            if i is None:
+                i = next((i for i, o in enumerate(open_) if not o[0]), 0 if open_ else None)
+            acct = open_.pop(i)[1] if i is not None else ""
+            cost = detail_field(detail, "cost").lstrip("$")
+            if not cost:
+                continue
+            for table, key in ((by_acct, acct or "?"), (by_seat, v.get("title", k))):
+                row = table.setdefault(key, {"wakings": 0, "cost": 0.0, "turns": 0, "minutes": 0.0})
+                row["wakings"] += 1
+                row["cost"] += float(cost)
+                row["turns"] += int(detail_field(detail, "turns") or 0)
+                row["minutes"] += float(detail_field(detail, "minutes") or 0)
+    return by_acct, by_seat
+
+
+def mail_sender(est: Estate) -> tuple[str, str]:
+    """Who is speaking: (roster key, display name). A seat when CURIA_SEAT
+    names one on this roster, else the principal."""
+    seat = os.environ.get("CURIA_SEAT", "")
+    for k, v in est.roster.items():
+        if seat and k.lower() == seat.lower():
+            return k, v.get("title", k)
+    return "", est.principal
+
+
+# ---------------------------------------------------------------- rulings
+
+def rulings(est: Estate) -> list[dict]:
+    """The brain's rulings, oldest first: slug, status, what enforces it, date
+    (the YYYY-MM-DD the filename starts with, else the file's mtime), text.
+    A `status:` line and an `enforced by:` line are read wherever they are."""
+    d = est.dir / "brain" / "rulings"
+    out: list[dict] = []
+    if not d.is_dir():
+        return out
+    for f in sorted(p for p in d.iterdir()
+                    if p.suffix == ".md" and not p.name.startswith(".") and p.name.lower() != "readme.md"):
+        text = f.read_text()
+        # The status line may open a line or sit in a dated header ("Date: ... Status: enacted.").
+        head = "\n".join(text.splitlines()[:12])
+        m = re.search(r"\bstatus:\s*([A-Za-z]+)", head, re.I)
+        e = re.search(r"^enforced by:\s*(.+?)\s*$", text, re.I | re.M)
+        enforced = e.group(1).strip() if e else ""
+        if re.fullmatch(r"(nothing( yet)?|none|-|tbd|n/a)\.?", enforced, re.I):
+            enforced = ""
+        dm = re.match(r"(\d{4}-\d{2}-\d{2})", f.name)
+        date = (parse_iso(dm.group(1)) if dm else None) or \
+            dt.datetime.fromtimestamp(f.stat().st_mtime, dt.timezone.utc)
+        out.append({"slug": f.stem, "path": f, "status": m.group(1).lower() if m else "",
+                    "enforced": enforced, "date": date, "text": text})
+    return out
+
+
+def cmd_rulings(a) -> None:
+    est = find_estate(a.estate)
+    rs = rulings(est)
+    if not rs:
+        print(f"  no rulings in {est.dir / 'brain' / 'rulings'}")
+        return
+    cols = shutil.get_terminal_size().columns
+    for r in rs:
+        lead = f"  {r['date']:%Y-%m-%d}  {r['status'] or 'NO STATUS':<9} {r['slug']:<44} enforced by: "
+        line = lead + (r["enforced"] or "-")
+        width = max(cols, len(lead) + 40)   # long prose is cut, never wrapped out of its column
+        print(line if len(line) <= width else line[:width - 4] + " ...")
 
 
 # --------------------------------------------------------------- commands
@@ -294,6 +688,8 @@ def cmd_roster(a) -> None:
     cols = shutil.get_terminal_size().columns
     for k, v in est.roster.items():
         extra = "; ".join(v.get("jurisdiction", [])) or v.get("summary", "")
+        if v.get("run_model"):
+            extra = f"(headless: {v['run_model']}) {extra}".rstrip()
         if not v.get("active", True):
             extra = f"(reserved) {extra}".rstrip()
         lead = (f"  {v.get('title', k):<12} {v.get('kind', '?'):<7} "
@@ -323,12 +719,15 @@ def cmd_accounts(a) -> None:
         d = account_dir(est, k)
         until = account_limited(est, k)
         state = f"limited until {until:%Y-%m-%d %H:%M}Z" if until else ("ok" if d.exists() else "NO CONFIG DIR")
-        print(f"  {k:<10} {v.get('plan', ''):<10} fallback={v.get('fallback', '-'):<10} {state:<28} {d}")
+        print(f"  {k:<10} {v.get('plan', ''):<10} fallback={v.get('fallback', '-'):<10} {state:<28} {d}"
+              + ("" if v.get("shared", True) else "  (dedicated)"))
+        print(f"  {'':<10} {account_burn(est, k)}")
 
 
 def cmd_check(a) -> None:
     est = find_estate(a.estate)
     problems: list[str] = []
+    notes: list[str] = []
     for k, v in est.roster.items():
         if v.get("account") not in est.accounts:
             problems.append(f"seat {k}: account '{v.get('account')}' not in accounts.toml")
@@ -339,6 +738,57 @@ def cmd_check(a) -> None:
         sd = est.seat_dir(k)
         if not (sd / "charter.md").exists():
             problems.append(f"seat {k}: no charter.md")
+        events = session_events(sd)
+        starts = [e for e in events if e[0] == "start"]
+        ends = [e for e in events if e[0] == "end"]
+        interactive = [e for e in starts if "headless" not in e[2]]
+        headless = [e for e in starts if "headless" in e[2]]
+        if interactive and not handoff_written(sd):
+            notes.append(f"seat {k}: {len(interactive)} interactive session(s) and no handoff written; "
+                         "its memory is empty")
+        if headless and not journal_entries(sd, 1):
+            notes.append(f"seat {k}: {len(headless)} headless waking(s) and no journal entry "
+                         "(runs before journals existed, or the seat is not writing one)")
+        open_ = open_sessions(sd)
+        if (sd / "RESTART").exists() and not open_:
+            notes.append(f"seat {k}: stale RESTART marker with no session awake; the next launch clears it")
+        if (sd / "LIMITED").exists() and not open_:
+            notes.append(f"seat {k}: LIMITED marker with no session awake; the next launch clears it")
+        if (sd / "LAST-LIMITED").exists():
+            notes.append(f"seat {k}: its last session ended on a usage limit and no handoff has been written "
+                         "since; the prime says so until one is")
+        chain, cur, seen = [], v.get("account", ""), set()
+        while cur in est.accounts and cur not in seen:
+            seen.add(cur)
+            if est.accounts[cur].get("shared", True) is False and cur != v.get("account"):
+                chain.append(cur)
+            cur = est.accounts[cur].get("fallback", "")
+        if chain:
+            notes.append(f"seat {k}: dedicated account(s) {', '.join(chain)} in its chain are skipped for it "
+                         "(shared = false)")
+        for o in open_:
+            if o["pid"] and not pid_alive(o["pid"]):
+                notes.append(f"seat {k}: a session from {age(o['at'])} ago has no end and its launcher "
+                             f"(pid {o['pid']}) is gone; `curia reap` closes the record")
+    for key in THRESHOLDS:
+        v = est.meta.get(key)
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
+            problems.append(f"estate.toml {key} must be a number, not {v!r}")
+    for r in rulings(est):
+        if not r["status"]:
+            problems.append(f"ruling {r['slug']}: no `status:` line (one of {', '.join(RULING_STATUSES)})")
+        elif r["status"] not in RULING_STATUSES:
+            problems.append(f"ruling {r['slug']}: status '{r['status']}' is not one of "
+                            + ", ".join(RULING_STATUSES))
+        elif r["status"] == "enforced" and not r["enforced"]:
+            problems.append(f"ruling {r['slug']}: status enforced, but no `enforced by:` line names the program")
+        elif r["status"] == "enacted" and not r["enforced"]:
+            notes.append(f"ruling {r['slug']}: enacted with nothing enforcing it; law by custom until "
+                         "something does (the lictor nudges after a while)")
+    try:
+        load_hooks(est.dir / "hooks.json")
+    except ValueError as e:
+        problems.append(str(e))
     for k, r in est.repos.items():
         p = est.repo_path(k)
         if not p.exists():
@@ -357,17 +807,31 @@ def cmd_check(a) -> None:
         if missing:
             problems.append(f"account {k}: skills not linked into {cfg / 'skills'}: "
                             + ", ".join(missing) + " (a launch links them; `curia check` only reports)")
-    for prompt in ("censor.md", "lictor-cloud.md"):
-        if not (est.dir / "prompts" / prompt).exists():
-            problems.append(f"prompts/{prompt} missing")
+        until = account_limited(est, k)
+        if until:
+            notes.append(f"account {k}: limited until {until:%Y-%m-%d %H:%M}Z; launches fall back to "
+                         f"'{est.accounts[k].get('fallback', '-')}'")
+    for prompt in OFFICE_PROMPTS:
+        pp = est.dir / "prompts" / prompt
+        if not pp.exists():
+            problems.append(f"prompts/{prompt} missing (the template has one: "
+                            f"{MECHANISM_DIR / 'templates' / 'estate' / 'prompts' / prompt})")
+        elif TEMPLATE_TEXT_RE.search(read(pp)):
+            problems.append(f"prompts/{prompt} still carries template text; fill it in")
+    if TEMPLATE_TEXT_RE.search(read(est.dir / "estate.toml")):
+        notes.append("estate.toml still carries template text (created, naming_family)")
     if not shutil.which("claude"):
         problems.append("claude not on PATH")
     if not shutil.which("gh"):
         problems.append("gh not on PATH (lictor and censor need it for PRs and runs)")
     if problems:
         print("\n".join(f"  ! {p}" for p in problems))
+    else:
+        print(f"  {est.name}: roster, repos, accounts and prompts are consistent")
+    if notes:
+        print("\n".join(f"  - {n}" for n in notes))
+    if problems:
         sys.exit(1)
-    print(f"  {est.name}: roster, repos, accounts and prompts are consistent")
 
 
 def cmd_prime(a) -> None:
@@ -375,9 +839,203 @@ def cmd_prime(a) -> None:
     print(build_prime(est, a.seat))
 
 
+def load_hooks(path: Path) -> dict:
+    """hooks.json as {event: [...]}; ValueError when it is not that shape."""
+    text = read(path)
+    if not text.strip():
+        return {}
+    try:
+        d = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{path} is not valid JSON: {e}")
+    hooks = d.get("hooks") if isinstance(d, dict) else None
+    if not isinstance(hooks, dict) or not all(isinstance(v, list) for v in hooks.values()):
+        raise ValueError(f'{path} must be {{"hooks": {{"<Event>": [...]}}}}, the shape of a settings file')
+    return hooks
+
+
+def estate_hooks(est: Estate) -> dict:
+    """The estate's own fences: curia/hooks.json, in the shape of Claude Code's
+    settings. A ruling becomes mechanical here - a PreToolUse command that
+    refuses - without any account's settings.json being edited. Absent or
+    empty means the estate declares none."""
+    try:
+        return load_hooks(est.dir / "hooks.json")
+    except ValueError as e:
+        die(str(e))
+
+
+def hooks_summary(est: Estate, headless: bool = False) -> str:
+    n = sum(len(v) for v in estate_hooks(est).values())
+    return ("precompact, shift and limited hooks" + ("" if headless else ", usage status line")
+            + (f" + {n} estate hook(s) from hooks.json" if n else ""))
+
+
+def seat_settings(est: Estate | None = None, headless: bool = False) -> str:
+    """Settings a seat session carries, passed with --settings so no account's
+    settings.json is edited. The mechanism's hooks: PreCompact turns a manual
+    /compact into a reminder to hand off; Stop says when the shift is over;
+    StopFailure on a rate limit marks the account and tells the launcher.
+    Then whatever fences the estate declares in hooks.json. Interactively, a
+    status line that records what Claude Code measures. Auto-compaction is
+    not blocked, and nothing fires on a context threshold; no such hook
+    exists."""
+    me = shlex.quote(str(Path(__file__).resolve()))
+    hooks: dict = {
+        "PreCompact": [{"matcher": "manual", "hooks": [{"type": "command", "command": f"{me} hook precompact"}]}],
+        "Stop": [{"hooks": [{"type": "command", "command": f"{me} hook shift"}]}],
+        "StopFailure": [{"matcher": "rate_limit", "hooks": [{"type": "command", "command": f"{me} hook limited"}]}],
+    }
+    for event, entries in (estate_hooks(est) if est else {}).items():
+        hooks.setdefault(event, []).extend(entries)
+    settings: dict = {"hooks": hooks}
+    if not headless:
+        settings["statusLine"] = {"type": "command", "command": f"{me} hook usage", "refreshInterval": 60}
+    return json.dumps(settings)
+
+
+def envelope_args(s: dict, *, headless: bool = False, skip_permissions: bool = False) -> list[str]:
+    """The seat's authority envelope on the command line. `disallowed_tools`
+    in the roster are refused in every session: that is the fence. `tools`
+    are allowed without asking: headless, the roster's list or the default;
+    interactively, only a list the roster names."""
+    out: list[str] = []
+    if headless and not skip_permissions:
+        out += ["--allowedTools", ",".join(seat_tools(s))]
+    elif not headless and s.get("tools"):
+        out += ["--allowedTools", ",".join(s["tools"])]
+    if s.get("disallowed_tools"):
+        out += ["--disallowedTools", ",".join(s["disallowed_tools"])]
+    return out
+
+
+def prime_file(est: Estate, name: str, **kw) -> Path:
+    """The prime in a temporary file for --append-system-prompt-file, so a long
+    handoff does not ride on the command line. The caller removes it."""
+    f = tempfile.NamedTemporaryFile("w", prefix=f"curia-prime-{name.lower()}-", suffix=".md", delete=False)
+    with f:
+        f.write(build_prime(est, name, **kw))
+    return Path(f.name)
+
+
+def invoke_claude(cmd: list[str], cwd: Path, env: dict, timeout: int | None = None, capture: bool = False,
+                  watch=None):
+    """The one place claude is started; tests replace it. Headless runs get no
+    stdin: claude waits on an inherited pipe and warns when nothing comes.
+    With `watch`, a callable, the session is ended (SIGTERM, then SIGKILL) as
+    soon as it returns true: the launcher ends a session whose account hit
+    its limit, since nothing useful can happen there without tokens."""
+    if capture:
+        return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True,
+                              timeout=timeout, stdin=subprocess.DEVNULL)
+    if watch is None:
+        return subprocess.call(cmd, cwd=cwd, env=env)
+    p = subprocess.Popen(cmd, cwd=cwd, env=env)
+    while True:
+        try:
+            return p.wait(timeout=WATCH_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        if watch():
+            p.terminate()
+            try:
+                return p.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                return p.wait()
+
+
+def carry_transcript(est: Estate, cut: dict, cfg: Path) -> bool:
+    """Experimental: copy a cut session's transcript from the limited
+    account's config dir into the next account's, at the same relative path,
+    so the relaunch can --resume it there. False when the file is not where
+    the hook said, or not under that account's config dir."""
+    acct = str(cut.get("account", ""))
+    src = Path(str(cut.get("transcript_path", "")))
+    if acct not in est.accounts or not src.is_file():
+        return False
+    try:
+        rel = src.resolve().relative_to(account_dir(est, acct).resolve())
+    except ValueError:
+        return False
+    dest = cfg / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+    return True
+
+
+def board(est: Estate, repo: str) -> dict:
+    """The repo's beads export sorted for a night's work. ready: open and
+    nothing open blocks it. working: in progress. blocked: by open beads on
+    the board, which will come through. human: waiting on a person - a label
+    from `human_labels`, a blocked bead with nothing open on the board
+    blocking it, or a bead blocked only by such beads or by ids not on the
+    board. closed: how many are. Only as fresh as the last export."""
+    p = est.repo_path(repo) / ".beads" / "issues.jsonl"
+    if not p.exists():
+        die(f"{repo} has no .beads/issues.jsonl export; there is no board to work")
+    issues = [json.loads(line) for line in open(p) if line.strip()]
+    status = {i["id"]: i.get("status") for i in issues}
+    labels = set(est.meta.get("human_labels") or HUMAN_LABELS)
+    recorded = {i["id"]: [d["depends_on_id"] for d in i.get("dependencies", []) if d.get("type") == "blocks"]
+                for i in issues}
+    blockers = {k: [b for b in v if status.get(b) != "closed"] for k, v in recorded.items()}   # still open
+    # blocked with no blocker on record is blocked by something off the board: a person.
+    # Blocked with every blocker closed is merely not flipped back yet; it is ready.
+    human = {i["id"] for i in issues if i.get("status") != "closed"
+             and (set(i.get("labels") or []) & labels or (i.get("status") == "blocked" and not recorded[i["id"]]))}
+    grew = True
+    while grew:   # blocked only by what waits on a person waits on a person
+        grew = False
+        for i in issues:
+            if i["id"] in human or i.get("status") == "closed" or not blockers[i["id"]]:
+                continue
+            if all(b in human or b not in status for b in blockers[i["id"]]):
+                human.add(i["id"])
+                grew = True
+    out: dict = {"ready": [], "working": [], "blocked": [], "human": [],
+                 "closed": sum(1 for i in issues if i.get("status") == "closed")}
+    for i in issues:
+        st = i.get("status")
+        if st == "closed":
+            continue
+        if i["id"] in human:
+            out["human"].append(i)
+        elif blockers[i["id"]]:
+            out["blocked"].append(i)
+        elif st == "in_progress":
+            out["working"].append(i)
+        else:
+            out["ready"].append(i)
+    return out
+
+
+def everything_orders(repo: str, b: dict) -> str:
+    """Tonight's orders for a seat working a board until it is clear."""
+    def ids(xs: list) -> str:
+        return (", ".join(i["id"] for i in xs[:12]) + (" ..." if len(xs) > 12 else "")) or "none"
+    return (f"Tonight's orders: work {repo}'s board until nothing remains that is not waiting on a human. "
+            f"As of this waking: {len(b['ready'])} ready ({ids(b['ready'])}), {len(b['working'])} in progress "
+            f"({ids(b['working'])}), {len(b['blocked'])} blocked by other beads on the board, "
+            f"{len(b['human'])} waiting on a human ({ids(b['human'])}; leave those alone, and say in your "
+            "handoff what would unblock each). Per your charter: claim what is ready, design and dispatch or "
+            "implement, get it reviewed and landed, close it, and move to the next. When the shift hook says "
+            "so, or when the board is clear, make sure the board on disk is true (`bd export`, or this "
+            "repo's sync), then /handoff: the launcher wakes you again with the board as it then stands, and "
+            "stops when nothing remains. Never close a bead that did not land.")
+
+
 def cmd_launch(a) -> None:
     est = find_estate(a.estate)
-    name, s = est.seat(a.seat)
+    launch_seat(est, a.seat, repo=a.repo, loop=a.loop, account=a.account, tmux=a.tmux,
+                say=a.say, print_cmd=a.print_cmd, carry=a.carry, everything=a.everything)
+
+
+def launch_seat(est: Estate, seat: str, *, repo: str | None = None, loop: bool = False,
+                account: str | None = None, tmux: bool = False, say: str | None = None,
+                print_cmd: bool = False, carry: bool = False, everything: bool = False) -> None:
+    """Wake a seat interactively. `launch` and `ingest` both come here."""
+    name, s = est.seat(seat)
     if s.get("kind") == "fleet":
         die(f"{name} is a fleet seat; it is dispatched by {s.get('managed_by', 'its office')}, "
             "not launched directly")
@@ -386,50 +1044,158 @@ def cmd_launch(a) -> None:
     title = s.get("title", name)
     sd = est.seat_dir(name)
     home = est.root if s.get("home", "estate") == "estate" else est.repo_path(s["home"])
-    repo = a.repo or est.repo_here()
+    repo = repo or est.repo_here()
     if repo:
         home = est.repo_path(repo)
-    want = getattr(a, "account", None) or s.get("account", "")
+    if everything:
+        if not repo:
+            die("--everything wants a repo to work: --repo <repo>, or launch from inside one")
+        loop = True
+    want = account or s.get("account", "")
     if want not in est.accounts:
         die(f"account '{want}' is not in accounts.toml ({', '.join(est.accounts)})")
-    if getattr(a, "print_cmd", False):
-        acct, cfg = resolve_account(est, want)
+    own = s.get("account", "")
+    if print_cmd:
+        acct, cfg = resolve_account(est, want, own)
         print("CLAUDE_CONFIG_DIR=" + str(cfg) + " CURIA_SEAT=" + name + " cwd=" + str(home))
         print("claude --name " + shlex.quote(title) + " --model " + s.get("model", "?") +
-              " --append-system-prompt <prime:" + str(len(build_prime(est, name))) + " chars> " +
-              (shlex.quote(a.say) if getattr(a, "say", None) else ""))
+              " --session-id <new uuid> --append-system-prompt-file <prime:" +
+              str(len(build_prime(est, name))) + " chars> --settings <" + hooks_summary(est) + ">" +
+              "".join(" " + x for x in envelope_args(s)) + " " + (shlex.quote(say) if say else ""))
         return
-    if a.tmux:
+    if tmux:
         inner = ["curia", "launch", name, "--estate", str(est.dir)]
-        if getattr(a, "account", None):
-            inner += ["--account", a.account]
+        if account:
+            inner += ["--account", account]
         if repo:
             inner += ["--repo", repo]
-        if a.loop:
+        if loop:
             inner.append("--loop")
-        if getattr(a, "say", None):
-            inner += ["--say", a.say]
+        if carry:
+            inner.append("--carry")
+        if everything:
+            inner.append("--everything")
+        if say:
+            inner += ["--say", say]
         subprocess.check_call(["tmux", "new-window", "-n", title, "-c", str(home), shlex.join(inner)])
         print(f"curia: {title} opened in tmux window '{title}'")
         return
+    restart = sd / "RESTART"
+    if restart.exists():
+        restart.unlink()
+        print(f"curia: cleared a stale RESTART marker for {title}; this launch is the waking it asked for")
+    for stale in ("LIMITED", "SHIFT-OVER"):
+        (sd / stale).unlink(missing_ok=True)   # left by a session that is over
+    limited_marker = sd / "LIMITED"
+    resume: dict | None = None   # a cut session to carry to the next account (--carry)
+    orders = say
+    seen_board: tuple | None = None
+    idle_rounds = 0
     while True:
-        acct, cfg = resolve_account(est, want)
+        if everything:
+            b = board(est, repo)
+            remaining = b["ready"] + b["working"] + b["blocked"]
+            if not remaining:
+                msg = (f"{title}'s board in {repo} is clear: nothing remains that is not waiting on a human "
+                       f"({len(b['human'])} waiting, {b['closed']} closed).")
+                print("curia: " + msg)
+                log_session(sd, "clear", f"repo={repo} human={len(b['human'])} closed={b['closed']}")
+                notify(est, f"{title}: board clear in {repo}", msg)
+                break
+            key = (tuple(sorted(i["id"] for i in remaining)), b["closed"])
+            idle_rounds = idle_rounds + 1 if key == seen_board else 0
+            seen_board = key
+            if idle_rounds >= 2:
+                msg = (f"{title} has woken twice in {repo} without the board moving ({len(remaining)} remaining, "
+                       "the same set, nothing closed); stopping so someone can look, rather than spinning.")
+                print("curia: " + msg, file=sys.stderr)
+                log_session(sd, "stalled", f"repo={repo} remaining={len(remaining)}")
+                notify(est, f"{title}: no progress in {repo}", msg)
+                break
+            orders = everything_orders(repo, b) + (f"\n\nAlso, from the principal: {say}" if say else "")
+        free, limited = walk_chain(est, want, own)
+        if free is None and loop and limited:
+            until = min(u for _, u in limited)
+            print(f"curia: every account in the chain is limited; {title} waits until "
+                  f"{until:%Y-%m-%d %H:%M}Z, then tries again", file=sys.stderr)
+            log_session(sd, "wait", f"every account limited until {until.isoformat(timespec='seconds')}")
+            notify(est, f"{title} is waiting for a limit to lift",
+                   f"Every account in {title}'s chain is limited until {until:%Y-%m-%d %H:%M}Z; "
+                   "the --loop launcher tries again then.")
+            time.sleep(max(60.0, (until - now()).total_seconds() + 60))
+            continue
+        acct, cfg = resolve_account(est, want, own)  # dies when the chain is spent and there is no loop to wait in
         for linked in ensure_skills(cfg):
             print(f"curia: linked the {linked} skill into {cfg.name}")
         env = dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg), CURIA_SEAT=name, CURIA_ESTATE=str(est.dir))
-        cmd = ["claude", "--name", title, "--append-system-prompt", build_prime(est, name)]
+        prime = prime_file(est, name)
+        cmd = ["claude", "--name", title, "--append-system-prompt-file", str(prime), "--settings", seat_settings(est)]
+        carried = resume is not None and carry_transcript(est, resume, cfg)
+        if carried:
+            sid = str(resume["session_id"])
+            cmd += ["--resume", sid]
+        else:
+            sid = str(uuid.uuid4())
+            cmd += ["--session-id", sid]
+        resume = None
         if s.get("model"):
             cmd += ["--model", s["model"]]
-        if getattr(a, "say", None):
-            cmd.append(a.say)
-        log_session(sd, "start", f"account={acct} cwd={home}")
-        print(f"curia: waking {title} (session {session_number(sd) - 1}, account {acct}, in {home})")
-        rc = subprocess.call(cmd, cwd=home, env=env)
-        log_session(sd, "end", f"rc={rc}")
-        restart = sd / "RESTART"
-        if a.loop and restart.exists():
+        cmd += envelope_args(s)
+        if orders:
+            cmd.append(orders)
+        log_session(sd, "start", f"account={acct} model={s.get('model', '?')} cwd={home} "
+                                 f"session={sid} pid={os.getpid()}" + (" carried" if carried else ""))
+        print(f"curia: waking {title} (session {session_number(sd) - 1}, account {acct}, in {home})"
+              + (f", carrying session {sid} over" if carried else ""))
+        started = now()
+        try:
+            rc = invoke_claude(cmd, home, env, watch=limited_marker.exists)
+        finally:
+            prime.unlink(missing_ok=True)
+        tail = ""
+        usage = session_usage(cfg, sid)
+        if usage:
+            if isinstance(usage.get("cost_usd"), (int, float)):
+                tail += f" cost=${usage['cost_usd']:.2f}"
+            if isinstance(usage.get("duration_ms"), (int, float)):
+                tail += f" minutes={usage['duration_ms'] / 60000:.1f}"
+            (cfg / "curia-usage" / f"{sid}.json").unlink(missing_ok=True)
+        cut = None
+        if limited_marker.exists():
+            cut = read_json(limited_marker) or {}
+            os.replace(limited_marker, sd / "LAST-LIMITED")   # the next prime says what happened
+            tail += " limited"
+        log_session(sd, "end", f"rc={rc} session={sid}{tail}")
+        if cut is not None:
+            on = cut.get("account") or acct
+            nxt, _ = walk_chain(est, want, own)
+            print(f"curia: {title}'s session ended on a usage limit on '{on}'"
+                  + (f"; relaunching on '{nxt}'" if loop and nxt else
+                     "; the --loop launcher waits for a limit to lift" if loop else
+                     "; relaunch by hand when a limit lifts"), file=sys.stderr)
+            notify(est, f"{title} hit a limit on {on}",
+                   f"The session was ended without a handoff; its transcript is at "
+                   f"{cut.get('transcript_path') or '?'}. "
+                   + (f"The --loop launcher relaunches on '{nxt}'." if loop and nxt else
+                      "The --loop launcher waits for a limit to lift." if loop else "Nothing relaunches."))
+            if not loop:
+                break
+            if carry and cut.get("transcript_path") and cut.get("session_id"):
+                resume = cut
+            continue
+        if carried and rc != 0 and (now() - started).total_seconds() < 60 and not restart.exists():
+            print(f"curia: carrying session {sid} to '{acct}' failed at once (rc {rc}); waking {title} fresh",
+                  file=sys.stderr)
+            continue
+        if loop and restart.exists():
             restart.unlink()
             print(f"curia: {title} asked to be woken again; relaunching with the new handoff")
+            continue
+        if everything:
+            if rc != 0 and (now() - started).total_seconds() < 60:
+                print(f"curia: {title}'s session ended at once (rc {rc}); not relaunching", file=sys.stderr)
+                break
+            print(f"curia: {title} ended without a handoff; the board decides whether it wakes again")
             continue
         break
 
@@ -442,7 +1208,7 @@ def fill_placeholders(text: str, subs: dict) -> str:
 
 
 def cmd_run(a) -> None:
-    """Headless run of an office seat with a prompt file (claude -p)."""
+    """Headless run of a seat with a prompt file (claude -p)."""
     est = find_estate(a.estate)
     name, s = est.seat(a.seat)
     prompt_path = Path(a.prompt).expanduser()
@@ -451,45 +1217,201 @@ def cmd_run(a) -> None:
     prompt = read(prompt_path)
     if not prompt:
         die(f"empty or missing prompt {prompt_path}")
-    subs = {"estate": est.name, "principal": est.principal, "date": TODAY, "seat": s.get("title", name)}
+    subs = {"estate": est.name, "principal": est.principal, "date": today(), "seat": s.get("title", name)}
     repo = a.repo or est.repo_here()
     if repo:
         rk, r = est.repo(repo)
         subs.update({"repo": rk, **{k: str(v) for k, v in r.items()}})
-    subs.update(dict(kv.split("=", 1) for kv in (a.set or [])))
+    for kv in a.set or []:
+        if "=" not in kv:
+            die(f"--set wants key=value, got '{kv}'")
+        k, v = kv.split("=", 1)
+        subs[k] = v
     prompt = fill_placeholders(prompt, subs)
     cwd = est.repo_path(repo) if repo else est.root
-    out = run_headless(est, name, s, prompt, cwd, a.timeout, a.skip_permissions)
-    print(out)
+    if a.print_cmd:
+        acct, cfg = resolve_account(est, s.get("account", ""), s.get("account", ""))
+        model = headless_model(s, a.model)
+        print("CLAUDE_CONFIG_DIR=" + str(cfg) + " CURIA_SEAT=" + name + " cwd=" + str(cwd))
+        print("claude -p <prompt:" + str(len(prompt)) + " chars + journal orders> --output-format json"
+              " --append-system-prompt-file <prime:" + str(len(build_prime(est, name))) + " chars>" +
+              (" --model " + model if model else "") +
+              (f" (fallback {s['fallback_model']} on a limit)" if s.get("fallback_model") else "") +
+              (" --dangerously-skip-permissions" if a.skip_permissions else "") +
+              "".join(" " + x for x in envelope_args(s, headless=True, skip_permissions=a.skip_permissions)) +
+              " --settings <" + hooks_summary(est, headless=True) + ">")
+        return
+    res = run_headless(est, name, s, prompt, cwd, a.timeout, a.skip_permissions, a.model)
+    print(res.text)
+    if res.failed:
+        sys.exit(1)
+
+
+def headless_model(s: dict, override: str | None = None) -> str | None:
+    """The model a headless run uses: --model, else the roster's run_model, else model."""
+    return override or s.get("run_model") or s.get("model") or None
+
+
+JOURNAL_ORDERS = """
+
+---
+
+This is a headless waking: there is no /handoff here, and the next waking of
+this seat reads your journal instead. Before your final answer, write a short
+dated journal entry (under 30 lines, no secrets) to `{path}`: what you were
+asked, what you did and where it landed, what remains, and what you would
+want to know next time. It is your memory; nothing else writes it. If
+something went wrong, that goes in plainly."""
+
+
+@dataclasses.dataclass
+class HeadlessResult:
+    """What a headless waking came back with, and what the record keeps."""
+    text: str = ""
+    rc: int = 0
+    session_id: str = ""
+    cost: float | None = None
+    turns: int | None = None
+    duration_ms: int | None = None
+    is_error: bool = False
+    accounts: list[str] = dataclasses.field(default_factory=list)  # tried, in order
+    limited: bool = False   # the last account tried hit its limit
+    journal: Path | None = None   # the entry the seat wrote, if it did
+    model: str = ""         # the model the answer came from
+    fell_back: bool = False   # ...and it was the fallback model, the primary having hit a limit
+
+    @property
+    def failed(self) -> bool:
+        return self.is_error or self.rc != 0
+
+    def summary(self) -> str:
+        bits = [f"rc={self.rc}"]
+        if self.session_id:
+            bits.append(f"session={self.session_id}")
+        if self.cost is not None:
+            bits.append(f"cost=${self.cost:.2f}")
+        if self.turns is not None:
+            bits.append(f"turns={self.turns}")
+        if self.duration_ms is not None:
+            bits.append(f"minutes={self.duration_ms / 60000:.1f}")
+        if self.fell_back:
+            bits.append(f"fallback_model={self.model}")
+        return " ".join(bits)
+
+
+def parse_print_json(stdout: str) -> dict | None:
+    """The result object of `claude -p --output-format json`, or None when the
+    output is not that (an older claude, or a failure printed as text)."""
+    try:
+        d = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(d, list):
+        d = next((x for x in reversed(d) if isinstance(x, dict) and x.get("type") == "result"), None)
+    return d if isinstance(d, dict) else None
+
+
+def headless_result(stdout: str, stderr: str, rc: int) -> HeadlessResult:
+    d = parse_print_json(stdout)
+    tail = ("\n[stderr]\n" + stderr) if stderr.strip() else ""
+    if d is None:
+        return HeadlessResult(text=stdout + tail, rc=rc)
+    text = str(d.get("result") or "")
+    if not text:
+        errs = d.get("errors") or ([d["error"]] if d.get("error") else [])
+        text = "\n".join(str(e) for e in errs) or str(d.get("subtype") or "") or json.dumps(d)
+    cost = d.get("total_cost_usd", d.get("cost"))
+    turns = d.get("num_turns")
+    dur = d.get("duration_ms", d.get("duration"))
+    return HeadlessResult(
+        text=text + tail, rc=rc, session_id=str(d.get("session_id") or ""),
+        cost=float(cost) if isinstance(cost, (int, float)) else None,
+        turns=int(turns) if isinstance(turns, int) else None,
+        duration_ms=int(dur) if isinstance(dur, (int, float)) else None,
+        is_error=bool(d.get("is_error")))
 
 
 def run_headless(est: Estate, name: str, s: dict, prompt: str, cwd: Path,
-                 timeout: int, skip_permissions: bool) -> str:
-    acct, cfg = resolve_account(est, s.get("account", ""))
-    ensure_skills(cfg)
-    env = dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg), CURIA_SEAT=name, CURIA_ESTATE=str(est.dir))
-    full = build_prime(est, name) + "\n\n---\n\n" + prompt
-    cmd = ["claude", "-p", full, "--output-format", "text"]
-    if s.get("model"):
-        cmd += ["--model", s["model"]]
-    if skip_permissions:
-        cmd.append("--dangerously-skip-permissions")
-    else:
-        cmd += ["--allowedTools", ",".join(s.get("tools", ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Agent"]))]
+                 timeout: int, skip_permissions: bool, model: str | None = None) -> HeadlessResult:
+    """Wake a seat headless. The seat's answer comes back; the record gets the
+    session id, cost, turns and duration in sessions.log and the answer under
+    brain/<seat>/. Each headless run is a launch, so fallback happens here: a
+    run that dies on a usage limit marks its account and goes once more down
+    the chain."""
     sd = est.seat_dir(name)
-    log_session(sd, "start", f"headless account={acct} cwd={cwd}")
-    logdir = est.dir / "brain" / name.lower()
-    logdir.mkdir(parents=True, exist_ok=True)
-    try:
-        p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
-        out, rc = p.stdout + (("\n[stderr]\n" + p.stderr) if p.stderr.strip() else ""), p.returncode
-    except subprocess.TimeoutExpired as e:
-        out, rc = f"[timeout after {timeout}s]\n{(e.stdout or b'').decode() if isinstance(e.stdout, bytes) else e.stdout or ''}", 124
-    log_session(sd, "end", f"rc={rc}")
-    (logdir / f"{STAMP}-{cwd.name}.log").write_text(out)
-    if "usage limit" in out.lower() or "rate limit" in out.lower():
-        print(f"curia: output mentions a limit; consider `curia limit {acct} --hours 5`", file=sys.stderr)
-    return out
+    title = s.get("title", name)
+    primary = headless_model(s, model)
+    fallback = s.get("fallback_model") or None   # tried on the same account when the primary hits a limit
+    model_now = primary
+    fell_back = False
+    want = s.get("account", "")
+    tried: list[str] = []
+    while True:
+        acct, cfg = resolve_account(est, want, want)
+        if acct not in tried:
+            tried.append(acct)
+        ensure_skills(cfg)
+        journal = sd / "journal" / f"{stamp()}-{cwd.name}.md"
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        prime = prime_file(est, name, journal_path=journal, model=model_now)
+        env = dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg), CURIA_SEAT=name, CURIA_ESTATE=str(est.dir),
+                   CURIA_HEADLESS="1")
+        sid = str(uuid.uuid4())
+        cmd = ["claude", "-p", prompt + JOURNAL_ORDERS.format(path=journal), "--session-id", sid,
+               "--output-format", "json", "--append-system-prompt-file", str(prime),
+               "--settings", seat_settings(est, headless=True)]
+        if model_now:
+            cmd += ["--model", model_now]
+        if skip_permissions:
+            cmd.append("--dangerously-skip-permissions")
+        cmd += envelope_args(s, headless=True, skip_permissions=skip_permissions)
+        log_session(sd, "start", f"headless account={acct} model={model_now or '?'} cwd={cwd} "
+                                 f"session={sid} pid={os.getpid()}" + (" fallback" if fell_back else ""))
+        started = now()
+        try:
+            p = invoke_claude(cmd, cwd, env, timeout=timeout, capture=True)
+            res = headless_result(p.stdout, p.stderr, p.returncode)
+        except subprocess.TimeoutExpired as e:
+            partial = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+            res = HeadlessResult(text=f"[timeout after {timeout}s]\n{partial}", rc=124)
+        finally:
+            prime.unlink(missing_ok=True)
+        if res.duration_ms is None:
+            res.duration_ms = int((now() - started).total_seconds() * 1000)
+        res.accounts = list(tried)
+        res.session_id = res.session_id or sid   # the record pairs start and end by it
+        res.model, res.fell_back = model_now or "", fell_back
+        res.journal = journal if journal.exists() else None
+        missing = "" if res.journal or res.failed else " journal=missing"
+        log_session(sd, "end", res.summary() + missing)
+        logdir = est.dir / "brain" / name.lower()
+        logdir.mkdir(parents=True, exist_ok=True)
+        (logdir / f"{stamp()}-{cwd.name}.log").write_text(
+            res.text + f"\n\n[{res.summary()} account={acct}]\n")
+        if missing:
+            print(f"curia: {title} wrote no journal entry at {journal}", file=sys.stderr)
+        if res.failed and looks_limited(res.text):
+            if fallback and model_now != fallback:
+                # A limit may be the model's, not the account's: try the fallback model here
+                # before giving the account up. Both dead means the account is.
+                print(f"curia: {title} hit a limit on {model_now} ('{acct}'); trying {fallback} on the "
+                      "same account", file=sys.stderr)
+                model_now, fell_back = fallback, True
+                continue
+            until = limit_reset(res.text) or now() + dt.timedelta(hours=LIMIT_DEFAULT_HOURS)
+            mark_limited(est, acct, until)
+            res.limited = True
+            model_now, fell_back = primary, False   # the next account starts on the primary model
+            print(f"curia: account '{acct}' hit its limit; marked limited until {until:%Y-%m-%d %H:%M}Z",
+                  file=sys.stderr)
+            free, _ = walk_chain(est, want, want)
+            if free and free not in tried:
+                print(f"curia: waking {title} again on '{free}'", file=sys.stderr)
+                continue
+            notify(est, f"{title}: every account limited",
+                   f"{title} could not run headless: {', '.join(tried)} limited until "
+                   f"{until:%Y-%m-%d %H:%M}Z. Nothing retries; wake it by hand when the limit lifts.")
+        return res
 
 
 def cmd_handoff(a) -> None:
@@ -499,17 +1421,25 @@ def cmd_handoff(a) -> None:
     sd.mkdir(parents=True, exist_ok=True)
     hp = sd / "handoff.md"
     if a.begin:
-        prev = read(hp).strip()
-        if prev and not prev.startswith("_No handoff yet"):
+        if handoff_written(sd):
             hist = sd / "history"
             hist.mkdir(exist_ok=True)
-            shutil.move(hp, hist / f"{STAMP}.md")
+            shutil.move(hp, hist / f"{stamp()}.md")
         print(f"Write your handoff to: {hp}\nTemplate: {MECHANISM_DIR / 'templates' / 'handoff.md'}")
         return
     if a.done:
-        if not hp.exists() or len(read(hp).strip()) < 40:
+        if not handoff_written(sd):
             die("handoff.md is missing or too short; write it before --done")
+        text = read(hp)
+        missing = [h for h in handoff_sections()
+                   if not re.search(rf"^##\s+{re.escape(h)}", text, re.I | re.M)]
+        if missing:
+            die("handoff.md lacks the section(s): " + "; ".join(missing) +
+                f". The template is {MECHANISM_DIR / 'templates' / 'handoff.md'}; write every section, "
+                "even if only to say there is nothing under it")
         (sd / "RESTART").touch()
+        for marker in ("LAST-LIMITED", "SHIFT-OVER"):
+            (sd / marker).unlink(missing_ok=True)   # memory is fresh again; the shift's orders are done
         log_session(sd, "handoff", "")
         print(f"Handoff recorded for {s.get('title', name)}. The session may end now; "
               f"`curia launch {name.lower()}` wakes the seat with it (the --loop launcher does so on exit).")
@@ -527,29 +1457,70 @@ def cmd_laurel(a) -> None:
     if existing.strip().startswith("_"):
         existing = ""
     with open(lp, "w") as f:
-        f.write(existing.rstrip() + ("\n" if existing.strip() else "") + f"- {TODAY}: {a.text}\n")
+        f.write(existing.rstrip() + ("\n" if existing.strip() else "") + f"- {today()}: {a.text}\n")
     print(f"laurel recorded for {name}")
+
+
+def cmd_mail(a) -> None:
+    """A note from one seat, or the principal, to another: read in the prime at
+    the next waking, archived by the reader and by nobody else."""
+    est = find_estate(a.estate)
+    if a.all:
+        text = a.text or a.seat
+        if not text:
+            die("--all wants the text to send")
+        recipients = [k for k, v in est.roster.items() if v.get("active", True)]
+    else:
+        if not a.seat:
+            die("mail wants a seat, or --all")
+        name, _ = est.seat(a.seat)
+        sd = est.seat_dir(name)
+        mp = sd / "mail.md"
+        if a.archive:
+            if not read(mp).strip():
+                print(f"no mail for {name}")
+                return
+            hist = sd / "history"
+            hist.mkdir(parents=True, exist_ok=True)
+            dest = hist / f"mail-{stamp()}.md"
+            shutil.move(mp, dest)
+            print(f"mail archived to {dest}")
+            return
+        if a.text is None:
+            print(read(mp).strip() or f"_No mail for {name}._")
+            return
+        text, recipients = a.text, [name]
+    key, who = mail_sender(est)
+    line = f"- {today()} from {who}: {' '.join(text.split())}\n"
+    sent = []
+    for k in recipients:
+        if a.all and k.lower() == key.lower():
+            continue   # a broadcast does not come back to its sender
+        sd = est.seat_dir(k)
+        sd.mkdir(parents=True, exist_ok=True)
+        with open(sd / "mail.md", "a") as f:
+            f.write(line)
+        sent.append(k)
+    print(f"mail left for {', '.join(sent) or 'nobody'}; read at the next waking")
 
 
 def cmd_limit(a) -> None:
     est = find_estate(a.estate)
     acct = a.account
     if acct == "current":
-        cfg = Path(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude"))).resolve()
-        matches = [k for k in est.accounts if account_dir(est, k).resolve() == cfg]
-        if not matches:
-            die(f"no account in accounts.toml has config_dir {cfg}")
-        acct = matches[0]
+        acct = current_account(est)
+        if not acct:
+            die(f"no account in accounts.toml has config_dir {os.environ.get('CLAUDE_CONFIG_DIR', '~/.claude')}")
         print(f"curia: current account is '{acct}'")
     m = limit_marker(est, acct)
     if a.clear:
         m.unlink(missing_ok=True)
         print(f"{acct}: limit cleared")
         return
-    until = NOW + dt.timedelta(hours=a.hours) if a.hours else parse_iso(a.until or "")
+    until = now() + dt.timedelta(hours=a.hours) if a.hours else parse_iso(a.until or "")
     if not until:
         die("give --hours N or --until ISO")
-    m.write_text(until.isoformat())
+    mark_limited(est, acct, until)
     print(f"{acct}: marked limited until {until:%Y-%m-%d %H:%M} UTC; launches fall back to "
           f"'{est.accounts[acct].get('fallback', '-')}'")
 
@@ -575,13 +1546,47 @@ def repo_slug(remote: str) -> str:
     return remote.rstrip("/").removesuffix(".git").split("github.com/")[-1]
 
 
-def lictor_facts(est: Estate, stale_days: int, pr_hours: int) -> str:
-    out = [f"# Lictor report, {est.name} estate, {NOW:%Y-%m-%d %H:%M}Z",
+def branch_runs(slug: str, branch: str) -> tuple[dict | None, dict | None, list | None]:
+    """(last completed run, newest run, all fetched) for a branch. A run still
+    in progress has no conclusion; judging the branch by it would be judging
+    nothing, so the offices read the last completed one."""
+    runs = gh_json(["run", "list", "--repo", slug, "--branch", branch, "--limit", "5",
+                    "--json", "conclusion,status,url,createdAt,headSha"])
+    if not runs:
+        return None, None, runs
+    done = next((x for x in runs if x.get("status") == "completed"), None)
+    return done, runs[0], runs
+
+
+def run_line(done: dict | None, newest: dict | None) -> str:
+    if not done:
+        return f"no completed run among the newest; the newest is {newest.get('status', '?')}"
+    line = f"{done.get('conclusion') or '?'} ({age(done.get('createdAt', ''))} ago) {done.get('url', '')}"
+    if newest is not done:
+        line += f"; a newer run is {newest.get('status', '?')}"
+    return line
+
+
+def lictor_facts(est: Estate, stale_days: int, pr_hours: int, postmortem_days: int = 7,
+                 ruling_days: int = 14) -> str:
+    t = now()
+    out = [f"# Lictor report, {est.name} estate, {t:%Y-%m-%d %H:%M}Z",
            "",
            "The Lictor reads; it never writes beads. Every fact below is only as fresh as the "
            "last `bd export` in each repo, and it stays quiet about anything younger than the "
            "thresholds (in_progress stale after "
-           f"{stale_days}d, drafts silent after {pr_hours}h).", ""]
+           f"{stale_days}d, drafts silent after {pr_hours}h, a postmortem unruled after "
+           f"{postmortem_days}d, an enacted ruling unenforced after {ruling_days}d).", ""]
+    rs = rulings(est)
+    ruling_texts = "\n".join(r["text"] for r in rs)
+    unenforced = [r for r in rs if r["status"] == "enacted" and not r["enforced"]
+                  and (t - r["date"]).days >= ruling_days]
+    if unenforced:
+        out.append("## Rulings")
+        for r in unenforced:
+            out.append(f"- UNENFORCED ruling {r['slug']} ({age(r['date'].isoformat())}): enacted, and nothing "
+                       "enforces it yet (a hook, a test, a check; or say why it stays advisory)")
+        out.append("")
     for k, r in est.repos.items():
         p = est.repo_path(k)
         out.append(f"## {k}")
@@ -598,7 +1603,7 @@ def lictor_facts(est: Estate, stale_days: int, pr_hours: int) -> str:
         out.append(f"- export newest update {age(newest)} ago; " +
                    ", ".join(f"{s} {n}" for s, n in sorted(counts.items())))
         stale = [i for i in issues if i.get("status") == "in_progress"
-                 and (NOW - (parse_iso(i.get("updated_at", "")) or NOW)).days >= stale_days]
+                 and (t - (parse_iso(i.get("updated_at", "")) or t)).days >= stale_days]
         for i in stale:
             out.append(f"- STALE in_progress {i['id']} ({age(i.get('updated_at', ''))}): {i.get('title', '')}")
         for i in issues:
@@ -611,6 +1616,13 @@ def lictor_facts(est: Estate, stale_days: int, pr_hours: int) -> str:
             elif all(status.get(b) == "closed" for b in blockers):
                 out.append(f"- UNBLOCKED but still marked blocked {i['id']}: {i.get('title', '')} "
                            f"(blockers {', '.join(blockers)} all closed)")
+        for i in issues:
+            if i.get("status") == "closed" or "postmortem" not in (i.get("labels") or []):
+                continue
+            since = parse_iso(i.get("created_at", "") or i.get("updated_at", "")) or t
+            if (t - since).days >= postmortem_days and i["id"] not in ruling_texts:
+                out.append(f"- UNRULED postmortem {i['id']} ({age(since.isoformat())}): {i.get('title', '')} "
+                           "(no ruling cites it; fold it into the brain, or close it and say why)")
         if r.get("forge") == "github" and r.get("remote"):
             slug = repo_slug(r["remote"])
             prs = gh_json(["pr", "list", "--repo", slug, "--state", "open", "--limit", "50",
@@ -620,30 +1632,29 @@ def lictor_facts(est: Estate, stale_days: int, pr_hours: int) -> str:
             else:
                 out.append(f"- open PRs: {len(prs)} ({sum(1 for x in prs if x['isDraft'])} drafts)")
                 for x in prs:
-                    hrs = (NOW - (parse_iso(x["updatedAt"]) or NOW)).total_seconds() / 3600
+                    hrs = (t - (parse_iso(x["updatedAt"]) or t)).total_seconds() / 3600
                     if hrs >= pr_hours:
                         kind = "draft" if x["isDraft"] else "PR"
                         out.append(f"- SILENT {kind} #{x['number']} ({hrs:.0f}h): {x['title']} {x['url']}")
             if r.get("integration_branch"):
-                runs = gh_json(["run", "list", "--repo", slug, "--branch", r["integration_branch"],
-                                "--limit", "1", "--json", "conclusion,status,url,createdAt"])
+                done, newest, runs = branch_runs(slug, r["integration_branch"])
                 if runs:
-                    x = runs[0]
-                    out.append(f"- {r['integration_branch']} last run: {x.get('conclusion') or x.get('status')} "
-                               f"({age(x.get('createdAt', ''))} ago) {x.get('url', '')}")
+                    out.append(f"- {r['integration_branch']} last completed run: {run_line(done, newest)}")
         out.append("")
     return "\n".join(out)
 
 
 def cmd_lictor(a) -> None:
     est = find_estate(a.estate)
-    report = lictor_facts(est, a.stale_days, a.pr_hours)
+    report = lictor_facts(est, a.stale_days, a.pr_hours, a.postmortem_days, a.ruling_days)
     if a.write:
         d = est.dir / "brain" / "lictor"
         d.mkdir(parents=True, exist_ok=True)
-        path = d / f"{STAMP}.md"
+        path = d / f"{stamp()}.md"
         path.write_text(report)
         print(f"written {path}")
+        nudges = sum(1 for line in report.splitlines() if NUDGE_RE.match(line))
+        notify(est, f"Lictor: {nudges} nudge(s)", f"Report at {path}", path)
     else:
         print(report)
 
@@ -656,42 +1667,369 @@ def cmd_censor(a) -> None:
     prompt_t = read(est.dir / "prompts" / "censor.md")
     if not prompt_t:
         die("prompts/censor.md missing")
-    summary = [f"# Censor report, {est.name} estate, {TODAY}" + (" (dry run)" if a.dry_run else ""), ""]
-    woke = 0
+    day = today()
+    summary = [f"# Censor report, {est.name} estate, {day}" + (" (dry run)" if a.dry_run else ""), ""]
+    woke, limited = 0, []
     for k, r in est.repos.items():
         b = r.get("integration_branch")
         if not b or r.get("forge") != "github" or not r.get("gate"):
             continue
         slug = repo_slug(r["remote"])
-        runs = gh_json(["run", "list", "--repo", slug, "--branch", b, "--limit", "1",
-                        "--json", "conclusion,status,url,createdAt,headSha"])
+        done, newest, runs = branch_runs(slug, b)
         if not runs:
             summary.append(f"- {k}: no runs found on {b} (or gh unavailable)")
             continue
-        x = runs[0]
-        concl = x.get("conclusion") or x.get("status") or "?"
-        line = f"- {k} `{b}`: **{concl}** ({age(x.get('createdAt', ''))} ago) {x.get('url', '')}"
-        if concl == "success" or a.dry_run:
+        line = f"- {k} `{b}`: **{run_line(done, newest)}**"
+        if not done or done.get("conclusion") == "success" or a.dry_run:
             summary.append(line)
             continue
         woke += 1
-        summary.append(line + " -> Censor woke")
         prompt = fill_placeholders(prompt_t, {
-            "repo": k, "branch": b, "run_url": x.get("url", ""), "conclusion": concl,
-            "head_sha": x.get("headSha", ""), "date": TODAY,
+            "repo": k, "branch": b, "run_url": done.get("url", ""), "conclusion": done.get("conclusion", "?"),
+            "head_sha": done.get("headSha", ""), "date": day,
             **{kk: str(vv) for kk, vv in r.items()}})
-        out = run_headless(est, name, s, prompt, est.repo_path(k), a.timeout, a.skip_permissions)
+        res = run_headless(est, name, s, prompt, est.repo_path(k), a.timeout, a.skip_permissions)
+        line += " -> Censor woke"
+        if res.limited:
+            limited.append(k)
+            line += f" and hit a limit ({', '.join(res.accounts)} tried)"
+        elif len(res.accounts) > 1:
+            line += f" (fell back to {res.accounts[-1]})"
+        summary.append(line)
         summary.append("\n<details><summary>Censor transcript, " + k + "</summary>\n\n```\n" +
-                       out[-6000:] + "\n```\n</details>\n")
+                       res.text[-6000:] + "\n```\n</details>\n")
     summary.append("")
     summary.append(f"Censor woke on {woke} repo(s). Reports are committed by hand or by the office "
                    "that owns the estate repo; the Censor never promotes to a release branch.")
+    print("\n".join(summary))
+    if a.dry_run:
+        return   # a dry run reports; it neither writes the day's report nor tells anyone
     d = est.dir / "brain" / "censor"
     d.mkdir(parents=True, exist_ok=True)
-    path = d / f"{TODAY}.md"
+    path = d / f"{day}.md"
     path.write_text("\n".join(summary))
-    print("\n".join(summary))
     print(f"\nwritten {path}")
+    subject = f"Censor {day}: woke on {woke} repo(s)"
+    if limited:
+        subject += f"; limited on {', '.join(limited)}"
+    notify(est, subject, "\n".join(line for line in summary if line.startswith("- ")), path)
+
+
+# ------------------------------------------------------------------- fleet
+
+def git(args: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess:
+    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    if check and p.returncode != 0:
+        die(f"git {' '.join(args)} in {cwd}: {(p.stderr or p.stdout).strip()}")
+    return p
+
+
+def integration_ref(src: Path, r: dict) -> str:
+    """The ref a worker branches from: origin/<integration> after a fetch when
+    the repo has one, else the local branch. The fetch is best effort."""
+    b = r.get("integration_branch")
+    if not b:
+        die(f"{src} has no integration_branch in repos.toml; nothing to branch from")
+    try:
+        subprocess.run(["git", "fetch", "--quiet", "origin"], cwd=src, capture_output=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        pass
+    if git(["rev-parse", "--verify", "-q", f"refs/remotes/origin/{b}"], src, check=False).returncode == 0:
+        return f"origin/{b}"
+    return b
+
+
+def worktree_path(est: Estate, seat_key: str, repo_key: str) -> Path:
+    return est.worktrees_dir / seat_key.lower() / repo_key
+
+
+def prepare_worktree(est: Estate, seat_key: str, repo_key: str, bead: str) -> tuple[Path, str]:
+    """A fleet worker's home for one job: worktrees/<seat>/<repo>, on branch
+    <seat>/<bead> off the integration branch. The home is reused from job to
+    job, never shared between seats, and never touched while it holds
+    uncommitted work."""
+    rk, r = est.repo(repo_key)
+    src = est.repo_path(rk)
+    if not (src / ".git").exists():
+        die(f"{src} is not a git repository")
+    branch = f"{seat_key.lower()}/{bead}"
+    path = worktree_path(est, seat_key, rk)
+    ref = integration_ref(src, r)
+    exists = git(["rev-parse", "--verify", "-q", f"refs/heads/{branch}"], src, check=False).returncode == 0
+    if path.exists():
+        if git(["status", "--porcelain"], path).stdout.strip():
+            die(f"{path} has uncommitted work; finish or park it before dispatching again "
+                f"(`git -C {path} status`)")
+        if git(["rev-parse", "--abbrev-ref", "HEAD"], path).stdout.strip() != branch:
+            git(["checkout", "-q", branch] if exists else ["checkout", "-q", "-b", branch, ref], path)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        git(["worktree", "add", "-q", str(path), branch] if exists
+            else ["worktree", "add", "-q", "-b", branch, str(path), ref], src)
+    return path, branch
+
+
+def assignments_log(sd: Path, event: str, detail: str) -> None:
+    """The fleet record: who was sent where, for what, and what came back."""
+    sd.mkdir(parents=True, exist_ok=True)
+    with open(sd / "assignments.log", "a") as f:
+        f.write(f"{event} {now().isoformat(timespec='seconds')} {detail}\n")
+
+
+def prompt_text(est: Estate, given: str | None, default: str) -> tuple[Path, str]:
+    """A prompt from the estate's prompts/ unless given as a path."""
+    p = Path(given).expanduser() if given else Path(default)
+    if not p.is_absolute():
+        p = est.dir / "prompts" / p
+    text = read(p)
+    if not text:
+        die(f"empty or missing prompt {p}")
+    return p, text
+
+
+def cmd_dispatch(a) -> None:
+    """Give a fleet worker a home and a job: a worktree of its own, a branch
+    named for the bead, a headless waking there, a record of it, and a review
+    by another seat if asked."""
+    est = find_estate(a.estate)
+    name, s = est.seat(a.seat)
+    title = s.get("title", name)
+    if s.get("kind") != "fleet":
+        die(f"{name} is a {s.get('kind', '?')} seat; dispatch is for fleet. Crew and offices are launched or run.")
+    if not s.get("active", True):
+        die(f"{name} is reserved (active = false in roster.toml)")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", a.bead):
+        die(f"'{a.bead}' does not look like a bead id")
+    repo = a.repo or est.repo_here()
+    if not repo:
+        die("--repo, or run from inside one; a worker needs a repo to work in")
+    rk, r = est.repo(repo)
+    sd = est.seat_dir(name)
+    busy = [o for o in open_sessions(sd) if o["pid"] and pid_alive(o["pid"])]
+    if busy:
+        die(f"{title} is at work (a session since {age(busy[-1]['at'])} ago, launcher pid {busy[-1]['pid']}); "
+            "a worker has one home and one job at a time. Dispatch another, or wait.")
+    ppath, template = prompt_text(est, a.prompt, "dispatch.md")
+    reviewer = est.seat(a.review) if a.review else None
+    by = mail_sender(est)[1]
+    subs = {"estate": est.name, "principal": est.principal, "date": today(), "seat": title, "bead": a.bead,
+            "branch": f"{name.lower()}/{a.bead}", "worktree": str(worktree_path(est, name, rk)),
+            "repo": rk, "dispatcher": by, "land_label": est.land_label,
+            **{k: str(v) for k, v in r.items()}}
+    if a.print_cmd:
+        acct, cfg = resolve_account(est, s.get("account", ""), s.get("account", ""))
+        print(f"worktree {subs['worktree']} on branch {subs['branch']} off {r.get('integration_branch', '?')}")
+        print("CLAUDE_CONFIG_DIR=" + str(cfg) + " CURIA_SEAT=" + name + " cwd=" + subs["worktree"])
+        print(f"claude -p <{ppath.name}:{len(template)} chars + journal orders> --model "
+              f"{headless_model(s, a.model) or '?'}" + (f"; then review by {reviewer[0]}" if reviewer else ""))
+        return
+    path, branch = prepare_worktree(est, name, rk, a.bead)
+    subs["worktree"], subs["branch"] = str(path), branch
+    prompt = fill_placeholders(template, subs)
+    assignments_log(sd, "dispatch", f"bead={a.bead} repo={rk} branch={branch} worktree={path} by={by}")
+    print(f"curia: {title} dispatched to {rk} for {a.bead}: {path} on {branch}", file=sys.stderr)
+    res = run_headless(est, name, s, prompt, path, a.timeout, a.skip_permissions, a.model)
+    assignments_log(sd, "returned", f"bead={a.bead} {res.summary()}" + (" limited" if res.limited else ""))
+    print(res.text)
+    failed = res.failed
+    if reviewer and not res.failed:
+        rname, rs = reviewer
+        rtitle = rs.get("title", rname)
+        _, rtemplate = prompt_text(est, a.review_prompt, "review.md")
+        rprompt = fill_placeholders(rtemplate, {**subs, "seat": rtitle, "worker": title})
+        print(f"curia: {rtitle} reviewing {a.bead} in {path}", file=sys.stderr)
+        rres = run_headless(est, rname, rs, rprompt, path, a.timeout, a.skip_permissions, None)
+        assignments_log(sd, "reviewed", f"bead={a.bead} by={rname} {rres.summary()}")
+        print(f"\n--- review by {rtitle} ---\n{rres.text}")
+        failed = failed or rres.failed
+    if failed:
+        sys.exit(1)
+
+
+def branch_landed(src: Path, r: dict, branch: str) -> bool:
+    """Has the branch landed on the integration branch: an ancestor of it, or,
+    since a squash merge loses ancestry, a merged PR with that head per gh."""
+    if git(["merge-base", "--is-ancestor", branch, integration_ref(src, r)], src, check=False).returncode == 0:
+        return True
+    if r.get("forge") == "github" and r.get("remote"):
+        prs = gh_json(["pr", "list", "--repo", repo_slug(r["remote"]), "--head", branch, "--state", "merged",
+                       "--limit", "1", "--json", "number"])
+        return bool(prs)
+    return False
+
+
+def cmd_reap(a) -> None:
+    """Clear away what is finished or dead, and only that: close the record of
+    a session whose launcher is gone; remove a worktree whose branch has
+    landed and which holds no uncommitted work. Nothing running and nothing
+    unfinished is touched."""
+    est = find_estate(a.estate)
+    dry = a.dry_run
+    did = 0
+    for k in est.roster:
+        sd = est.seat_dir(k)
+        for o in open_sessions(sd):
+            if not o["pid"]:
+                print(f"  {k}: a session from {age(o['at'])} ago has no end and no pid on record "
+                      "(before reap existed); close it by hand if it is dead")
+                continue
+            if pid_alive(o["pid"]):
+                continue
+            print(f"  {k}: session {o['sid'] or '?'} from {age(o['at'])} ago; launcher pid {o['pid']} is gone"
+                  + ("; would close the record" if dry else "; record closed"))
+            if not dry:
+                log_session(sd, "end", f"rc=- session={o['sid']} reaped: launcher pid {o['pid']} gone")
+            did += 1
+    wd = est.worktrees_dir
+    if wd.is_dir():
+        for seat_dir in sorted(p for p in wd.iterdir() if p.is_dir()):
+            for wt in sorted(p for p in seat_dir.iterdir() if p.is_dir()):
+                if not (wt / ".git").exists():
+                    continue
+                rk = next((x for x in est.repos if x.lower() == wt.name.lower()), None)
+                if not rk:
+                    print(f"  {seat_dir.name}: {wt} is not a registered repo; leaving it")
+                    continue
+                src, r = est.repo_path(rk), est.repos[rk]
+                branch = git(["rev-parse", "--abbrev-ref", "HEAD"], wt).stdout.strip()
+                if git(["status", "--porcelain"], wt).stdout.strip():
+                    print(f"  {seat_dir.name}: {wt} has uncommitted work on {branch}; leaving it")
+                    continue
+                if not branch_landed(src, r, branch):
+                    print(f"  {seat_dir.name}: {wt} on {branch}, not landed; leaving it")
+                    continue
+                print(f"  {seat_dir.name}: {wt} on {branch} has landed"
+                      + ("; would remove it" if dry else "; removed"))
+                if not dry:
+                    git(["worktree", "remove", str(wt)], src)
+                    git(["branch", "-D", branch], src, check=False)
+                    assignments_log(est.seat_dir(seat_dir.name), "reap", f"branch={branch} worktree={wt} landed")
+                did += 1
+    if not did:
+        print("  nothing to reap")
+
+
+# -------------------------------------------------------------- portcullis
+
+def gh_run(args: list[str]) -> subprocess.CompletedProcess | None:
+    """Run gh for its side effect; None when gh is missing or hangs."""
+    if not shutil.which("gh"):
+        return None
+    try:
+        return subprocess.run(["gh", *args], capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def bd_close(repo: Path, bead: str) -> str:
+    """Close a bead in its repo's database; the line the report gets."""
+    if not shutil.which("bd"):
+        return f"bd not on PATH; close {bead} by hand"
+    try:
+        p = subprocess.run(["bd", "close", bead], cwd=repo, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return f"bd close {bead} timed out; close it by hand"
+    return f"{bead} closed" if p.returncode == 0 else f"bd close {bead} failed: {(p.stderr or p.stdout).strip()}"
+
+
+def bead_named(text: str, prefixes: list[str]) -> str | None:
+    """The first bead id of the repo's prefixes in the text, or None."""
+    if not prefixes:
+        return None
+    m = re.search(r"\b((?:" + "|".join(re.escape(p) for p in prefixes) + r")-\d+)\b", text, re.I)
+    return m.group(1) if m else None
+
+
+def pr_gate(pr: dict, label: str) -> tuple[bool, str]:
+    """Does a PR pass the gate: not a draft, reviewed (an APPROVED decision or
+    the land label), every check green, mergeable. With the reason when not."""
+    if pr.get("isDraft"):
+        return False, "draft"
+    labels = {x.get("name", "") for x in pr.get("labels") or []}
+    if pr.get("reviewDecision") != "APPROVED" and label not in labels:
+        return False, "unreviewed"
+    rollup = pr.get("statusCheckRollup") or []
+    if not rollup:
+        return False, "no checks reported"
+    for c in rollup:
+        state = (c.get("conclusion") or c.get("state") or "").upper()
+        if state in ("SUCCESS", "SKIPPED", "NEUTRAL"):
+            continue
+        what = c.get("name") or c.get("context") or "?"
+        status = (c.get("status") or "").upper()
+        if status in ("IN_PROGRESS", "QUEUED", "PENDING", "WAITING", "REQUESTED") or state in ("PENDING", "EXPECTED"):
+            return False, f"checks pending ({what})"
+        return False, f"checks red ({what})"
+    if pr.get("mergeable") == "CONFLICTING":
+        return False, "conflicts with the integration branch"
+    if pr.get("mergeable") != "MERGEABLE":
+        return False, "mergeability not yet known"
+    return True, "green, reviewed, mergeable"
+
+
+def cmd_portcullis(a) -> None:
+    """The land gate: for each repo, land the seats' PRs that pass the gate
+    and close their beads. The yes or no is gh's facts, so this runs from a
+    cron and wakes no model. Everything else is left where it is, with the
+    reason, for the seats to act on."""
+    est = find_estate(a.estate)
+    label = a.label or est.land_label
+    summary = [f"# Portcullis report, {est.name} estate, {now():%Y-%m-%d %H:%M}Z" + (" (dry run)" if a.dry_run else ""),
+               "",
+               "A PR is a seat's when its branch or title names a bead of the repo. It lands when it is not a "
+               f"draft, is reviewed (an APPROVED review or the `{label}` label), every check is green and it is "
+               "mergeable; landing closes the bead. Everything else stays where it is, with the reason.", ""]
+    landed, held, failed = 0, 0, 0
+    for k, r in est.repos.items():
+        b = r.get("integration_branch")
+        if not b or r.get("forge") != "github" or not r.get("remote"):
+            continue
+        slug = repo_slug(r["remote"])
+        prs = gh_json(["pr", "list", "--repo", slug, "--base", b, "--state", "open", "--limit", "100",
+                       "--json", "number,title,headRefName,isDraft,reviewDecision,statusCheckRollup,labels,mergeable,url"])
+        summary.append(f"## {k}")
+        if prs is None:
+            summary.append("- gh unavailable or unauthorised; nothing landed\n")
+            continue
+        mine = [(pr, bead_named(f"{pr.get('headRefName', '')} {pr.get('title', '')}", r.get("beads_prefix", [])))
+                for pr in prs]
+        mine = [(pr, bead) for pr, bead in mine if bead]
+        if not mine:
+            summary.append(f"- no open PR against `{b}` names a bead\n")
+            continue
+        method = r.get("merge", "squash")
+        for pr, bead in mine:
+            ok, why = pr_gate(pr, label)
+            line = f"- #{pr['number']} {bead} `{pr.get('headRefName', '')}`: {why}"
+            if not ok:
+                held += 1
+                summary.append(line)
+                continue
+            if a.dry_run:
+                landed += 1
+                summary.append(line + " -> would land")
+                continue
+            p = gh_run(["pr", "merge", str(pr["number"]), "--repo", slug, f"--{method}", "--delete-branch"])
+            if p is None or p.returncode != 0:
+                failed += 1
+                summary.append(line + " -> merge FAILED: " + ((p.stderr or p.stdout).strip() if p else "gh not on PATH"))
+                continue
+            landed += 1
+            summary.append(line + f" -> landed ({method}); " + bd_close(est.repo_path(k), bead))
+        summary.append("")
+    summary.append(f"Landed {landed}, held {held}, failed {failed}. The Portcullis never merges a draft, never "
+                   "reviews, and never touches a release branch.")
+    print("\n".join(summary))
+    if a.dry_run or not (landed or held or failed):
+        return   # nothing at the gate: nothing to record
+    d = est.dir / "brain" / "portcullis"
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{stamp()}.md"
+    path.write_text("\n".join(summary))
+    print(f"\nwritten {path}")
+    if landed or failed:
+        notify(est, f"Portcullis: landed {landed}, failed {failed}",
+               "\n".join(line for line in summary if line.startswith("- ")), path)
 
 
 def cmd_rename(a) -> None:
@@ -724,7 +2062,7 @@ def cmd_rename(a) -> None:
         sd_old.rename(sd_new)
     sd_new.mkdir(parents=True, exist_ok=True)
     with open(sd_new / "charter.md", "a") as f:
-        f.write(f"\n> Renamed from {old_title} on {TODAY}. The history in this directory is one seat's.\n")
+        f.write(f"\n> Renamed from {old_title} on {today()}. The history in this directory is one seat's.\n")
     log_session(sd_new, "rename", f"formerly {oldk} ({old_title})")
     print(f"{old_title} is now {new_title}. Charter, handoff, laurels and history carried over; "
           "the record notes the change. Update prose references (briefs, prompts) by hand.")
@@ -738,7 +2076,7 @@ def _inbox_write(est: Estate, text: str, label: str) -> Path:
     gi = inbox / ".gitignore"
     if not gi.exists():
         gi.write_text("*\n!.gitignore\n")
-    f = inbox / f"{STAMP}-{label}.md"
+    f = inbox / f"{stamp()}-{label}.md"
     f.write_text(text)
     return f
 
@@ -748,7 +2086,7 @@ def cmd_ingest(a) -> None:
     est = find_estate(a.estate)
     name, _ = est.seat_by_role("notarius")
     repo = None
-    want = getattr(a, "repo", None)
+    want = a.repo
     if not want:
         here = est.repo_here()
         if here and est.repo_path(here) != est.root:
@@ -796,10 +2134,268 @@ def cmd_ingest(a) -> None:
                    "reads and writes land in its database; for any other repo change directory "
                    "(or bd -C <path>) first - a bead filed from the wrong directory gets the wrong "
                    "prefix with no error.")
-    ns = argparse.Namespace(estate=a.estate, seat=name, repo=repo, loop=False,
-                            account=getattr(a, "account", None),
-                            tmux=a.tmux, say=prompt, print_cmd=a.print_cmd)
-    cmd_launch(ns)
+    launch_seat(est, name, repo=repo, account=a.account, tmux=a.tmux, say=prompt, print_cmd=a.print_cmd)
+
+
+# ----------------------------------------------------------------- notify
+
+def notify(est: Estate, subject: str, body: str, path: Path | None = None) -> None:
+    """Tell the principal, if the estate says how. estate.toml `notify` is a
+    shell command run with CURIA_SUBJECT, CURIA_BODY and CURIA_REPORT in its
+    environment; empty means nobody is told. Failing to notify is reported on
+    stderr and never fatal: the report is already on disk."""
+    cmd = est.meta.get("notify", "")
+    if not cmd:
+        return
+    env = dict(os.environ, CURIA_ESTATE=str(est.dir), CURIA_SUBJECT=subject, CURIA_BODY=body,
+               CURIA_REPORT=str(path or ""))
+    try:
+        p = subprocess.run(cmd, shell=True, env=env, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        print("curia: notify command timed out", file=sys.stderr)
+        return
+    if p.returncode != 0:
+        print(f"curia: notify command failed (rc={p.returncode}): {p.stderr.strip()}", file=sys.stderr)
+
+
+# ----------------------------------------------------------------- status
+
+def latest_file(d: Path, suffix: str) -> Path | None:
+    if not d.is_dir():
+        return None
+    files = sorted(f for f in d.iterdir() if f.suffix == suffix and not f.name.startswith("."))
+    return files[-1] if files else None
+
+
+def file_age(p: Path | None) -> str:
+    if not p or not p.exists():
+        return "none"
+    return age(dt.datetime.fromtimestamp(p.stat().st_mtime, dt.timezone.utc).isoformat()) + " ago"
+
+
+def cmd_status(a) -> None:
+    """The estate now: who is awake, whose memory is how old, what the offices last said."""
+    est = find_estate(a.estate)
+    print(f"{est.name} estate, {now():%Y-%m-%d %H:%M}Z\n")
+    print("Seats")
+    for k, v in est.roster.items():
+        sd = est.seat_dir(k)
+        events = session_events(sd)
+        starts = [e for e in events if e[0] == "start"]
+        ends = [e for e in events if e[0] == "end"]
+        open_ = open_sessions(sd)
+        dead = [o for o in open_ if o["pid"] and not pid_alive(o["pid"])]
+        last = events[-1] if events else None
+        if last and last[0] == "wait":
+            state = "waiting for a limit to lift"
+        elif open_ and len(dead) == len(open_):
+            state = f"orphaned; launcher pid {dead[-1]['pid']} gone (`curia reap` closes it)"
+        elif open_:
+            kind = "headless" if "headless" in open_[-1]["detail"] else "awake"
+            state = f"{kind} since {age(open_[-1]['at'])} ago" + (f" (x{len(open_)})" if len(open_) > 1 else "")
+        elif starts:
+            rc = re.search(r"rc=(\d+)", ends[-1][2]) if ends else None
+            state = f"asleep; last woke {age(starts[-1][1])} ago" + (f", rc {rc.group(1)}" if rc else "")
+        else:
+            state = "never woken"
+        hp = sd / "handoff.md"
+        handoff = file_age(hp) if handoff_written(sd) else "none"
+        journal = file_age(latest_file(sd / "journal", ".md"))
+        mail = sum(1 for line in read(sd / "mail.md").splitlines() if line.startswith("- "))
+        flags = " RESTART pending" if (sd / "RESTART").exists() else ""
+        if not v.get("active", True):
+            flags += " reserved"
+        print(f"  {v.get('title', k):<12} {v.get('kind', '?'):<7} {state:<34} "
+              f"sessions {len(starts):<4} handoff {handoff:<9} journal {journal:<9} mail {mail:<3}{flags}")
+    print("\nAccounts")
+    for k, v in est.accounts.items():
+        until = account_limited(est, k)
+        state = f"limited until {until:%Y-%m-%d %H:%M}Z" if until else "ok"
+        print(f"  {k:<10} {state:<32} fallback={v.get('fallback', '-'):<10} {account_burn(est, k)}"
+              + ("" if v.get("shared", True) else " (dedicated)"))
+    print("\nOffices")
+    for office in ("censor", "lictor", "portcullis"):
+        p = latest_file(est.dir / "brain" / office, ".md")
+        if not p:
+            print(f"  {office:<10} no report written")
+            continue
+        text = read(p)
+        note = ""
+        m = re.search(r"^Censor woke on \d+ repo\(s\)", text, re.M)
+        if m:
+            note = m.group(0)
+        if office == "lictor":
+            n = sum(1 for line in text.splitlines() if NUDGE_RE.match(line))
+            note = f"{n} nudge(s)"
+        m = re.search(r"^Landed \d+, held \d+", text, re.M)
+        if m:
+            note = m.group(0)
+        if looks_limited(text):
+            note += "; mentions a limit"
+        print(f"  {office:<10} {p.name} ({file_age(p)}) {note}")
+    by_acct, by_seat = spend(est)
+    print("\nSpend (from sessions.log: headless results, and the status line's readings for interactive sessions)")
+    if not by_acct:
+        print("  none recorded")
+    for label, table in (("account", by_acct), ("seat", by_seat)):
+        for k, row in table.items():
+            print(f"  {label:<8} {k:<12} wakings {row['wakings']:<4} ${row['cost']:<8.2f} "
+                  f"turns {row['turns']:<5} minutes {row['minutes']:.0f}")
+
+
+# ------------------------------------------------------------------- hook
+
+def cmd_hook(a) -> None:
+    """What a seat session's Claude Code hooks run. Installed by launch and run
+    through --settings, so nothing edits an account's settings.json."""
+    if a.event not in ("precompact", "release-guard", "usage", "limited", "shift"):
+        die(f"no hook '{a.event}'")
+    try:
+        payload = json.load(sys.stdin) if not sys.stdin.isatty() else {}
+    except (json.JSONDecodeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    seat, est_dir = os.environ.get("CURIA_SEAT", ""), os.environ.get("CURIA_ESTATE", "")
+    if not seat or not est_dir:
+        return  # not a seat: nothing to say
+    if a.event != "precompact":
+        est = Estate(Path(est_dir))
+        {"release-guard": hook_release_guard, "usage": hook_usage,
+         "limited": hook_limited, "shift": hook_shift}[a.event](est, seat, payload)
+        return
+    if payload.get("trigger", "manual") != "manual":
+        return  # auto-compaction: nothing to say
+    ok = Path(est_dir) / "seats" / seat.lower() / "COMPACT-OK"
+    if ok.exists():
+        ok.unlink()
+        return
+    print("House rules: hand off, don't compact. Run /handoff; the next session wakes with your note "
+          "and loses nothing. If the principal wants this session compacted instead, they touch "
+          f"{ok} from outside and you run /compact again.", file=sys.stderr)
+    sys.exit(2)
+
+
+def hook_usage(est: Estate, seat: str, payload: dict) -> None:
+    """The status line: record what Claude Code measures - the account's
+    rate-limit windows, this session's cost - where the launcher and the
+    other hooks read it, and print one line for the bar."""
+    cfg = Path(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")))
+    acct = current_account(est) or cfg.name
+    rl = payload.get("rate_limits") if isinstance(payload.get("rate_limits"), dict) else {}
+    cost = payload.get("cost") if isinstance(payload.get("cost"), dict) else {}
+    sid = str(payload.get("session_id") or "")
+    at = now().isoformat(timespec="seconds")
+    windows = {w: rl[w] for w in ("five_hour", "seven_day", "spend_limit") if isinstance(rl.get(w), dict)}
+    write_json(usage_path(cfg), {"at": at, "account": acct, "seat": seat, "session_id": sid, **windows})
+    if sid:
+        write_json(cfg / "curia-usage" / f"{sid}.json",
+                   {"at": at, "account": acct, "seat": seat, "cost_usd": cost.get("total_cost_usd"),
+                    "duration_ms": cost.get("total_duration_ms"), **windows})
+    bits = [est.roster.get(seat, {}).get("title", seat), acct]
+    for w, label in (("five_hour", "5h"), ("seven_day", "7d"), ("spend_limit", "spend")):
+        d = windows.get(w, {})
+        if isinstance(d.get("used_percentage"), (int, float)):
+            bit = f"{label} {d['used_percentage']:.0f}%"
+            if isinstance(d.get("resets_at"), (int, float)):
+                bit += f" resets {dt.datetime.fromtimestamp(d['resets_at'], dt.timezone.utc):%H:%M}Z"
+            bits.append(bit)
+    if isinstance(cost.get("total_cost_usd"), (int, float)):
+        bits.append(f"${cost['total_cost_usd']:.2f}")
+    if isinstance(cost.get("total_duration_ms"), (int, float)):
+        m = int(cost["total_duration_ms"] // 60000)
+        bits.append(f"{m // 60}h{m % 60:02d}m")
+    print(" | ".join(str(b) for b in bits))
+
+
+def hook_limited(est: Estate, seat: str, payload: dict) -> None:
+    """StopFailure on a rate limit: the turn ended because the account is out
+    of budget. Mark the account limited until it lifts, and leave the seat a
+    LIMITED marker for the launcher, which ends the session and relaunches
+    on the fallback; nothing useful can happen here without tokens."""
+    if payload.get("error_type", "rate_limit") != "rate_limit":
+        return
+    cfg = Path(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")))
+    acct = current_account(est)
+    error = str(payload.get("error") or "")
+    retry = payload.get("retry_after_seconds")
+    used, resets, window = worst_window(usage_reading(cfg))
+    if isinstance(retry, (int, float)) and not isinstance(retry, bool) and retry > 0:
+        until, why = now() + dt.timedelta(seconds=float(retry)), f"retry after {retry:.0f}s"
+    elif used is not None and resets is not None and used >= est.threshold("limited_at"):
+        until, why = resets, f"{window} window at {used:.0f}%"
+    elif looks_limited(error):
+        until, why = limit_reset(error) or now() + dt.timedelta(hours=LIMIT_DEFAULT_HOURS), "limit banner"
+    else:
+        until, why = now() + dt.timedelta(minutes=10), "rate limit naming no reset; ten minutes"
+    if acct:
+        mark_limited(est, acct, until)
+    sd = est.seat_dir(seat)
+    note = {"at": now().isoformat(timespec="seconds"), "account": acct or cfg.name,
+            "until": until.isoformat(timespec="seconds"), "why": why,
+            "session_id": str(payload.get("session_id") or ""),
+            "transcript_path": str(payload.get("transcript_path") or ""), "error": error[:300]}
+    write_json(sd / "LIMITED", note)
+    log_session(sd, "limit", f"account={note['account']} until={note['until']} session={note['session_id']} ({why})")
+
+
+def hook_shift(est: Estate, seat: str, payload: dict) -> None:
+    """Stop: at the end of a turn, is the shift over? Past handoff_at on the
+    account's fullest window, or past shift_hours awake, the seat is told
+    once to hand off; exit 2 keeps it going with that as its orders. The
+    SHIFT-OVER marker stops the nagging, and handoff --done or a launch
+    clears it. Headless there is no /handoff, so nothing is said."""
+    if os.environ.get("CURIA_HEADLESS") or payload.get("stop_hook_active"):
+        return
+    sd = est.seat_dir(seat)
+    marker = sd / "SHIFT-OVER"
+    if marker.exists():
+        return
+    cfg = Path(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")))
+    acct = current_account(est) or cfg.name
+    reasons = []
+    used, resets, window = worst_window(usage_reading(cfg))
+    if used is not None and resets is not None and used >= est.threshold("handoff_at"):
+        reasons.append(f"account '{acct}' is at {used:.0f}% of its {window.replace('_', '-')} window "
+                       f"(resets {resets:%H:%M}Z)")
+    hours = est.threshold("shift_hours")
+    open_ = open_sessions(sd)
+    started = parse_iso(open_[-1]["at"]) if open_ else None
+    if hours > 0 and started and now() - started >= dt.timedelta(hours=hours):
+        reasons.append(f"this session has been awake {(now() - started).total_seconds() / 3600:.1f}h "
+                       f"(a shift is {hours:g}h)")
+    if not reasons:
+        return
+    sd.mkdir(parents=True, exist_ok=True)
+    marker.write_text(now().isoformat(timespec="seconds") + " " + "; ".join(reasons) + "\n")
+    log_session(sd, "shift", "; ".join(reasons))
+    print("Shift over: " + "; ".join(reasons) + ". Hand off now: finish or park what is in hand, then run "
+          "/handoff. The relaunch lands on an account with headroom, and the next session is you, reading "
+          "your note; nothing is lost by stopping here.", file=sys.stderr)
+    sys.exit(2)
+
+
+def hook_release_guard(est: Estate, seat: str, payload: dict) -> None:
+    """A fence, and the worked example of one: refuse a `git push` that names
+    a repo's release branch, where that branch is not also the integration
+    branch. Matched on the command text alone, so a push with no refspec
+    while standing on the release branch is not caught; the rule covers that,
+    this hook covers the common case."""
+    if payload.get("tool_name") != "Bash":
+        return
+    command = str((payload.get("tool_input") or {}).get("command", ""))
+    if not re.search(r"\bgit\b[^\n;&|]*\bpush\b", command):
+        return
+    for k, r in est.repos.items():
+        release = r.get("release_branch")
+        if not release or release == r.get("integration_branch"):
+            continue
+        if re.search(rf"(^|[\s:/+]){re.escape(release)}(?=\s|$)", command):
+            print(f"House rules: a seat never pushes to `{release}`, the release branch of {k}. Open a PR "
+                  f"against `{r.get('integration_branch', 'the integration branch')}` and let the gate land "
+                  "it; a release is the principal's to cut. If this needs the principal, say so.",
+                  file=sys.stderr)
+            sys.exit(2)
 
 
 # ------------------------------------------------------------------- help
@@ -822,28 +2418,40 @@ Vocabulary
   prime     the system prompt a seat wakes with
   handoff   the note a seat writes on its way to sleep
   laurel    praise recorded so the seat sees it on waking; carries no work
+  mail      a note one seat leaves another; read at waking, archived by the reader
+  gate      a mechanical yes or no; the Portcullis lands work that passes it
+  fence     a program that refuses what the law forbids; hooks.json declares them
+  ruling    law that spans repos, with a status and what enforces it; brain/rulings/
+  shift     one session's workday; a hook says when it is over and the seat hands off
 
 Looking around
   roster                    who is on the estate
   repos                     the repos and their beads exports
-  accounts                  accounts and their limit state
-  check                     is the estate consistent
+  accounts                  accounts, their limit state, what their status lines last measured
+  rulings                   the brain's rulings: status and what enforces each
+  check                     is the estate consistent; notes what is odd
+  status                    who is awake, whose memory is how old, what the offices last said, what was spent
 
 Waking seats
-  launch <seat>             wake a crew seat or office, primed (--loop, --account, --say, --repo)
+  launch <seat>             wake a crew seat or office, primed (--loop, --everything, --say, --repo, --account, --carry)
   prime <seat>              print the prime a seat would wake with
-  run <seat> --prompt <f>   headless run of a seat with a prompt file; how an office wakes a crew seat
+  run <seat> --prompt <f>   headless run of a seat with a prompt file; how an office wakes a crew seat (--model, --print-cmd)
+  dispatch <fleet>          a fleet worker gets a worktree of its own and a job there (--bead <id>, --review <seat>, --repo)
   ingest <notes...>         capture beads from meeting notes (--paste, --repo, --account; '-' reads stdin)
 
-Watching (crons watch, models act)
+Watching (crons watch, models act; gates neither)
   lictor                    read-only nudge report across every repo
   censor                    check integration branches; wake the Censor where red
+  portcullis                land the seats' PRs that are reviewed and green; close their beads (--dry-run)
+  reap                      close the record of dead sessions; remove worktrees whose branch landed (--dry-run)
 
 The record
   handoff <seat>            show a seat's handoff (--begin/--done belong to the skill)
   laurel <seat> "text"      record praise for a seat's work
+  mail <seat> "text"        leave a seat a note for its next waking (--all broadcasts; --archive once read)
   limit <account> --hours N mark an account limited; launches fall back down the chain
   rename <old> <new>        rename a seat, keeping its history
+  hook <event>              what a seat session's Claude Code hooks run; launch installs them
 
 Estates
   init <path> --name N --principal P   create a new estate from the template
@@ -870,15 +2478,110 @@ lictor is blind in a repo without one). Read-only.""",
 
     "accounts": """\
 Print each account in accounts.toml: plan, fallback account, and limit
-state. An account is limited while its config dir holds a curia-limit-until
-marker set in the future; an expired marker is removed on read.""",
+state, and under it what its status line last measured - the fullest
+rate-limit window, when it resets, who read it. An account is limited
+while its config dir holds a curia-limit-until marker set in the future;
+an expired marker is removed on read. `shared = false` marks a dedicated
+account: only its own seats launch there, and no chain falls back to it.""",
 
     "check": """\
 Validate the estate against itself: every seat's account exists, every
 fleet seat has a managing office, every home is a real repo, every seat has
 a charter; every repo path exists and exports beads; skills are linked into
-each account's config dir; the censor and lictor prompts exist; claude and
-gh are on PATH. Prints what is wrong and exits 1; fixes nothing.""",
+each account's config dir; the office prompts (censor, lictor, dispatch,
+review) exist and no longer carry template text; hooks.json, if present,
+is a settings-shaped {"hooks": {...}}; every ruling in brain/rulings/ has a
+status from the lifecycle (proposed, advisory, enacted, enforced, retired)
+and one marked enforced names what enforces it; the rotation thresholds
+in estate.toml are numbers; claude and gh are on PATH. Prints what is
+wrong (marked !) and exits 1; fixes nothing.
+
+Below the problems come notes (marked -), which do not fail the check: a
+seat with interactive sessions and no handoff written, a seat with headless
+wakings and no journal entry, a stale RESTART or LIMITED marker, a seat
+whose last session was cut on a usage limit with no handoff since, a
+session with no end whose launcher is gone (`curia reap` closes it), a
+dedicated account (shared = false) in a seat's chain that is skipped for
+it, an enacted ruling that nothing enforces yet, an account currently
+marked limited, template text left in estate.toml.""",
+
+    "rulings": """\
+List the brain's rulings (brain/rulings/*.md), oldest first: date, status,
+slug, and what enforces it. A ruling is a file with a `status:` line and an
+`enforced by:` line; the template is templates/ruling.md in the mechanism
+repo. The lifecycle is the fences one: proposed, advisory, enacted,
+enforced, retired. Enacted means every seat must obey it; enforced means a
+program refuses or alerts when one does not, and `enforced by:` names it
+(a hook in hooks.json, a test, a check). Retired stays in place with its
+reason. `check` reports a ruling without a status; `lictor` nudges when an
+enacted ruling has gone a while with nothing enforcing it. Read-only.""",
+
+    "mail": """\
+Leave a seat a note: `curia mail <seat> "text"` appends one dated line,
+signed by the seat sending it (CURIA_SEAT) or the principal, to
+seats/<seat>/mail.md. The seat reads it in its prime at the next waking,
+under "Mail (unread)", and archives it itself with `curia mail <seat>
+--archive`, which moves the file to history/; nothing archives it for the
+seat, and it is read again at every waking until then. `--all` sends to
+every active seat but the sender. With no text, print the seat's unread
+mail. Mail carries work; praise is a laurel.""",
+
+    "dispatch": """\
+Give a fleet worker a home and a job. The home is a git worktree of its
+own at <worktrees>/<seat>/<repo> (estate.toml `worktrees`, default
+worktrees/ under the estate root), on a branch named <seat>/<bead> off the
+repo's integration branch (origin's copy after a fetch, when there is
+one). The worktree is reused from job to job and refused while it holds
+uncommitted work; a worker already at work (a session with no end and a
+live launcher) is not dispatched again. The job is a headless waking there
+(see `curia help run`) with prompts/dispatch.md as the brief, or --prompt;
+{bead}, {branch}, {worktree}, {repo}, {dispatcher}, {land_label} and the
+repo's repos.toml values fill its placeholders. The record is
+seats/<seat>/assignments.log (dispatch, returned, reviewed, reap) plus the
+usual sessions.log and journal.
+
+--review <seat> then wakes that seat headless in the same worktree with
+prompts/review.md (or --review-prompt): the third step of design,
+implement, review. The reviewer marks the PR reviewed, or requests
+changes; it does not fix. The Portcullis lands what is reviewed and green.
+The exit status is non-zero when the worker or the reviewer failed.
+
+Dispatch never claims or closes a bead, never merges, never removes a
+worktree; the brief tells the worker to claim, `portcullis` closes on
+landing, `reap` removes when landed. Only fleet seats are dispatched; crew
+and offices are launched or run.""",
+
+    "portcullis": """\
+The land gate. For each github repo with an integration branch, list the
+open PRs against it and take the seats' - those whose branch or title
+names a bead of the repo (its beads_prefix). A PR lands when it is not a
+draft, is reviewed (an APPROVED review, or the land label from estate.toml
+`land_label`, default 'reviewed', which a reviewer with the same forge
+identity as the worker can add where it cannot approve), every check is
+green and it is mergeable. Landing is `gh pr merge` with the repo's
+`merge` method (squash by default) and --delete-branch, then `bd close`
+of the bead in that repo (or a line saying to close it by hand when bd is
+not on PATH). Everything else stays, with the reason: draft, unreviewed,
+checks pending or red, conflicts.
+
+The yes or no is gh's facts, so this is a gate, not an office: a cron
+runs it and no model wakes (a launchd unit on an interval is in the estate
+template). A report lands in brain/portcullis/ when anything stood at the
+gate, and the principal is notified when something landed or a merge
+failed. --dry-run says what would land and writes nothing. The Portcullis
+never merges a draft, never reviews, never touches a release branch.""",
+
+    "reap": """\
+Clear away what is finished or dead, and only that. Sessions: a start in
+sessions.log with no end whose launcher pid is gone gets its end line
+(rc=-, reaped), so `status` stops calling the seat awake; a live launcher
+is left alone, and a start with no pid on record (before pids were
+recorded) is only mentioned. Worktrees: each <worktrees>/<seat>/<repo>
+whose branch has landed - an ancestor of the integration branch, or a
+merged PR with that head per gh, since squash merges lose ancestry - and
+which holds no uncommitted work is removed with its local branch, and the
+seat's assignments.log says so. Anything unfinished, unlanded or dirty is
+left where it is, with a line saying why. --dry-run says what would go.""",
 
     "prime": """\
 Print the system prompt the seat would wake with: charter, last handoff,
@@ -897,34 +2600,142 @@ office. --say gives the seat an opening message - the night's orders - so a
 looped launch needs no typing; without it the seat wakes on its prime alone
 and waits for you.
 
-Account fallback happens here, at launch - a running session never changes
-account. It is DECLARED, not measured: the chain skips an account only
-while a `curia limit` marker says to, and nothing reads how much of a plan
-is left. --account starts the walk somewhere other than the seat's usual
-account, for when you know one is nearly spent; it is a starting point, not
-a pin, so a limited account still falls through to its own fallback.""",
+Account rotation happens here, at launch - a running session never changes
+account. The chain is walked in order and the first account with headroom
+is taken: not marked limited by `curia limit`, not measured past
+limited_at, and under rotate_at on its fullest rate-limit window as its
+status line last read it (thresholds in estate.toml; `curia help init`).
+Past rotate_at the walk moves on; when every open account is past it, the
+emptiest is taken. A reading past limited_at counts as limited until that
+window resets, marker or none. An account with `shared = false` in
+accounts.toml is only ever its own seats': never a fallback for anyone
+else, so the seats that need it always find it. With no reading on file
+the walk is markers only, as before. --account starts the walk somewhere
+other than the seat's usual account; it is a starting point, not a pin.
+
+Mid-session, the seat's own hooks keep the night alive (`curia help
+hook`). Its status line records what Claude Code measures. Its Stop hook,
+past handoff_at or past shift_hours awake, tells it once to hand off while
+it still has the tokens to write the note; the --loop relaunch then lands
+on an account with headroom. Its StopFailure hook, when a turn dies on
+the limit, marks the account and leaves a LIMITED marker; the launcher,
+watching for it, ends the session (nothing useful can happen there
+without tokens) and relaunches on the fallback with a prime line saying
+the last session was cut without a handoff and where its transcript is.
+Without --loop the same note is printed and the launch ends.
+
+--carry, experimental, with --loop: after a cut, copy the transcript into
+the next account's config dir and --resume the session there, so the seat
+carries on mid-thought. If that resume fails at once, the seat is woken
+fresh on the same account instead.
+
+--everything, with a repo: work its board until it is clear. Each waking
+gets orders naming what is ready, in progress, blocked by other beads on
+the board, and waiting on a human - a label from estate.toml
+`human_labels`, a blocked bead with nothing open on the board blocking
+it, or a bead blocked only by such beads or by ids not on the board; those
+are left alone. --loop is implied. After each handoff the board is read
+again from the repo's beads export (so the orders tell the seat to export
+before handing off), and the loop ends when nothing remains that is not
+waiting on a human, or when two wakings in a row leave the board exactly
+as it was, so a stuck seat does not spin all night; the principal is told
+either way. A session that ends without a handoff is woken again while
+the board says so, unless it died at once. --say is appended to the
+orders.
+
+The record: each session gets a fresh session id, written to sessions.log
+with its start and end, so a transcript can be found again (claude
+--resume <id> under that account). The end line carries the cost and
+minutes the status line last reported for the session, so `status` can
+total interactive spend. The prime goes to claude in a temporary file, not
+on the command line. A RESTART marker left by an earlier handoff is
+cleared at launch: this launch is the waking it asked for.
+
+--loop relaunches after each /handoff. When every account in the chain is
+limited, a looped launch does not die: it logs a wait, notifies if the
+estate says how, sleeps until the earliest reset time and tries again.
+Without --loop, a spent chain is an error, since you are at the keyboard.
+
+The session carries Claude Code hooks, passed with --settings so no
+account's settings.json is edited: the mechanism's, which refuses a manual
+/compact with a reminder to /handoff instead (`curia help hook` says how
+the principal allows one), then whatever fences the estate declares in
+curia/hooks.json. Auto-compaction is not blocked.
+
+The authority envelope comes from the roster: `disallowed_tools` are
+refused for the whole session, in every session, and that is the fence;
+`tools`, when the roster names a list, are allowed without asking.
+Interactively, a seat with no `tools` list gets whatever the account's own
+permissions say. The start line in sessions.log records the model and the
+launcher's pid, so after an upgrade the seat's history says which model it
+was, and `reap` can tell a dead launcher from a live one.""",
 
     "run": """\
-Run a seat headless: prepend the seat's prime to a prompt file and invoke
-`claude -p`. Any seat, not only an office. This is how an office wakes a
-crew seat: a subagent spawned inside a session inherits that session's
-account and model, whereas `run` resolves the seat's OWN account from the
-roster (walking its fallback chain), links the skills there, and prepends
-the seat's own prime - charter, last handoff, laurels. It runs in the repo
+Run a seat headless: invoke `claude -p` with the seat's prime as system
+prompt and a prompt file as the message. Any seat, not only an office. This
+is how an office wakes a crew seat: a subagent spawned inside a session
+inherits that session's account and model, whereas `run` resolves the
+seat's OWN account from the roster (walking its fallback chain), links the
+skills there, and gives the seat its own prime - charter, last handoff,
+laurels, journal. It runs in the repo
 you are in, or the one --repo names, or else the estate root. The prompt is
 looked up in the estate's prompts/ directory unless given as a path; {placeholders}
 in it are filled from the estate, the --repo entry in repos.toml, and --set
 pairs (unknown ones, and any other braces, are left intact). Output is
 printed and logged under brain/<seat>/, and the seat's sessions.log records
 a headless waking. Without --skip-permissions the seat gets the tool list
-from its roster entry, or Bash, Read, Edit, Write, Glob, Grep and Agent.""",
+from its roster entry, or Bash, Read, Edit, Write, Glob, Grep and Agent.
+
+The model is the seat's `run_model` from the roster when set, else its
+`model`: a seat can talk to the principal on one model and be woken
+headless on a cheaper one. --model overrides both for this run only; the
+roster is the record, so a standing change goes there, not in a flag.
+--print-cmd shows the resolved account, model, cwd and prompt size and
+runs nothing.
+
+Memory: there is no /handoff in a headless run, so the prompt ends with
+orders to write a short journal entry to seats/<seat>/journal/<stamp>-<repo>.md
+before answering, and the prime carries the seat's last three entries. One
+file per run, so overlapping runs of one seat never race. The mechanism
+never writes the entry; if the seat did not, sessions.log says
+journal=missing and stderr says so.
+
+The record: the run uses claude's JSON output, so sessions.log gets the
+session id, cost, turns and duration alongside rc, and the answer under
+brain/<seat>/ ends with the same line. The session id is chosen here and
+passed to claude, so the start line carries it too (with the launcher's
+pid), and `status` can total the spend by account and seat. Only the seat's
+answer is printed. The exit status is non-zero when the run failed.
+
+The run carries the same hooks and authority envelope as a launch: the
+mechanism's hooks, the estate's hooks.json, `--allowedTools` from the
+roster's `tools` (or the default list) and `--disallowedTools` from
+`disallowed_tools`. Print mode has no status line, and the run sets
+CURIA_HEADLESS, so the shift hook says nothing; the limited hook still
+marks the account when a turn dies on the limit.
+
+Limits: a run that dies on a usage limit marks its account limited (until
+the reset time the banner names, else for a few hours), then goes once
+more down the fallback chain. Each headless run is a launch, and fallback
+happens at launch. When the chain is spent, the estate is notified if it
+says how, and nothing retries.
+
+A roster `fallback_model` comes before that: when a run dies on a limit,
+the same account is tried once more on the fallback model before the
+account is marked, since a limit may be the model's rather than the
+account's. Both dead means the account is, and the walk continues down
+the chain on the primary model. The end line in sessions.log says
+fallback_model=<model> when the answer came from it.""",
 
     "handoff": """\
 With no flag, print the seat's current handoff note - the note the next
 session wakes up to. --begin and --done belong to the /handoff skill:
 --begin archives the old note to history/ and says where to write the new
-one; --done checks the note was written and touches the RESTART marker
-that a --loop launcher relaunches on.""",
+one; --done checks the note was written with every section the template
+asks for (a section may say there is nothing under it, but it must be
+there), touches the RESTART marker that a --loop launcher relaunches on,
+and clears the LAST-LIMITED and SHIFT-OVER markers: the seat's memory is
+fresh again, and the shift's orders are done.""",
 
     "laurel": """\
 Append one dated line of praise to the seat's laurels.md. The seat reads
@@ -941,21 +2752,37 @@ launch, never mid-session.
 A marker says an account IS limited, and every seat on it is then skipped.
 To send one session somewhere else, use `launch --account` instead: marking
 an account that is not limited steers the session by putting a falsehood in
-the record.""",
+the record.
+
+A headless run (`run`, `censor`) that dies on the limit banner writes this
+marker itself, reading the reset time from the banner when it names one,
+and retries down the chain. An interactive seat's StopFailure hook writes
+it when a turn dies on the limit (`curia help hook`), so by hand is for
+what the hooks did not see.""",
 
     "lictor": """\
 Read-only report across every repo: stale in_progress beads, blocked beads
 whose blockers are missing or all closed, silent PRs and drafts, the last
-gate run on each integration branch. Reads the beads exports and gh; never
-writes to a repo or a board. Crons watch, models act: the lictor only ever
-nudges the seats that do.""",
+completed gate run on each integration branch (a run still in progress is
+mentioned, not judged), postmortem beads (label `postmortem`, still open)
+older than --postmortem-days that no ruling in brain/rulings/ cites, and,
+above the repos, enacted rulings older than --ruling-days that nothing
+enforces yet. Reads the beads exports, the brain and gh; never writes to a
+repo or a board. Crons watch, models act: the lictor only ever nudges the
+seats that do. --write saves the report under brain/lictor/ and notifies
+the principal if estate.toml says how (see `curia help init`).""",
 
     "censor": """\
-For each repo with a gate and an integration branch, read the last run.
-Where it is red, wake the seat holding the censor role headless on that
-repo with prompts/censor.md; where green, just report. The day's summary
-lands in brain/censor/. The Censor diagnoses and opens fix drafts; it
-never promotes to a release branch.""",
+For each repo with a gate and an integration branch, read the last
+COMPLETED run; a run still in progress has no verdict and is only
+mentioned. Where the completed run is red, wake the seat holding the
+censor role headless on that repo with prompts/censor.md; where green,
+just report. The day's summary lands in brain/censor/, and the principal
+is notified if estate.toml says how. A waking that hits a usage limit
+marks the account and retries down the chain (see `curia help run`); the
+summary says when that happened. --dry-run prints what it would do and
+writes nothing, not even the report. The Censor diagnoses and opens fix
+drafts; it never promotes to a release branch.""",
 
     "ingest": """\
 Turn meeting notes into beads: wake the seat holding the notarius role on
@@ -984,9 +2811,91 @@ prompts) are yours to update by hand.""",
 
     "init": """\
 Copy the estate template to <path>/curia, stamp in the estate's name and
-principal, and register it in ~/.config/curia/estates.toml. Then: fill
-roster.toml, repos.toml and accounts.toml, write each seat's charter, and
-run `curia check`.""",
+principal, and register it in ~/.config/curia/estates.toml; refuses when
+that name or path is already registered. Then: fill roster.toml, repos.toml
+and accounts.toml, write each seat's charter, and run `curia check`.
+
+estate.toml `notify` is how the offices reach you: a shell command run
+with CURIA_SUBJECT, CURIA_BODY and CURIA_REPORT in its environment when
+the Censor finishes, the Lictor writes, the Portcullis lands or fails to,
+a headless run spends its whole account chain, or a looped seat waits out
+a limit. Empty means nobody is told; the template shows a macOS
+notification as an example. `worktrees` says where fleet workers' homes
+go and `land_label` what a reviewer adds to say "land this". The
+rotation thresholds are there too, with the mechanism's defaults: rotate_at
+(a launch prefers the next account past this), handoff_at (the shift hook
+says hand off past this), limited_at (a launch treats the account as
+limited past this), all percent of an account's fullest rate-limit window
+as its status line last read it, and shift_hours (the shift hook says hand
+off after this long awake; 0 never). `human_labels` names the labels that
+say a bead waits on a person, which `launch --everything` leaves alone.
+In accounts.toml, `shared = false` marks a dedicated account.
+
+The template also carries hooks.json, the estate's fences, with the
+mechanism's release-guard hook as the worked example; prompts/dispatch.md
+and prompts/review.md, the fleet's briefs; brain/rulings/, empty; and a
+launchd unit for the Portcullis on an interval beside the Censor's morning
+one.""",
+
+    "status": """\
+The estate now, read-only. For every seat: whether it is awake (a start
+in sessions.log without its end) or headless, or orphaned (the start's
+launcher pid is gone; `curia reap` closes the record), when it last woke,
+how many sessions it has had, how old its handoff and its newest journal
+entry are, how many unread mail lines wait, and whether a RESTART marker
+is pending. Then each account's limit state and what its status line last
+measured - the fullest rate-limit window, when it resets, who read it -
+with dedicated accounts marked; then the offices' latest reports (censor,
+lictor, portcullis) with their one-line result and whether one mentions a
+limit; then the spend totalled from every sessions.log by account and by
+seat - wakings, cost, turns, minutes - from headless results and from the
+status line's readings of interactive sessions. Nothing here asks the API
+anything, and nothing is touched.""",
+
+    "hook": """\
+What a seat session's Claude Code hooks run. `launch`, `run` and
+`dispatch` pass them to claude with --settings, so no account's
+settings.json is edited and a session started any other way carries none.
+The mechanism's hooks are below; the estate adds its own fences in
+curia/hooks.json, in the shape of a settings file's "hooks" block, and
+they ride along in every seat session. Outside a seat (no CURIA_SEAT, no
+CURIA_ESTATE) every hook here does nothing.
+
+precompact: fires on a manual /compact inside a seat. The house rule is
+hand off, don't compact, so the hook refuses (exit 2) and tells the seat
+to /handoff. To allow one anyway, touch COMPACT-OK in the seat's directory
+from outside the session; the hook consumes it and lets that one /compact
+through. Auto-compaction is never blocked.
+
+usage: the status line. Claude Code hands it what it measures - the
+account's rate-limit windows (five-hour, seven-day, a spend limit where
+one applies), each with a used percentage and a reset time, and the
+session's cost - and the hook writes them to curia-usage.json in the
+account's config dir and to curia-usage/<session id>.json, then prints one
+line for the bar. That file is what rotation, the shift hook and `status`
+read. Nothing here asks the API anything.
+
+shift: at the end of every turn. Past handoff_at on the account's fullest
+window, or past shift_hours awake (estate.toml), it tells the seat once to
+hand off - exit 2, so the seat carries on with that as its orders - and
+leaves SHIFT-OVER so it is said once; handoff --done or a launch clears
+it. Headless, or when Claude is already continuing because of a stop
+hook, it says nothing.
+
+limited: StopFailure on a rate limit, when a turn dies because the account
+is out of budget. Marks the account limited - until the retry-after the
+error names, else the measured window's reset, else the reset time in the
+banner, else a few hours; a rate limit naming no reset at all is taken as
+transient and marked for ten minutes - and leaves the seat a LIMITED
+marker carrying the session id and transcript path. `launch` watches for
+that marker, ends the session and relaunches (`curia help launch`).
+
+release-guard: a PreToolUse fence on Bash, and the worked example of one.
+A `git push` naming a repo's release branch, where that branch is not
+also the integration branch, is refused (exit 2) with the rule: open a PR
+and let the gate land it. It matches the command text, so a push with no
+refspec while standing on the release branch gets past it; the rule, not
+the hook, covers that. The estate template wires it in hooks.json.""",
 
     "help": """\
 With no argument, the overview: vocabulary, the daily rhythm, every
@@ -1001,16 +2910,51 @@ examples:
   curia launch <seat> --repo <repo>    name the repo from anywhere
   curia launch <seat> --print-cmd      show account, cwd and prompt without launching
   curia launch <seat> --account <acct> start on a named account, not the seat's usual
-  curia launch <seat> --loop --say "..."  wake it with orders and relaunch on /handoff""",
+  curia launch <seat> --loop --say "..."  wake it with orders and relaunch on /handoff
+  curia launch <seat> --loop --carry   ...and carry a cut session to the next account (experimental)
+  curia launch <office> --repo <repo> --everything   work the board until nothing remains but what waits on a human""",
     "run": """\
 examples:
   curia run <seat> --prompt <name>.md --repo <repo>
   curia run <seat> --prompt /tmp/oneoff.md --set date=2026-01-01
-  curia run <crew> --prompt /abs/brief.md --repo <repo>   an office waking a crew seat on the crew seat's account""",
+  curia run <crew> --prompt /abs/brief.md --repo <repo>   an office waking a crew seat on the crew seat's account
+  curia run <seat> --prompt <name>.md --print-cmd   show account, model and cwd; run nothing
+  curia run <crew> --prompt /abs/brief.md --model <model>   this run on another model (say why in the handoff)""",
     "limit": """\
 examples:
   curia limit current --hours 5        after claude reports a usage limit
   curia limit <account> --clear        the limit lifted early""",
+    "status": """\
+examples:
+  curia status                         the morning look: who is awake, what the offices said
+  watch -n 60 curia status             while a batch runs""",
+    "hook": """\
+examples:
+  touch <estate>/seats/<seat>/COMPACT-OK   allow the seat's next manual /compact
+  curia help init                      where hooks.json wires release-guard in""",
+    "mail": """\
+examples:
+  curia mail <seat> "the brief for <bead> is in the bead; start there"
+  curia mail --all "release branch is frozen until the principal says"
+  curia mail <seat>                    read what waits for the seat
+  curia mail <seat> --archive          the seat has read it (the seat runs this)""",
+    "dispatch": """\
+examples:
+  curia dispatch <fleet> --bead <id> --repo <repo>            a worktree and a job
+  curia dispatch <fleet> --bead <id> --repo <repo> --review <seat>   ...then a review
+  curia dispatch <fleet> --bead <id> --print-cmd              where it would go; run nothing""",
+    "portcullis": """\
+examples:
+  curia portcullis --dry-run           what would land, and why the rest would not
+  curia portcullis                     land it (the launchd unit does this on an interval)""",
+    "reap": """\
+examples:
+  curia reap --dry-run                 what is dead or landed
+  curia reap                           close the records, remove the worktrees""",
+    "rulings": """\
+examples:
+  curia rulings                        every ruling, its status, what enforces it
+  cp <mechanism>/templates/ruling.md <estate>/brain/rulings/$(date +%F)-<slug>.md""",
     "ingest": """\
 examples:
   curia ingest notes/<file>.md         wake the intake office on a file
@@ -1038,14 +2982,22 @@ def cmd_init(a) -> None:
     curia = target / "curia"
     if curia.exists():
         die(f"{curia} already exists")
+    key = a.name.lower().replace(" ", "_")
+    if ESTATES_FILE.exists():
+        registered = load_toml(ESTATES_FILE).get("estates", {})
+        if key in registered:
+            die(f"an estate '{key}' is already registered in {ESTATES_FILE}")
+        for k, e in registered.items():
+            if Path(e.get("path", "")).expanduser().resolve() == curia:
+                die(f"{curia} is already registered as estate '{k}' in {ESTATES_FILE}")
     shutil.copytree(MECHANISM_DIR / "templates" / "estate", curia)
     for p in curia.rglob("*"):
-        if p.is_file() and p.suffix in {".toml", ".md", ".plist"}:
+        if p.is_file() and p.suffix in {".toml", ".md", ".plist", ".json"}:
             p.write_text(p.read_text().replace("{{ESTATE}}", a.name).replace("{{PRINCIPAL}}", a.principal)
                          .replace("{{ESTATE_DIR}}", str(curia)).replace("{{MECHANISM}}", str(MECHANISM_DIR)))
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(ESTATES_FILE, "a") as f:
-        f.write(f'\n[estates.{a.name.lower().replace(" ", "_")}]\npath = "{curia}"\n')
+        f.write(f'\n[estates.{key}]\npath = "{curia}"\n')
     print(f"estate '{a.name}' created at {curia} and registered in {ESTATES_FILE}\n"
           "Next: fill roster.toml, repos.toml, accounts.toml; write seats/<seat>/charter.md; run `curia check`.")
 
@@ -1065,7 +3017,10 @@ def main() -> None:
     parser("roster", "list seats").set_defaults(fn=cmd_roster)
     parser("repos", "list repos and their beads exports").set_defaults(fn=cmd_repos)
     parser("accounts", "list accounts and limit state").set_defaults(fn=cmd_accounts)
+    parser("rulings", "the brain's rulings: status and what enforces each").set_defaults(fn=cmd_rulings)
     parser("check", "validate the estate's configuration").set_defaults(fn=cmd_check)
+    parser("status", "who is awake, whose memory is how old, what the offices last said, what was spent"
+           ).set_defaults(fn=cmd_status)
 
     p = parser("prime", "print the system-prompt prime a seat wakes up with")
     p.add_argument("seat", help="a seat name from roster.toml (any case)"); p.set_defaults(fn=cmd_prime)
@@ -1077,6 +3032,11 @@ def main() -> None:
     p.add_argument("--account", help="start on this account instead of the seat's, e.g. one with headroom")
     p.add_argument("--tmux", action="store_true", help="open in a new tmux window named after the seat")
     p.add_argument("--say", help="opening message for the seat, e.g. tonight's orders")
+    p.add_argument("--carry", action="store_true",
+                   help="experimental, with --loop: after a mid-session limit, copy the cut session's transcript "
+                        "to the next account and --resume it there")
+    p.add_argument("--everything", action="store_true",
+                   help="work the repo's board until nothing remains that is not waiting on a human (implies --loop)")
     p.add_argument("--print-cmd", dest="print_cmd", action="store_true", help="show what would run, without launching")
     p.set_defaults(fn=cmd_launch)
 
@@ -1088,7 +3048,24 @@ def main() -> None:
     p.add_argument("--timeout", type=int, default=3600, help="seconds before the run is cut off (default 3600)")
     p.add_argument("--skip-permissions", action="store_true",
                    help="run with --dangerously-skip-permissions instead of the seat's tool list")
+    p.add_argument("--model", help="model for this run only; default: the seat's run_model from the roster, else its model")
+    p.add_argument("--print-cmd", dest="print_cmd", action="store_true", help="show account, model, cwd and prompt size without running")
     p.set_defaults(fn=cmd_run)
+
+    p = parser("dispatch", "give a fleet worker a worktree of its own and a job there; --review adds a reviewer")
+    p.add_argument("seat", help="a fleet seat from roster.toml")
+    p.add_argument("--bead", required=True, help="the bead to implement; the branch is <seat>/<bead>")
+    p.add_argument("--repo", help="the repo to work in (default: the repo you are in)")
+    p.add_argument("--prompt", help="the worker's brief: a file in the estate's prompts/, or a path (default dispatch.md)")
+    p.add_argument("--review", help="after the worker returns, wake this seat headless in the worktree to review")
+    p.add_argument("--review-prompt", dest="review_prompt", help="the reviewer's brief (default review.md)")
+    p.add_argument("--timeout", type=int, default=3600, help="seconds before a waking is cut off (default 3600)")
+    p.add_argument("--skip-permissions", action="store_true",
+                   help="run with --dangerously-skip-permissions instead of the seat's tool list")
+    p.add_argument("--model", help="the worker's model for this job only (default: its run_model, else model)")
+    p.add_argument("--print-cmd", dest="print_cmd", action="store_true",
+                   help="show the worktree, branch, account and brief without touching git or running")
+    p.set_defaults(fn=cmd_dispatch)
 
     p = parser("handoff", "show a seat's handoff; --begin/--done belong to the /handoff skill")
     p.add_argument("seat", help="the seat whose handoff to show"); g = p.add_mutually_exclusive_group()
@@ -1100,6 +3077,13 @@ def main() -> None:
     p.add_argument("seat", help="the seat being praised")
     p.add_argument("text", help="the praise, one line, quoted"); p.set_defaults(fn=cmd_laurel)
 
+    p = parser("mail", "leave a seat a note for its next waking; the seat archives it once read")
+    p.add_argument("seat", nargs="?", help="the seat to write to (with --all, the text)")
+    p.add_argument("text", nargs="?", help="the note, quoted; omit it to read the seat's unread mail")
+    p.add_argument("--all", action="store_true", help="every active seat but the sender")
+    p.add_argument("--archive", action="store_true", help="the seat has read its mail: move it to history/")
+    p.set_defaults(fn=cmd_mail)
+
     p = parser("limit", "mark an account as usage-limited so launches fall back")
     p.add_argument("account", help="account name, or 'current' to resolve from CLAUDE_CONFIG_DIR")
     p.add_argument("--hours", type=float, help="limited for this many hours from now")
@@ -1110,15 +3094,28 @@ def main() -> None:
     p = parser("lictor", "read-only nudge report across every repo (crons watch)")
     p.add_argument("--stale-days", type=int, default=2, help="in_progress is stale after this many days (default 2)")
     p.add_argument("--pr-hours", type=int, default=24, help="a PR or draft is silent after this many hours (default 24)")
+    p.add_argument("--postmortem-days", dest="postmortem_days", type=int, default=7,
+                   help="an open postmortem bead no ruling cites is nudged after this many days (default 7)")
+    p.add_argument("--ruling-days", dest="ruling_days", type=int, default=14,
+                   help="an enacted ruling nothing enforces is nudged after this many days (default 14)")
     p.add_argument("--write", action="store_true", help="save to brain/lictor/ instead of printing")
     p.set_defaults(fn=cmd_lictor)
 
     p = parser("censor", "check each integration branch; wake the Censor where red (models act)")
-    p.add_argument("--dry-run", action="store_true", help="report branch states without waking anyone")
+    p.add_argument("--dry-run", action="store_true", help="print branch states; wake nobody, write nothing")
     p.add_argument("--timeout", type=int, default=5400, help="seconds per repo before a waking is cut off (default 5400)")
     p.add_argument("--skip-permissions", action="store_true",
                    help="run with --dangerously-skip-permissions instead of the seat's tool list")
     p.set_defaults(fn=cmd_censor)
+
+    p = parser("portcullis", "the land gate: merge the seats' PRs that are reviewed, green and mergeable; close their beads")
+    p.add_argument("--dry-run", action="store_true", help="say what would land and why the rest would not; merge nothing, write nothing")
+    p.add_argument("--label", help="the label that says reviewed (default: estate.toml land_label, else 'reviewed')")
+    p.set_defaults(fn=cmd_portcullis)
+
+    p = parser("reap", "close the record of sessions whose launcher is gone; remove worktrees whose branch has landed")
+    p.add_argument("--dry-run", action="store_true", help="say what would go; touch nothing")
+    p.set_defaults(fn=cmd_reap)
 
     p = parser("ingest", "capture beads from meeting notes: wake the intake office on the transcript(s)")
     p.add_argument("sources", nargs="*", help="transcript file(s); quote paths with spaces; '-' reads stdin")
@@ -1134,6 +3131,10 @@ def main() -> None:
     p.add_argument("new", help="the new name: a bare word, not yet on the roster")
     p.add_argument("--title", help="display title (default: the new name, capitalised)")
     p.set_defaults(fn=cmd_rename)
+
+    p = parser("hook", "what a seat session's Claude Code hooks run (launch installs them)")
+    p.add_argument("event", help="the hook: precompact, shift, limited, usage, release-guard")
+    p.set_defaults(fn=cmd_hook)
 
     p = parser("init", "create a new estate from the template")
     p.add_argument("path", help="workspace directory; the estate lands at <path>/curia")

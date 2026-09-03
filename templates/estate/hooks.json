@@ -1,0 +1,13 @@
+{
+  "_": "The estate's fences: the hooks block of a Claude Code settings file, carried into every seat session by launch, run and dispatch. A ruling becomes mechanical here. release-guard refuses a git push that names a repo's release branch (where it differs from the integration branch); add your own command hooks beside it, and name them in the ruling's `enforced by:` line.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "{{MECHANISM}}/bin/curia hook release-guard"}
+        ]
+      }
+    ]
+  }
+}

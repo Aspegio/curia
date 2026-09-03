@@ -1,6 +1,7 @@
 # Repos in the estate. path is relative to the estate root (the parent of curia/).
 # forge = github | azure | other. gate/leaf are the commands a seat runs.
-# Offices skip a repo with no gate or no integration_branch.
+# Offices skip a repo with no gate or no integration_branch. merge is how the
+# Portcullis lands a PR: squash (default), merge or rebase.
 
 [repos.example]
 path = "example"
@@ -11,3 +12,4 @@ integration_branch = "main"
 release_branch = "main"
 gate = "just ci"
 leaf = "just test"
+# merge = "squash"

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The land gate runs on an interval, not a morning: reviewed green work should
+     not wait for anyone. StartInterval is seconds; a Censor that should watch
+     continuously rather than at six can use the same key. -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>curia.{{ESTATE}}.portcullis</string>
+  <key>ProgramArguments</key><array>
+    <string>{{MECHANISM}}/bin/curia</string><string>--estate</string><string>{{ESTATE_DIR}}</string><string>portcullis</string>
+  </array>
+  <key>StartInterval</key><integer>900</integer>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/Users/USER/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+  <key>StandardOutPath</key><string>{{ESTATE_DIR}}/brain/portcullis/launchd.log</string>
+  <key>StandardErrorPath</key><string>{{ESTATE_DIR}}/brain/portcullis/launchd.log</string>
+</dict></plist>

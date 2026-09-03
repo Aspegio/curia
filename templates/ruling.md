@@ -1,0 +1,20 @@
+# Ruling - <slug>, <date>
+
+status: proposed
+enforced by: nothing yet
+
+## What was ruled
+One paragraph. What every seat must now do, or never do.
+
+## Why
+The incident, postmortem bead or question that led here. Cite bead ids; the
+Lictor stops nudging a postmortem once a ruling names it.
+
+## What enforces it
+The program that refuses or alerts: a hook in `hooks.json`, a test, a `curia
+check` line. Until there is one, the status stays `enacted` and the ruling is
+law by obedience; when there is one, name it on the `enforced by:` line and
+set the status to `enforced`.
+
+## History
+- <date>: proposed by <seat>, ruled by the principal

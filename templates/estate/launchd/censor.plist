@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Once a day at six. For a standing deploy-red watch, replace
+     StartCalendarInterval with <key>StartInterval</key><integer>1800</integer>. -->
 <plist version="1.0"><dict>
   <key>Label</key><string>curia.{{ESTATE}}.censor</string>
   <key>ProgramArguments</key><array>

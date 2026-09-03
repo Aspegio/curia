@@ -5,3 +5,30 @@ naming_family = "choose one per estate so a seat name is never ambiguous"
 created = "YYYY-MM-DD"
 # Words the mechanism repo must never contain. The fence test reads these.
 denylist = ["{{ESTATE}}", "{{PRINCIPAL}}"]
+# How the offices reach you: a shell command run with CURIA_SUBJECT, CURIA_BODY
+# and CURIA_REPORT in its environment when the Censor finishes, the Lictor
+# writes, a headless run spends its account chain, or a looped seat waits out a
+# limit. Empty means nobody is told. macOS:
+# notify = 'osascript -e "display notification \"$CURIA_BODY\" with title \"$CURIA_SUBJECT\""'
+notify = ""
+# Where fleet workers' homes go (`curia dispatch`): a directory relative to the
+# estate root, one worktree per seat per repo underneath it.
+worktrees = "worktrees"
+# What a reviewer adds to a PR to say "land this" when it cannot approve (same
+# forge identity as the worker); an APPROVED review counts too. The Portcullis
+# lands PRs that carry it and are green.
+land_label = "reviewed"
+# Rotation. Percent of an account's fullest rate-limit window, as the seat's
+# status line last measured it (five-hour, seven-day, or a spend limit):
+# rotate_at - a launch prefers the next account in the chain past this;
+# handoff_at - the Stop hook tells a seat to hand off past this;
+# limited_at - a launch treats the account as limited past this, marker or none.
+# shift_hours - the Stop hook tells a seat to hand off after this long awake
+# (0: never). These are the mechanism's defaults; change them here.
+rotate_at = 70
+handoff_at = 85
+limited_at = 95
+shift_hours = 6
+# Labels that say a bead waits on a person. `launch --everything` leaves those
+# beads alone and stops when nothing else remains.
+human_labels = ["needs-principal", "needs-human", "blocked-by-human"]
