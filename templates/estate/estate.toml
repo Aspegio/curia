@@ -28,6 +28,8 @@ land_label = "reviewed"
 # (0: no margin); budget_wrap_at - percent of --budget at which to start
 # wrapping up. These are the mechanism's defaults; change them here.
 rotate_at = 70
+# rotate_week_at - the same on the seven-day and spend windows, which empty slowly
+rotate_week_at = 90
 handoff_at = 85
 limited_at = 95
 shift_hours = 6

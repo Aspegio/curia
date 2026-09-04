@@ -128,6 +128,7 @@ def test_limit_banner_detection_needs_the_banner(curia):
     assert curia.looks_limited("You've hit your session limit · resets 4:30pm")
     assert curia.looks_limited("You've hit your weekly limit")
     assert curia.looks_limited("Claude usage limit reached")
+    assert curia.looks_limited("You're out of usage credits. Switch to another model, or manage usage credits")
     assert not curia.looks_limited("Reviewed the rate limiter PR; all good")
 
 
@@ -1321,3 +1322,88 @@ def test_until_and_budget_without_loop_die(cli, estate):
     rc, _, err = cli(*E(estate), "launch", "muse", "--until", "06:30")
     assert rc == 2 and "loop to end" in err
     rc, _, err = cli(*E(estate), "launch", "muse", "--budget", "200")
+
+
+# ------------------------------------------------ 2026-09-04: the account night
+
+def test_slow_windows_rotate_later_than_the_five_hour_one(curia, estate, tmp_path):
+    def reading(acct, **windows):
+        curia.write_json(curia.usage_path(tmp_path / f"acct-{acct}"),
+                         {"at": curia.now().isoformat(), "seat": "x",
+                          **{w: {"used_percentage": used, "resets_at": int(time.time()) + 3600} for w, used in windows.items()}})
+    reading("a", seven_day=75)               # a slow window past rotate_at but under rotate_week_at: stay
+    assert curia.walk_chain(estate, "a", "a")[0] == "a"
+    reading("a", seven_day=92)               # past rotate_week_at: rotate
+    assert curia.walk_chain(estate, "a", "a")[0] == "b"
+    reading("a", five_hour=75, seven_day=20)  # the five-hour window still rotates at rotate_at
+    assert curia.walk_chain(estate, "a", "a")[0] == "b"
+    reading("a", five_hour=96)               # and measured full is limited, whatever the window
+    free, limited = curia.walk_chain(estate, "a", "a")
+    assert free == "b" and [n for n, _ in limited] == ["a"]
+    assert curia.rotation_due({"spend_limit": {"used_percentage": 91, "resets_at": int(time.time()) + 60}}, 70, 90)
+    assert not curia.rotation_due({"seven_day": {"used_percentage": 99, "resets_at": int(time.time()) - 5}}, 70, 90)
+
+
+def test_launch_refuses_a_second_live_launcher_for_the_same_seat(curia, cli, estate, monkeypatch):
+    sd = estate.seat_dir("muse")
+    curia.log_session(sd, "start", f"account=a model=model-x cwd=/ session=older pid={os.getppid()}")
+    monkeypatch.setattr(curia, "invoke_claude", lambda cmd, cwd, env, timeout=None, capture=False, watch=None: 0)
+    rc, out, err = cli(*E(estate), "launch", "muse")
+    assert rc != 0 and "awake already" in err and str(os.getppid()) in err
+    assert [e[0] for e in curia.session_events(sd)] == ["start"]   # nothing was woken
+    curia.log_session(sd, "end", "rc=0 session=older")
+    rc, out, err = cli(*E(estate), "launch", "muse")
+    assert rc == 0, err
+
+
+def test_handoff_done_ends_the_session_when_the_turn_ends(curia, cli, estate, monkeypatch, tmp_path):
+    sd = estate.seat_dir("muse")
+    as_seat(monkeypatch, estate, "muse", tmp_path / "acct-a")
+    # before --done the Stop hook has nothing to say
+    rc, out, err = cli("hook", "shift", stdin=json.dumps({"session_id": "s1"}))
+    assert rc == 0 and not (sd / "ENDED").exists()
+    (sd / "RESTART").touch()   # what handoff --done leaves
+    rc, out, err = cli("hook", "shift", stdin=json.dumps({"session_id": "s1", "stop_hook_active": True}))
+    assert rc == 0 and (sd / "ENDED").exists()
+    (sd / "ENDED").unlink(); (sd / "RESTART").unlink()
+    # the launcher's watch ends the session on ENDED, and --loop relaunches on the RESTART it left
+    calls = []
+
+    def fake(cmd, cwd, env, timeout=None, capture=False, watch=None):
+        calls.append(cmd)
+        if len(calls) == 1:
+            assert not watch()
+            (sd / "RESTART").touch()   # --done
+            (sd / "ENDED").touch()     # the Stop hook at the end of that turn
+            assert watch()
+            return 143
+        return 0                        # the relaunched session ends by hand, no handoff: the loop stops
+
+    monkeypatch.setattr(curia, "invoke_claude", fake)
+    rc, out, err = cli(*E(estate), "launch", "muse", "--loop")
+    assert rc == 0, err
+    assert len(calls) == 2 and "asked to be woken again" in out
+    events = curia.session_events(sd)
+    assert [e[0] for e in events] == ["start", "end", "start", "end"]
+    assert "rc=143" in events[1][2] and "handed-off" in events[1][2]
+    assert not (sd / "ENDED").exists() and not (sd / "RESTART").exists()
+
+
+def test_censor_retries_gh_and_names_an_unread_branch(curia, cli, estate, monkeypatch):
+    answers = [None, None, [{"status": "completed", "conclusion": "success", "url": "u1", "createdAt": "", "headSha": "h1"}]]
+    monkeypatch.setattr(curia, "gh_json", lambda args: answers.pop(0) if answers else None)
+    slept = []
+    monkeypatch.setattr(curia.time, "sleep", lambda s: slept.append(s))
+    rc, out, _ = cli(*E(estate), "censor")
+    assert rc == 0 and slept == [curia.CENSOR_GH_WAIT] * 2 and "success" in out and "NOT judged" not in out
+    sd = estate.seat_dir("warden")
+    assert curia.session_events(sd)[-1][0] == "check" and "unread=0" in curia.session_events(sd)[-1][2]
+    # gh dead for good: three tries, then the branch is named unjudged, never called green
+    monkeypatch.setattr(curia, "gh_json", lambda args: None)
+    rc, out, _ = cli(*E(estate), "censor")
+    assert rc == 0 and "NOT judged" in out and "(3 tries)" in out and "no runs found" not in out
+    assert "unread=1" in curia.session_events(sd)[-1][2]
+    # a dry run does not wait around
+    slept.clear()
+    rc, out, _ = cli(*E(estate), "censor", "--dry-run")
+    assert rc == 0 and slept == [] and "NOT judged" in out

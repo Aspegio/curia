@@ -44,7 +44,7 @@ DEFAULT_TOOLS = ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Agent"]
 LIMIT_DEFAULT_HOURS = 5
 # The banner claude prints when an account is out of budget; matched only on a
 # run that failed, so a seat merely discussing rate limits is not caught.
-LIMIT_RE = re.compile(r"hit your (?:\w+ )?limit\b|usage limit\b|rate limit\b", re.I)
+LIMIT_RE = re.compile(r"hit your (?:\w+ )?limit\b|usage limit\b|rate limit\b|out of usage credits\b", re.I)
 # "resets 4:30pm (Area/City)", "resets at 5pm", "resets 16:30". Needs minutes
 # or am/pm so a stray number after "resets" is not read as an hour.
 RESET_RE = re.compile(r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:\(([^)]+)\))?", re.I)
@@ -62,14 +62,19 @@ OFFICE_PROMPTS = ("censor.md", "lictor-cloud.md", "dispatch.md", "review.md")
 WATCH_SECONDS = 5
 # Rotation thresholds, percent of an account's fullest rate-limit window as the
 # status line measures it; estate.toml overrides each by name. rotate_at: a
-# launch prefers the next account in the chain past this. handoff_at: the Stop
+# launch prefers the next account in the chain past this on the five-hour
+# window; rotate_week_at is the same for the seven-day and spend windows, which
+# empty slowly (a 72% week with 36h to run is not a 72% five hours). handoff_at: the Stop
 # hook tells a seat to hand off past this. limited_at: a launch treats the
 # account as limited past this, marker or none. shift_hours: the Stop hook
 # tells a seat to hand off after this long awake (0: never). wrap_minutes: how
 # long before --until to start wrapping up. budget_wrap_at: percent of --budget
 # at which to start wrapping up.
-THRESHOLDS = {"rotate_at": 70.0, "handoff_at": 85.0, "limited_at": 95.0, "shift_hours": 6.0,
-              "wrap_minutes": 45.0, "budget_wrap_at": 90.0}
+THRESHOLDS = {"rotate_at": 70.0, "rotate_week_at": 90.0, "handoff_at": 85.0, "limited_at": 95.0,
+              "shift_hours": 6.0, "wrap_minutes": 45.0, "budget_wrap_at": 90.0}
+# How many times the Censor asks gh for a branch's runs before saying gh is unavailable, and the wait between.
+CENSOR_GH_TRIES = 3
+CENSOR_GH_WAIT = 60.0
 # Labels that say a bead waits on a person; estate.toml `human_labels` overrides.
 HUMAN_LABELS = ["needs-principal", "needs-human", "blocked-by-human"]
 
@@ -340,6 +345,23 @@ def worst_window(reading: dict | None) -> tuple[float | None, dt.datetime | None
     return best
 
 
+def rotation_due(reading: dict | None, rotate_at: float, rotate_week_at: float) -> bool:
+    """Should a launch prefer the next account? Yes past rotate_at on the
+    five-hour window, or past rotate_week_at on a slow window (seven-day,
+    spend limit). One threshold for both parked a burn account at 72% of its
+    week with a day and a half to run, and capped its fallback within the hour."""
+    for name in ("five_hour", "seven_day", "spend_limit"):
+        w = (reading or {}).get(name) or {}
+        used, resets = w.get("used_percentage"), w.get("resets_at")
+        if not isinstance(used, (int, float)) or not isinstance(resets, (int, float)):
+            continue
+        if dt.datetime.fromtimestamp(resets, dt.timezone.utc) <= now():
+            continue
+        if used >= (rotate_at if name == "five_hour" else rotate_week_at):
+            return True
+    return False
+
+
 def account_burn(est: Estate, acct: str) -> str:
     """One phrase on what the status line last measured for an account."""
     reading = usage_reading(account_dir(est, acct))
@@ -414,8 +436,9 @@ def ensure_skills(cfg: Path) -> list[str]:
 
 def walk_chain(est: Estate, acct: str, own: str | None = None) -> tuple[str | None, list[tuple[str, dt.datetime]]]:
     """Walk the fallback chain from acct and choose an account. In chain
-    order, the first account that is not limited and whose fullest measured
-    window is under rotate_at; failing that, the emptiest account that is not
+    order, the first account that is not limited and not due a rotation
+    (`rotation_due`: five-hour past rotate_at, or a slow window past
+    rotate_week_at); failing that, the emptiest account that is not
     limited; None when every account is limited. Limited means a `curia
     limit` marker, or a status-line reading past limited_at, which counts
     until that window resets. An account marked `shared = false` is chosen
@@ -423,6 +446,7 @@ def walk_chain(est: Estate, acct: str, own: str | None = None) -> tuple[str | No
     dedicated account, never a fallback. Returned with the limited accounts
     passed and when each lifts."""
     rotate_at, limited_at = est.threshold("rotate_at"), est.threshold("limited_at")
+    rotate_week_at = est.threshold("rotate_week_at")
     seen: list[str] = []
     limited: list[tuple[str, dt.datetime]] = []
     candidates: list[tuple[str, float]] = []
@@ -437,10 +461,11 @@ def walk_chain(est: Estate, acct: str, own: str | None = None) -> tuple[str | No
             continue
         until = account_limited(est, cur)
         if until is None:
-            used, resets, _ = worst_window(usage_reading(account_dir(est, cur)))
+            reading = usage_reading(account_dir(est, cur))
+            used, resets, _ = worst_window(reading)
             if used is not None and resets is not None and used >= limited_at:
                 until = resets   # measured full: as good as a marker, lifting when the window does
-            elif used is None or used < rotate_at:
+            elif used is None or not rotation_due(reading, rotate_at, rotate_week_at):
                 return cur, limited
             else:
                 candidates.append((cur, used))
@@ -1126,6 +1151,12 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
         if len(repos) > 1:
             print("boards, in order: " + ", ".join(repos))
         return
+    live = [o for o in open_sessions(sd) if o["pid"] and o["pid"] != os.getpid() and pid_alive(o["pid"])]
+    if live:
+        o = live[-1]
+        die(f"{title} is awake already: a session since {age(o['at'])} ago under launcher pid {o['pid']}. A seat is "
+            "one session at a time: end that session first (its own loop relaunches it if it has one), or "
+            "`curia reap` if the launcher is in fact gone.")
     if tmux:
         inner = ["curia", "launch", name, "--estate", str(est.dir)]
         if account:
@@ -1178,9 +1209,10 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
     if restart.exists():
         restart.unlink()
         print(f"curia: cleared a stale RESTART marker for {title}; this launch is the waking it asked for")
-    for stale in ("LIMITED", "SHIFT-OVER"):
+    for stale in ("LIMITED", "SHIFT-OVER", "ENDED"):
         (sd / stale).unlink(missing_ok=True)   # left by a session that is over
     limited_marker = sd / "LIMITED"
+    ended_marker = sd / "ENDED"   # the Stop hook touches it when handoff --done has run and the turn is over
     resume: dict | None = None   # a cut session to carry to the next account (--carry)
     orders = night_ord if night_ord else say
     if night_ord and say:
@@ -1299,7 +1331,7 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
               + (f", carrying session {sid} over" if carried else ""))
         started = now()
         try:
-            rc = invoke_claude(cmd, home, env, watch=limited_marker.exists)
+            rc = invoke_claude(cmd, home, env, watch=lambda: limited_marker.exists() or ended_marker.exists())
         finally:
             prime.unlink(missing_ok=True)
         tail = ""
@@ -1311,6 +1343,9 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
             if isinstance(usage.get("duration_ms"), (int, float)):
                 tail += f" minutes={usage['duration_ms'] / 60000:.1f}"
             (cfg / "curia-usage" / f"{sid}.json").unlink(missing_ok=True)
+        if ended_marker.exists():
+            ended_marker.unlink()
+            tail += " handed-off"   # the session ended because its handoff was written, at the end of that turn
         cut = None
         if limited_marker.exists():
             cut = read_json(limited_marker) or {}
@@ -1343,8 +1378,9 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
             print(f"curia: {title} asked to be woken again; relaunching with the new handoff")
             continue
         if everything:
-            if rc != 0 and (now() - started).total_seconds() < 60:
-                print(f"curia: {title}'s session ended at once (rc {rc}); not relaunching", file=sys.stderr)
+            if (now() - started).total_seconds() < 60:
+                print(f"curia: {title}'s session ended at once (rc {rc}) without a handoff: ended by hand, or it "
+                      "could not start; not relaunching", file=sys.stderr)
                 break
             print(f"curia: {title} ended without a handoff; the board decides whether it wakes again")
             continue
@@ -1592,8 +1628,9 @@ def cmd_handoff(a) -> None:
         for marker in ("LAST-LIMITED", "SHIFT-OVER"):
             (sd / marker).unlink(missing_ok=True)   # memory is fresh again; the shift's orders are done
         log_session(sd, "handoff", "")
-        print(f"Handoff recorded for {s.get('title', name)}. The session may end now; "
-              f"`curia launch {name.lower()}` wakes the seat with it (the --loop launcher does so on exit).")
+        print(f"Handoff recorded for {s.get('title', name)}. This turn is the session's last: the launcher ends "
+              f"it when the turn ends; a --loop launcher wakes the seat again with the note, otherwise "
+              f"`curia launch {name.lower()}` does.")
         return
     print(read(hp) or "_No handoff yet._")
 
@@ -1820,15 +1857,24 @@ def cmd_censor(a) -> None:
         die("prompts/censor.md missing")
     day = today()
     summary = [f"# Censor report, {est.name} estate, {day}" + (" (dry run)" if a.dry_run else ""), ""]
-    woke, limited = 0, []
+    woke, limited, unread = 0, [], []
     for k, r in est.repos.items():
         b = r.get("integration_branch")
         if not b or r.get("forge") != "github" or not r.get("gate"):
             continue
         slug = repo_slug(r["remote"])
         done, newest, runs = branch_runs(slug, b)
+        tries = 1
+        while runs is None and tries < CENSOR_GH_TRIES and not a.dry_run:
+            time.sleep(CENSOR_GH_WAIT)   # gh fails at 06:00 for reasons that pass: network, keychain, PATH
+            tries += 1
+            done, newest, runs = branch_runs(slug, b)
+        if runs is None:
+            unread.append(k)
+            summary.append(f"- {k}: gh could not read {b}'s runs ({tries} tries); the branch was NOT judged")
+            continue
         if not runs:
-            summary.append(f"- {k}: no runs found on {b} (or gh unavailable)")
+            summary.append(f"- {k}: no runs found on {b}")
             continue
         line = f"- {k} `{b}`: **{run_line(done, newest)}**"
         if not done or done.get("conclusion") == "success" or a.dry_run:
@@ -1860,9 +1906,12 @@ def cmd_censor(a) -> None:
     path = d / f"{day}.md"
     path.write_text("\n".join(summary))
     print(f"\nwritten {path}")
+    log_session(est.seat_dir(name), "check", f"woke={woke} unread={len(unread)} report={path.name}")
     subject = f"Censor {day}: woke on {woke} repo(s)"
     if limited:
         subject += f"; limited on {', '.join(limited)}"
+    if unread:
+        subject += f"; gh unavailable on {', '.join(unread)}"
     notify(est, subject, "\n".join(line for line in summary if line.startswith("- ")), path)
 
 
@@ -2495,11 +2544,18 @@ def hook_shift(est: Estate, seat: str, payload: dict) -> None:
     account's fullest window, past shift_hours awake, past the deadline, or
     past budget, the seat is told once to hand off; exit 2 keeps it going
     with that as its orders. The SHIFT-OVER marker stops the nagging, and
-    handoff --done or a launch clears it. Headless there is no /handoff, so
-    nothing is said."""
-    if os.environ.get("CURIA_HEADLESS") or payload.get("stop_hook_active"):
+    handoff --done or a launch clears it. After handoff --done (the RESTART
+    marker), the end of the turn touches ENDED and the launcher ends the
+    session: nothing written after --done reaches the record. Headless there
+    is no /handoff, so nothing is said."""
+    if os.environ.get("CURIA_HEADLESS"):
         return
     sd = est.seat_dir(seat)
+    if (sd / "RESTART").exists():
+        (sd / "ENDED").touch()   # handoff --done has run and this turn is over: the launcher ends the session
+        return
+    if payload.get("stop_hook_active"):
+        return
     marker = sd / "SHIFT-OVER"
     if marker.exists():
         return
@@ -3017,7 +3073,9 @@ a limit. Empty means nobody is told; the template shows a macOS
 notification as an example. `worktrees` says where fleet workers' homes
 go and `land_label` what a reviewer adds to say "land this". The
 rotation thresholds are there too, with the mechanism's defaults: rotate_at
-(a launch prefers the next account past this), handoff_at (the shift hook
+(a launch prefers the next account past this on the five-hour window),
+rotate_week_at (the same on the seven-day and spend windows, which empty
+slowly; default 90), handoff_at (the shift hook
 says hand off past this), limited_at (a launch treats the account as
 limited past this), all percent of an account's fullest rate-limit window
 as its status line last read it, shift_hours (the shift hook says hand

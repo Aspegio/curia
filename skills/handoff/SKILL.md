@@ -32,5 +32,7 @@ is you, reading your diary.
    banner the hooks did not catch, also run
    `curia limit current --until "<reset time from the error, ISO>"` so the
    relaunch lands on the fallback account instead of the limited one.
-7. Tell the principal in one line that the handoff is written and the session
-   may end. Do not exit yourself.
+7. Tell the principal in one line that the handoff is written. This turn is
+   the session's last: the launcher ends the session when the turn ends and,
+   with --loop, wakes you again with the note. Do not exit yourself, and do
+   nothing after --done that the record would need.
