@@ -129,8 +129,11 @@ weaken it to get green.
   every other account without them (which is how `/handoff` went missing for a
   whole account's seats). Launch is the moment the account is known; link there.
 - The estate is discovered (`--estate`, `CURIA_ESTATE`, a walk up from the
-  working directory, then the registered default), so no command needs a
-  particular working directory.
+  working directory, then the registry: the estate whose roster has the seat
+  named, or the only one registered), so no command needs a particular
+  working directory. Two estates and no seat to tell them apart means stop,
+  never guess: there is no default estate, so no command lands on the wrong
+  client.
 - The working directory chooses the repo. `launch`, `run` and `ingest`
   default `--repo` to the registered repo containing the cwd (the most
   specific where repos nest); the roster home applies only from outside any

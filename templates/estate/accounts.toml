@@ -1,8 +1,12 @@
-# Accounts are Claude config dirs (CLAUDE_CONFIG_DIR). fallback names the next
-# account to use when this one is marked limited (`curia limit <name>`) or
-# measured past the estate's thresholds. shared = false makes an account a
-# dedicated one: only seats whose roster account it is launch there, and no
-# other seat's chain falls back to it, so those seats always find it.
+# Accounts are Claude config dirs (CLAUDE_CONFIG_DIR). Two shapes: a client
+# with a dedicated account gets its own config dir, listed in this estate
+# alone; a client without one lists the principal's own accounts, the pool,
+# which every such estate shares, limits and all (`curia check` notes which
+# accounts are pooled). fallback names the next account to use when this one
+# is marked limited (`curia limit <name>`) or measured past the estate's
+# thresholds; the chain stops at a repeat. shared = false makes an account
+# its own seats' only: no other seat's chain falls back to it, so those seats
+# always find it, and a client's account never carries a seat that is not on it.
 
 [accounts.main]
 config_dir = "~/.claude"

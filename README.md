@@ -72,7 +72,9 @@ curia launch <seat> --account <acct>   # start on a named account, e.g. one with
 ```
 
 The estate is found from `--estate`, `CURIA_ESTATE`, walking up from the
-working directory, or the default registered in `~/.config/curia/estates.toml`.
+working directory, or the registry in `~/.config/curia/estates.toml`: the
+estate whose roster has the seat you named, or the only one registered. Two
+estates and no seat to tell them apart, and a command stops rather than guess.
 
 ## A new client
 
@@ -83,8 +85,10 @@ curia init ~/Workspace/NewClient --name "NewClient" --principal "Name"
 Then fill `roster.toml`, `repos.toml`, `accounts.toml`, write each seat's
 `charter.md`, look at `hooks.json` (the estate's fences; the release-guard is
 wired in as the example), run `curia check`. Give every client its own naming family so a
-seat name is never ambiguous, and its own account config dir. Seats never
-roam between estates.
+seat name is never ambiguous: the registry finds a seat's estate by its name.
+A client with a dedicated account gets its own config dir, listed in that
+estate alone; a client without one lists the principal's own accounts, the
+pool, which such estates share. Seats never roam between estates.
 
 ## Principles the mechanism encodes
 

@@ -233,7 +233,26 @@ class Estate:
         return best[0] if best else None
 
 
-def find_estate(explicit: str | None) -> Estate:
+def registered_estates() -> dict[str, Path]:
+    """The estates registered on this machine: key -> curia directory."""
+    if not ESTATES_FILE.exists():
+        return {}
+    return {k: Path(e["path"]).expanduser()
+            for k, e in load_toml(ESTATES_FILE).get("estates", {}).items() if e.get("path")}
+
+
+def seat_registered(curia_dir: Path, seat: str) -> bool:
+    """Does the roster at curia_dir have this seat (any case)?"""
+    roster = curia_dir / "roster.toml"
+    return roster.exists() and any(k.lower() == seat.lower() for k in load_toml(roster).get("seats", {}))
+
+
+def find_estate(explicit: str | None, seat: str | None = None) -> Estate:
+    """The estate a command works in: --estate, CURIA_ESTATE, a walk up from
+    the working directory, then the registry - the one estate whose roster
+    has the named seat (a naming family keeps a seat name to one estate), or
+    the only estate registered. Two estates and no seat to tell them apart:
+    stop, never guess, so nothing lands on the wrong client."""
     if explicit:
         p = Path(explicit).expanduser()
         return Estate(p if p.name == "curia" else p / "curia")
@@ -245,15 +264,22 @@ def find_estate(explicit: str | None) -> Estate:
             return Estate(p)
         if (p / "curia" / "estate.toml").exists():
             return Estate(p / "curia")
-    if ESTATES_FILE.exists():
-        estates = load_toml(ESTATES_FILE).get("estates", {})
-        for _, e in estates.items():
-            if e.get("default"):
-                return Estate(Path(e["path"]).expanduser())
-        if len(estates) == 1:
-            return Estate(Path(next(iter(estates.values()))["path"]).expanduser())
+    estates = registered_estates()
+    if seat:
+        homes = [k for k, p in estates.items() if seat_registered(p, seat)]
+        if len(homes) > 1:
+            die(f"seat '{seat}' is on more than one registered estate ({', '.join(homes)}); pass --estate")
+        if homes:
+            return Estate(estates[homes[0]])
+        if len(estates) > 1:
+            die(f"no registered estate ({', '.join(estates)}) has a seat '{seat}'; pass --estate")
+    if len(estates) == 1:
+        return Estate(next(iter(estates.values())))
+    if estates:
+        die(f"more than one estate is registered ({', '.join(estates)}): pass --estate, set CURIA_ESTATE, "
+            "or run inside one")
     die("no estate found: pass --estate, set CURIA_ESTATE, run inside one, "
-        f"or register a default in {ESTATES_FILE}")
+        f"or register one in {ESTATES_FILE} (`curia init` does)")
 
 
 # --------------------------------------------------------------- accounts
@@ -777,6 +803,21 @@ def cmd_accounts(a) -> None:
         print(f"  {'':<10} {account_burn(est, k)}")
 
 
+def pooled_with(est: Estate, acct: str) -> list[tuple[str, str]]:
+    """The other registered estates naming this account's config dir, as
+    (estate key, their account name). The principal's own accounts are pooled
+    this way; a client's dedicated account should never show up here."""
+    mine = account_dir(est, acct).resolve()
+    out = []
+    for key, p in registered_estates().items():
+        if p.resolve() == est.dir or not (p / "accounts.toml").exists():
+            continue
+        for name, a in load_toml(p / "accounts.toml").get("accounts", {}).items():
+            if a.get("config_dir") and Path(os.path.expanduser(a["config_dir"])).resolve() == mine:
+                out.append((key, name))
+    return out
+
+
 def cmd_check(a) -> None:
     est = find_estate(a.estate)
     problems: list[str] = []
@@ -864,6 +905,9 @@ def cmd_check(a) -> None:
         if until:
             notes.append(f"account {k}: limited until {until:%Y-%m-%d %H:%M}Z; launches fall back to "
                          f"'{est.accounts[k].get('fallback', '-')}'")
+        for other, theirs in pooled_with(est, k):
+            notes.append(f"account {k}: its config dir is also account '{theirs}' of estate '{other}': a pooled "
+                         "account, whose limits and transcripts both estates share")
     for prompt in OFFICE_PROMPTS:
         pp = est.dir / "prompts" / prompt
         if not pp.exists():
@@ -888,7 +932,7 @@ def cmd_check(a) -> None:
 
 
 def cmd_prime(a) -> None:
-    est = find_estate(a.estate)
+    est = find_estate(a.estate, a.seat)
     print(build_prime(est, a.seat))
 
 
@@ -1100,7 +1144,7 @@ def everything_orders(repo: str, b: dict, night: str = "") -> str:
 
 
 def cmd_launch(a) -> None:
-    est = find_estate(a.estate)
+    est = find_estate(a.estate, a.seat)
     launch_seat(est, a.seat, repo=a.repo, loop=a.loop, account=a.account, tmux=a.tmux,
                 say=a.say, print_cmd=a.print_cmd, carry=a.carry, everything=a.everything,
                 until=a.until, budget=a.budget)
@@ -1396,7 +1440,7 @@ def fill_placeholders(text: str, subs: dict) -> str:
 
 def cmd_run(a) -> None:
     """Headless run of a seat with a prompt file (claude -p)."""
-    est = find_estate(a.estate)
+    est = find_estate(a.estate, a.seat)
     name, s = est.seat(a.seat)
     prompt_path = Path(a.prompt).expanduser()
     if not prompt_path.is_absolute():
@@ -1602,7 +1646,7 @@ def run_headless(est: Estate, name: str, s: dict, prompt: str, cwd: Path,
 
 
 def cmd_handoff(a) -> None:
-    est = find_estate(a.estate)
+    est = find_estate(a.estate, a.seat)
     name, s = est.seat(a.seat)
     sd = est.seat_dir(name)
     sd.mkdir(parents=True, exist_ok=True)
@@ -1636,7 +1680,7 @@ def cmd_handoff(a) -> None:
 
 
 def cmd_laurel(a) -> None:
-    est = find_estate(a.estate)
+    est = find_estate(a.estate, a.seat)
     name, _ = est.seat(a.seat)
     sd = est.seat_dir(name)
     sd.mkdir(parents=True, exist_ok=True)
@@ -1652,7 +1696,7 @@ def cmd_laurel(a) -> None:
 def cmd_mail(a) -> None:
     """A note from one seat, or the principal, to another: read in the prime at
     the next waking, archived by the reader and by nobody else."""
-    est = find_estate(a.estate)
+    est = find_estate(a.estate, None if a.all else a.seat)
     if a.all:
         text = a.text or a.seat
         if not text:
@@ -1991,7 +2035,7 @@ def cmd_dispatch(a) -> None:
     """Give a fleet worker a home and a job: a worktree of its own, a branch
     named for the bead, a headless waking there, a record of it, and a review
     by another seat if asked."""
-    est = find_estate(a.estate)
+    est = find_estate(a.estate, a.seat)
     name, s = est.seat(a.seat)
     title = s.get("title", name)
     if s.get("kind") != "fleet":
@@ -2234,7 +2278,7 @@ def cmd_portcullis(a) -> None:
 
 def cmd_rename(a) -> None:
     """Rename a seat: the person stays, the name changes, the record says so."""
-    est = find_estate(a.estate)
+    est = find_estate(a.estate, a.old)
     oldk, s = est.seat(a.old)
     newk = a.new.lower()
     if any(k.lower() == newk for k in est.roster):
@@ -2687,7 +2731,9 @@ Estates
   init <path> --name N --principal P   create a new estate from the template
 
 The estate is found from --estate, CURIA_ESTATE, a walk up from the working
-directory, or the default registered in ~/.config/curia/estates.toml.
+directory, then the registry (~/.config/curia/estates.toml): the estate whose
+roster has the seat you named, or the only one registered. Two estates and no
+seat to tell them apart, and a command stops rather than guess.
 
 `curia help <command>` explains one command in full. The law - house rules,
 rulings, charters - lives in the estate's own curia/ directory, not here."""
@@ -2732,8 +2778,10 @@ wakings and no journal entry, a stale RESTART or LIMITED marker, a seat
 whose last session was cut on a usage limit with no handoff since, a
 session with no end whose launcher is gone (`curia reap` closes it), a
 dedicated account (shared = false) in a seat's chain that is skipped for
-it, an enacted ruling that nothing enforces yet, an account currently
-marked limited, template text left in estate.toml.""",
+it, an account whose config dir another registered estate also names (a
+pooled account: the principal's own are, and a client's dedicated one must
+never be), an enacted ruling that nothing enforces yet, an account
+currently marked limited, template text left in estate.toml.""",
 
     "rulings": """\
 List the brain's rulings (brain/rulings/*.md), oldest first: date, status,
@@ -3065,6 +3113,16 @@ principal, and register it in ~/.config/curia/estates.toml; refuses when
 that name or path is already registered. Then: fill roster.toml, repos.toml
 and accounts.toml, write each seat's charter, and run `curia check`.
 
+Give the estate a naming family of its own: the registry finds a seat's
+estate by the seat's name, so a name shared by two estates is ambiguous
+and a command using it stops. accounts.toml takes one of two shapes. A
+client with a dedicated account gets its own config dir, listed in that
+estate alone. A client without one lists the principal's own accounts,
+the pool, which every such estate shares along with its limits; the
+template starts on ~/.claude for that reason. `check` notes which of an
+estate's accounts another estate also names. The estate's name, principal
+and repo names join the fence the mechanism's tests keep.
+
 estate.toml `notify` is how the offices reach you: a shell command run
 with CURIA_SUBJECT, CURIA_BODY and CURIA_REPORT in its environment when
 the Censor finishes, the Lictor writes, the Portcullis lands or fails to,
@@ -3162,6 +3220,7 @@ command. With a command, that command's page in full.""",
 HELP_EXAMPLES = {
     "launch": """\
 examples:
+  curia launch <seat>                  from anywhere: the registry finds the estate whose roster has the seat
   curia launch <seat> --loop --tmux    the overnight shape: own window, relaunch on /handoff
   cd <repo> && curia launch <seat>     the seat starts in the repo you are in
   curia launch <seat> --repo <repo>    name the repo from anywhere
@@ -3266,7 +3325,8 @@ def cmd_init(a) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(prog="curia", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--estate", help="path to <workspace>/curia (default: CURIA_ESTATE, cwd walk-up, or registered default)")
+    ap.add_argument("--estate", help="path to <workspace>/curia (default: CURIA_ESTATE, cwd walk-up, the registered estate whose roster "
+                    "has the seat named, or the only one registered)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def parser(name: str, summary: str) -> argparse.ArgumentParser:

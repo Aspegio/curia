@@ -9,7 +9,7 @@ import pytest
 
 MECH = pathlib.Path(__file__).resolve().parent.parent
 ESTATES = pathlib.Path.home() / ".config" / "curia" / "estates.toml"
-SCAN_SUFFIXES = {".py", ".md", ".toml", ".plist", ".json", ""}
+SCAN_SUFFIXES = {".py", ".md", ".toml", ".plist", ".json", ".jsonl", ".html", ""}
 
 
 def denylist() -> set[str]:

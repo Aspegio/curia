@@ -477,6 +477,53 @@ def test_rename_keeps_the_seat_memory(curia, cli, estate):
     assert rc == 2 and "already exists" in err
 
 
+# ---------------------------------------------------------------- registry
+
+def other_estate(cli, tmp_path, name, roster="", accounts=""):
+    """A second registered estate beside the fixture's, with the roster and
+    accounts given (else the template's)."""
+    rc, _, err = cli("init", str(tmp_path / name.lower()), "--name", name, "--principal", "X")
+    assert rc == 0, err
+    cd = tmp_path / name.lower() / "curia"
+    if roster:
+        (cd / "roster.toml").write_text(roster)
+    if accounts:
+        (cd / "accounts.toml").write_text(accounts)
+    return cd.resolve()
+
+
+def test_a_seat_name_finds_its_estate_in_the_registry(curia, cli, estate, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CURIA_ESTATE", raising=False)
+    other = other_estate(cli, tmp_path, "Other",
+                         roster='[seats.oracle]\ntitle = "Oracle"\nkind = "crew"\nmodel = "m"\naccount = "main"\n')
+    assert curia.find_estate(None, "muse").dir == estate.dir
+    assert curia.find_estate(None, "Oracle").dir == other
+    rc, out, err = cli("prime", "muse")
+    assert rc == 0, err
+    rc, _, err = cli("prime", "nobody")
+    assert rc == 2 and "no registered estate" in err
+    # an office command from outside any workspace has no seat to go by: stop
+    rc, _, err = cli("roster")
+    assert rc == 2 and "more than one estate is registered" in err
+    # a seat on both estates is ambiguous, not a guess
+    (other / "roster.toml").write_text('[seats.muse]\ntitle = "Muse"\nkind = "crew"\nmodel = "m"\naccount = "main"\n')
+    rc, _, err = cli("prime", "muse")
+    assert rc == 2 and "more than one registered estate" in err
+    # inside a workspace the walk up still wins
+    monkeypatch.chdir(estate.root / "alpha")
+    assert curia.find_estate(None, "muse").dir == estate.dir
+    rc, _, err = cli("roster")
+    assert rc == 0, err
+
+
+def test_check_notes_an_account_pooled_across_estates(cli, estate, tmp_path):
+    other_estate(cli, tmp_path, "Other", accounts=f'[accounts.pool]\nconfig_dir = "{tmp_path / "acct-b"}"\n')
+    rc, out, _ = cli(*E(estate), "check")
+    assert "account b: its config dir is also account 'pool' of estate 'other'" in out
+    assert "account a: its config dir is also" not in out
+
+
 # -------------------------------------------------------------------- init
 
 def test_init_refuses_a_registered_name(curia, cli, estate, tmp_path):
