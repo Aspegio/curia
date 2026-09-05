@@ -1454,3 +1454,52 @@ def test_censor_retries_gh_and_names_an_unread_branch(curia, cli, estate, monkey
     slept.clear()
     rc, out, _ = cli(*E(estate), "censor", "--dry-run")
     assert rc == 0 and slept == [] and "NOT judged" in out
+
+
+def test_run_with_a_bead_records_the_assignment_and_its_cost(curia, cli, estate, monkeypatch, tmp_path):
+    brief = tmp_path / "brief.md"
+    brief.write_text("Review {bead} in {repo}.\n")
+
+    def fake(cmd, cwd, env, timeout=None, capture=False, watch=None):
+        journal = Path(re.search(r"journal entry .*? to `([^`]+)`", cmd[cmd.index("-p") + 1], re.S).group(1))
+        journal.write_text("# done\n")
+        return completed(cmd, 0, result_json("Verdict: MERGE"))
+
+    monkeypatch.setattr(curia, "invoke_claude", fake)
+    rc, out, err = cli(*E(estate), "run", "muse", "--prompt", str(brief), "--repo", "alpha", "--bead", "ab-1,ab-2")
+    assert rc == 0, err
+    log = (estate.seat_dir("muse") / "assignments.log").read_text().splitlines()
+    assert len(log) == 2
+    assert log[0].startswith("run ") and " bead=ab-1,ab-2 prompt=brief.md by=" in log[0] and " repo=alpha" in log[0]
+    assert log[1].startswith("done ") and " bead=ab-1,ab-2 prompt=brief.md rc=0 session=sess-1 cost=$0.50" in log[1]
+    # --set bead=<id> is the same record; no bead, no record
+    rc, _, err = cli(*E(estate), "run", "muse", "--prompt", str(brief), "--repo", "alpha", "--set", "bead=ab-3")
+    assert rc == 0, err
+    log = (estate.seat_dir("muse") / "assignments.log").read_text().splitlines()
+    assert len(log) == 4 and " bead=ab-3 " in log[2]
+    rc, _, err = cli(*E(estate), "run", "muse", "--prompt", str(brief), "--repo", "alpha")
+    assert rc == 0, err
+    assert len((estate.seat_dir("muse") / "assignments.log").read_text().splitlines()) == 4
+    rc, _, err = cli(*E(estate), "run", "muse", "--prompt", str(brief), "--repo", "alpha", "--bead", "not a bead")
+    assert rc != 0 and "does not look like a bead id" in err
+
+
+def test_usage_hook_keeps_a_time_series_of_headroom(curia, cli, estate, monkeypatch, tmp_path):
+    as_seat(monkeypatch, estate, "muse", tmp_path / "acct-a")
+    monkeypatch.setattr(curia, "memory_headroom", lambda: 61)
+    t0 = dt.datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    monkeypatch.setattr(curia, "now", lambda: t0)
+    assert cli("hook", "usage", stdin=statusline_payload())[0] == 0
+    assert cli("hook", "usage", stdin=statusline_payload())[0] == 0     # same reading, same minute: no new line
+    log = (tmp_path / "acct-a" / "curia-usage.log").read_text().splitlines()
+    assert len(log) == 1
+    assert log[0].startswith("2026-01-01T10:00:00+00:00 account=a seat=muse session=sess-1 five_hour=23 seven_day=41 ")
+    assert log[0].endswith("cost=$1.25 mem=61")
+    assert cli("hook", "usage", stdin=statusline_payload(five=(31.0, 3600)))[0] == 0   # the window moved: a line
+    monkeypatch.setattr(curia, "now", lambda: t0 + dt.timedelta(minutes=6))
+    assert cli("hook", "usage", stdin=statusline_payload(five=(31.0, 3600)))[0] == 0   # five minutes on: a line
+    log = (tmp_path / "acct-a" / "curia-usage.log").read_text().splitlines()
+    assert len(log) == 3 and " five_hour=31 " in log[1] and log[2].startswith("2026-01-01T10:06:00")
+    # another session's lines do not throttle this one
+    assert cli("hook", "usage", stdin=statusline_payload(sid="sess-2", five=(31.0, 3600)))[0] == 0
+    assert len((tmp_path / "acct-a" / "curia-usage.log").read_text().splitlines()) == 4

@@ -1472,7 +1472,22 @@ def cmd_run(a) -> None:
               "".join(" " + x for x in envelope_args(s, headless=True, skip_permissions=a.skip_permissions)) +
               " --settings <" + hooks_summary(est, headless=True) + ">")
         return
+    beads = [b for x in (a.bead or []) for b in x.split(",") if b.strip()]
+    if not beads and subs.get("bead"):
+        beads = [b for b in str(subs["bead"]).split(",") if b.strip()]
+    for b in beads:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", b):
+            die(f"'{b}' does not look like a bead id")
+    sd = est.seat_dir(name)
+    if beads:
+        # The crew's cost attaches to beads the way the fleet's does: a run that names its
+        # bead(s) is recorded in the seat's assignments.log, and the factory reads it.
+        assignments_log(sd, "run", f"bead={','.join(beads)} prompt={prompt_path.name} by={mail_sender(est)[1]}"
+                        + (f" repo={subs['repo']}" if subs.get("repo") else ""))
     res = run_headless(est, name, s, prompt, cwd, a.timeout, a.skip_permissions, a.model)
+    if beads:
+        assignments_log(sd, "done", f"bead={','.join(beads)} prompt={prompt_path.name} {res.summary()}"
+                        + (" limited" if res.limited else ""))
     print(res.text)
     if res.failed:
         sys.exit(1)
@@ -2549,7 +2564,61 @@ def hook_usage(est: Estate, seat: str, payload: dict) -> None:
     if isinstance(cost.get("total_duration_ms"), (int, float)):
         m = int(cost["total_duration_ms"] // 60000)
         bits.append(f"{m // 60}h{m % 60:02d}m")
+    usage_series(cfg, at, acct, seat, sid, windows, cost)
     print(" | ".join(str(b) for b in bits))
+
+
+USAGE_SERIES_MINUTES = 5
+
+
+def memory_headroom() -> int | None:
+    """Free memory as macOS reports it (kern.memorystatus_level, percent); None elsewhere."""
+    try:
+        p = subprocess.run(["sysctl", "-n", "kern.memorystatus_level"], capture_output=True, text=True, timeout=2)
+        return int(p.stdout.strip()) if p.returncode == 0 and p.stdout.strip().isdigit() else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
+def usage_series(cfg: Path, at: str, acct: str, seat: str, sid: str, windows: dict, cost: dict) -> None:
+    """The time series behind the reading: one line per session every few minutes, or
+    sooner when a window's percentage moves, to <config dir>/curia-usage.log. The reading
+    in curia-usage.json is overwritten each turn; this is what lets the estate look back
+    at headroom, spend and machine memory over a month (ruling: the factory is measured)."""
+    log = cfg / "curia-usage.log"
+    pcts = {w: round(d["used_percentage"]) for w, d in windows.items()
+            if isinstance(d, dict) and isinstance(d.get("used_percentage"), (int, float))}
+    last = ""
+    try:
+        with open(log, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 4096))
+            tail = f.read().decode(errors="replace").splitlines()
+        last = next((l for l in reversed(tail) if f" session={sid} " in l + " "), "") if sid else ""
+    except OSError:
+        pass
+    if last:
+        try:
+            then = dt.datetime.fromisoformat(last.split(" ", 1)[0])
+        except ValueError:
+            then = None
+        same = all(f" {w}={p} " in last + " " for w, p in pcts.items())
+        if then and same and now() - then < dt.timedelta(minutes=USAGE_SERIES_MINUTES):
+            return
+    bits = [at, f"account={acct}", f"seat={seat}"]
+    if sid:
+        bits.append(f"session={sid}")
+    bits += [f"{w}={p}" for w, p in pcts.items()]
+    if isinstance(cost.get("total_cost_usd"), (int, float)):
+        bits.append(f"cost=${cost['total_cost_usd']:.2f}")
+    mem = memory_headroom()
+    if mem is not None:
+        bits.append(f"mem={mem}")
+    try:
+        with open(log, "a") as f:
+            f.write(" ".join(bits) + "\n")
+    except OSError:
+        pass
 
 
 def hook_limited(est: Estate, seat: str, payload: dict) -> None:
@@ -3372,6 +3441,9 @@ def main() -> None:
     p.add_argument("--prompt", required=True, help="file in the estate's prompts/, or a path")
     p.add_argument("--repo", help="run in this repo (default: the repo you are in, else the estate root); its repos.toml values become {placeholders}")
     p.add_argument("--set", action="append", help="key=value substitution for the prompt (repeatable)")
+    p.add_argument("--bead", action="append",
+                   help="the bead(s) this run is about (repeatable, or comma-separated); recorded with the run's "
+                        "cost in the seat's assignments.log so spend attaches to work. --set bead=<id> does the same")
     p.add_argument("--timeout", type=int, default=3600, help="seconds before the run is cut off (default 3600)")
     p.add_argument("--skip-permissions", action="store_true",
                    help="run with --dangerously-skip-permissions instead of the seat's tool list")
