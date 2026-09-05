@@ -1042,6 +1042,113 @@ def invoke_claude(cmd: list[str], cwd: Path, env: dict, timeout: int | None = No
                 return p.wait()
 
 
+DETACH_RUNS = True   # tests run the body in-process; the binary detaches
+
+
+def run_detached(sd: Path, title: str, label: str, body, wait: bool) -> None:
+    """Run `body` (a callable returning an exit status) in a process of its
+    own, free of the caller: a new session, stdin from /dev/null, stdout and
+    stderr to seats/<seat>/runs/<stamp>-<label>.log, reparented to init. A
+    headless run is an hour or more of a seat's work and its record; the
+    shell that asked for it is often a seat session that will hand off and
+    end before it returns, and a child of that shell died with it (three
+    jobs lost in one handoff). With `wait` the caller stays and prints the
+    log when the job ends, so a foreground call reads as before, and Ctrl-C
+    stops only the waiting; without it the caller prints the pid and the log
+    path and returns at once. The record (sessions.log, assignments.log,
+    brain/) is written by the job itself, so nothing is lost if the caller
+    goes. In tests, or with DETACH_RUNS off, the body runs in-process."""
+    if not DETACH_RUNS:
+        rc = body()
+        if rc:
+            sys.exit(rc)
+        return
+    runs = sd / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    log = runs / f"{stamp()}-{re.sub(r'[^A-Za-z0-9._-]+', '_', label)[:60]}.log"
+    r, w = os.pipe()   # the job reports its pid, then its exit status; EOF means it is gone
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:                      # the middle child: a session of its own, then the job
+        os.close(r)
+        os.setsid()
+        for fd in range(3, 256):      # nothing of the caller's (its shell's pipes) stays open in the job
+            if fd != w:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        gpid = os.fork()
+        if gpid != 0:
+            os._exit(0)               # ...and out, so the job's parent is init, not the caller
+        rc = 1
+        try:
+            fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+            null = os.open(os.devnull, os.O_RDONLY)
+            os.dup2(null, 0)
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)
+            os.close(fd)
+            os.close(null)
+            sys.stdout = os.fdopen(1, "w", buffering=1)
+            sys.stderr = os.fdopen(2, "w", buffering=1)
+            os.write(w, f"pid={os.getpid()}\n".encode())
+            try:
+                rc = int(body() or 0)
+            except SystemExit as e:
+                rc = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+            except BaseException:
+                import traceback
+                traceback.print_exc()
+                rc = 1
+        finally:
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os.write(w, f"rc={rc}\n".encode())
+            except OSError:
+                pass                  # the caller has gone; the record is written all the same
+            os._exit(rc)
+    os.close(w)
+    os.waitpid(pid, 0)                # the middle child exits at once
+    got = b""
+    while b"\n" not in got:
+        chunk = os.read(r, 256)
+        if not chunk:
+            break
+        got += chunk
+    job = detail_field(got.decode(errors="replace").split("\n", 1)[0], "pid")
+    if not wait:
+        os.close(r)
+        print(f"curia: {title} runs detached for {label}: pid {job or '?'}, log {log}; "
+              f"its record is {sd.name}/sessions.log and assignments.log")
+        return
+    print(f"curia: {title} runs detached for {label} (pid {job or '?'}, log {log}); waiting for it. "
+          "Ctrl-C stops only the waiting.", file=sys.stderr)
+    rest = got.split(b"\n", 1)[1] if b"\n" in got else b""
+    try:
+        while True:
+            chunk = os.read(r, 4096)
+            if not chunk:
+                break
+            rest += chunk
+    except KeyboardInterrupt:
+        print(f"\ncuria: {title} keeps running (pid {job or '?'}); read {log} when it ends", file=sys.stderr)
+        sys.exit(130)
+    finally:
+        os.close(r)
+    rc_line = next((l for l in rest.decode(errors="replace").splitlines() if l.startswith("rc=")), "")
+    sys.stdout.write(read(log))
+    sys.stdout.flush()
+    if not rc_line:
+        print(f"curia: {title}'s job (pid {job or '?'}) ended without reporting; see {log}", file=sys.stderr)
+        sys.exit(1)
+    rc = int(rc_line[3:] or 1)
+    if rc:
+        sys.exit(rc)
+
+
 def carry_transcript(est: Estate, cut: dict, cfg: Path) -> bool:
     """Experimental: copy a cut session's transcript from the limited
     account's config dir into the next account's, at the same relative path,
@@ -1061,17 +1168,40 @@ def carry_transcript(est: Estate, cut: dict, cfg: Path) -> bool:
     return True
 
 
+def board_export(est: Estate, repo: str) -> tuple[str, str]:
+    """The export a board is read from, and where it came from. When the repo
+    has an origin and an integration branch: origin's copy of the export on
+    that branch, after a fetch. The board is what is pushed; the checkout the
+    estate names may be one nobody pulls (a launcher read a stale one on two
+    wakings running while the office merged, exported and pushed from a
+    worktree of its own, saw the same board twice, and stopped for the
+    night). With no origin, or no export on that branch, the file on disk."""
+    src = est.repo_path(repo)
+    r = est.repos.get(repo, {})
+    b = r.get("integration_branch")
+    if b and git(["remote", "get-url", "origin"], src, check=False).returncode == 0:
+        ref = integration_ref(src, r)
+        if ref.startswith("origin/"):
+            p = git(["show", f"{ref}:.beads/issues.jsonl"], src, check=False)
+            if p.returncode == 0:
+                sha = git(["rev-parse", "--short", ref], src, check=False).stdout.strip()
+                return p.stdout, f"{ref} at {sha}, as pushed"
+    local = src / ".beads" / "issues.jsonl"
+    if not local.exists():
+        die(f"{repo} has no .beads/issues.jsonl export; there is no board to work")
+    return local.read_text(), "the export on disk"
+
+
 def board(est: Estate, repo: str) -> dict:
     """The repo's beads export sorted for a night's work. ready: open and
     nothing open blocks it. working: in progress. blocked: by open beads on
     the board, which will come through. human: waiting on a person - a label
     from `human_labels`, a blocked bead with nothing open on the board
     blocking it, or a bead blocked only by such beads or by ids not on the
-    board. closed: how many are. Only as fresh as the last export."""
-    p = est.repo_path(repo) / ".beads" / "issues.jsonl"
-    if not p.exists():
-        die(f"{repo} has no .beads/issues.jsonl export; there is no board to work")
-    issues = [json.loads(line) for line in open(p) if line.strip()]
+    board. closed: how many are. source: where the export was read from (see
+    board_export). Only as fresh as the last export."""
+    text, source = board_export(est, repo)
+    issues = [json.loads(line) for line in text.splitlines() if line.strip()]
     status = {i["id"]: i.get("status") for i in issues}
     labels = set(est.meta.get("human_labels") or HUMAN_LABELS)
     recorded = {i["id"]: [d["depends_on_id"] for d in i.get("dependencies", []) if d.get("type") == "blocks"]
@@ -1090,7 +1220,7 @@ def board(est: Estate, repo: str) -> dict:
             if all(b in human or b not in status for b in blockers[i["id"]]):
                 human.add(i["id"])
                 grew = True
-    out: dict = {"ready": [], "working": [], "blocked": [], "human": [],
+    out: dict = {"ready": [], "working": [], "blocked": [], "human": [], "source": source,
                  "closed": sum(1 for i in issues if i.get("status") == "closed")}
     for i in issues:
         st = i.get("status")
@@ -1130,13 +1260,15 @@ def everything_orders(repo: str, b: dict, night: str = "") -> str:
     def ids(xs: list) -> str:
         return (", ".join(i["id"] for i in xs[:12]) + (" ..." if len(xs) > 12 else "")) or "none"
     board_orders = (f"Tonight's orders: work {repo}'s board until nothing remains that is not waiting on a human. "
-            f"As of this waking: {len(b['ready'])} ready ({ids(b['ready'])}), {len(b['working'])} in progress "
+            f"As of this waking (the board read from {b.get('source', 'the export on disk')}): "
+            f"{len(b['ready'])} ready ({ids(b['ready'])}), {len(b['working'])} in progress "
             f"({ids(b['working'])}), {len(b['blocked'])} blocked by other beads on the board, "
             f"{len(b['human'])} waiting on a human ({ids(b['human'])}; leave those alone, and say in your "
             "handoff what would unblock each). Per your charter: claim what is ready, design and dispatch or "
             "implement, get it reviewed and landed, close it, and move to the next. When the shift hook says "
             "so, or when the board is clear, make sure the board on disk is true (`bd export -o .beads/issues.jsonl`, or this "
-            "repo's sync), then /handoff: the launcher wakes you again with the board as it then stands, and "
+            "repo's sync) and pushed, then /handoff: the launcher reads the board as pushed to origin's integration "
+            "branch and wakes you again with it as it then stands, and "
             "stops when nothing remains. Never close a bead that did not land.")
     if night:
         return night + "\n\n" + board_orders
@@ -1324,7 +1456,7 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
             seen_board = key
             if idle_rounds >= 2:
                 msg = (f"{title} has woken twice in {repo} without the board moving ({len(remaining)} remaining, "
-                       "the same set, nothing closed); "
+                       f"the same set, nothing closed; the board read from {b.get('source', '?')}); "
                        + ("moving on to the next board rather than spinning." if queue else
                           "stopping so someone can look, rather than spinning."))
                 print("curia: " + msg, file=sys.stderr)
@@ -1354,6 +1486,8 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
         if budget_float is not None:
             env["CURIA_BUDGET"] = str(budget_float)
         env["CURIA_SPENT"] = str(spent)
+        if loop or everything:
+            env["CURIA_LOOP"] = "1"   # the shift hook may promise a relaunch only when there is one
         prime = prime_file(est, name)
         cmd = ["claude", "--name", title, "--append-system-prompt-file", str(prime), "--settings", seat_settings(est)]
         carried = resume is not None and carry_transcript(est, resume, cfg)
@@ -1484,13 +1618,16 @@ def cmd_run(a) -> None:
         # bead(s) is recorded in the seat's assignments.log, and the factory reads it.
         assignments_log(sd, "run", f"bead={','.join(beads)} prompt={prompt_path.name} by={mail_sender(est)[1]}"
                         + (f" repo={subs['repo']}" if subs.get("repo") else ""))
-    res = run_headless(est, name, s, prompt, cwd, a.timeout, a.skip_permissions, a.model)
-    if beads:
-        assignments_log(sd, "done", f"bead={','.join(beads)} prompt={prompt_path.name} {res.summary()}"
-                        + (" limited" if res.limited else ""))
-    print(res.text)
-    if res.failed:
-        sys.exit(1)
+
+    def body() -> int:
+        res = run_headless(est, name, s, prompt, cwd, a.timeout, a.skip_permissions, a.model)
+        if beads:
+            assignments_log(sd, "done", f"bead={','.join(beads)} prompt={prompt_path.name} {res.summary()}"
+                            + (" limited" if res.limited else ""))
+        print(res.text)
+        return 1 if res.failed else 0
+
+    run_detached(sd, s.get("title", name), ",".join(beads) or prompt_path.stem, body, wait=not a.detach)
 
 
 def headless_model(s: dict, override: str | None = None) -> str | None:
@@ -2087,22 +2224,25 @@ def cmd_dispatch(a) -> None:
     prompt = fill_placeholders(template, subs)
     assignments_log(sd, "dispatch", f"bead={a.bead} repo={rk} branch={branch} worktree={path} by={by}")
     print(f"curia: {title} dispatched to {rk} for {a.bead}: {path} on {branch}", file=sys.stderr)
-    res = run_headless(est, name, s, prompt, path, a.timeout, a.skip_permissions, a.model)
-    assignments_log(sd, "returned", f"bead={a.bead} {res.summary()}" + (" limited" if res.limited else ""))
-    print(res.text)
-    failed = res.failed
-    if reviewer and not res.failed:
-        rname, rs = reviewer
-        rtitle = rs.get("title", rname)
-        _, rtemplate = prompt_text(est, a.review_prompt, "review.md")
-        rprompt = fill_placeholders(rtemplate, {**subs, "seat": rtitle, "worker": title})
-        print(f"curia: {rtitle} reviewing {a.bead} in {path}", file=sys.stderr)
-        rres = run_headless(est, rname, rs, rprompt, path, a.timeout, a.skip_permissions, None)
-        assignments_log(sd, "reviewed", f"bead={a.bead} by={rname} {rres.summary()}")
-        print(f"\n--- review by {rtitle} ---\n{rres.text}")
-        failed = failed or rres.failed
-    if failed:
-        sys.exit(1)
+
+    def body() -> int:
+        res = run_headless(est, name, s, prompt, path, a.timeout, a.skip_permissions, a.model)
+        assignments_log(sd, "returned", f"bead={a.bead} {res.summary()}" + (" limited" if res.limited else ""))
+        print(res.text)
+        failed = res.failed
+        if reviewer and not res.failed:
+            rname, rs = reviewer
+            rtitle = rs.get("title", rname)
+            _, rtemplate = prompt_text(est, a.review_prompt, "review.md")
+            rprompt = fill_placeholders(rtemplate, {**subs, "seat": rtitle, "worker": title})
+            print(f"curia: {rtitle} reviewing {a.bead} in {path}", file=sys.stderr)
+            rres = run_headless(est, rname, rs, rprompt, path, a.timeout, a.skip_permissions, None)
+            assignments_log(sd, "reviewed", f"bead={a.bead} by={rname} {rres.summary()}")
+            print(f"\n--- review by {rtitle} ---\n{rres.text}")
+            failed = failed or rres.failed
+        return 1 if failed else 0
+
+    run_detached(sd, title, a.bead, body, wait=not a.detach)
 
 
 def branch_landed(src: Path, r: dict, branch: str) -> bool:
@@ -2712,9 +2852,15 @@ def hook_shift(est: Estate, seat: str, payload: dict) -> None:
     sd.mkdir(parents=True, exist_ok=True)
     marker.write_text(now().isoformat(timespec="seconds") + " " + "; ".join(reasons) + "\n")
     log_session(sd, "shift", "; ".join(reasons))
+    if os.environ.get("CURIA_LOOP"):
+        after = ("The relaunch lands on an account with headroom, and the next session is you, reading "
+                 "your note; nothing is lost by stopping here.")
+    else:
+        after = ("This launch has no --loop, so nobody relaunches you after /handoff: put in your note, and "
+                 "tell the principal, what is in flight and what a relaunch would carry on. Jobs started with "
+                 "`curia dispatch` or `curia run` are their own processes and finish their record without you.")
     print("Shift over: " + "; ".join(reasons) + ". Hand off now: finish or park what is in hand, then run "
-          "/handoff. The relaunch lands on an account with headroom, and the next session is you, reading "
-          "your note; nothing is lost by stopping here.", file=sys.stderr)
+          "/handoff. " + after, file=sys.stderr)
     sys.exit(2)
 
 
@@ -2778,8 +2924,8 @@ Looking around
 Waking seats
   launch <seat>             wake a crew seat or office, primed (--loop, --everything, --say, --repo, --account, --carry, --until, --budget)
   prime <seat>              print the prime a seat would wake with
-  run <seat> --prompt <f>   headless run of a seat with a prompt file; how an office wakes a crew seat (--model, --print-cmd)
-  dispatch <fleet>          a fleet worker gets a worktree of its own and a job there (--bead <id>, --review <seat>, --repo)
+  run <seat> --prompt <f>   headless run of a seat with a prompt file; how an office wakes a crew seat (--model, --detach, --print-cmd)
+  dispatch <fleet>          a fleet worker gets a worktree of its own and a job there (--bead <id>, --review <seat>, --repo, --detach)
   ingest <notes...>         capture beads from meeting notes (--paste, --repo, --account; '-' reads stdin)
 
 Watching (crons watch, models act; gates neither)
@@ -2885,7 +3031,12 @@ live launcher) is not dispatched again. The job is a headless waking there
 {bead}, {branch}, {worktree}, {repo}, {dispatcher}, {land_label} and the
 repo's repos.toml values fill its placeholders. The record is
 seats/<seat>/assignments.log (dispatch, returned, reviewed, reap) plus the
-usual sessions.log and journal.
+usual sessions.log and journal. The waking is a process of its own, free of
+the shell that dispatched it (see `curia help run`): by default the caller
+waits and prints the worker's answer, and the reviewer's, when they are
+done; --detach returns at once with the pid and the log path, and
+assignments.log says `returned` and `reviewed` when they are. The worktree
+is prepared, and a refusal given, before anything is forked.
 
 --review <seat> then wakes that seat headless in the same worktree with
 prompts/review.md (or --review-prompt): the third step of design,
@@ -2982,8 +3133,10 @@ the board, and waiting on a human - a label from estate.toml
 `human_labels`, a blocked bead with nothing open on the board blocking
 it, or a bead blocked only by such beads or by ids not on the board; those
 are left alone. --loop is implied. After each handoff the board is read
-again from the repo's beads export (so the orders tell the seat to export
-before handing off), and the loop ends when nothing remains that is not
+again from the repo's beads export as pushed to origin's integration
+branch - the checkout the estate names may be one nobody pulls - or from
+the file on disk where the repo has no origin (so the orders tell the seat
+to export and push before handing off), and the loop ends when nothing remains that is not
 waiting on a human, or when two wakings in a row leave the board exactly
 as it was, so a stuck seat does not spin all night; the principal is told
 either way. A session that ends without a handoff is woken again while
@@ -3059,6 +3212,17 @@ headless on a cheaper one. --model overrides both for this run only; the
 roster is the record, so a standing change goes there, not in a flag.
 --print-cmd shows the resolved account, model, cwd and prompt size and
 runs nothing.
+
+The run is a process of its own. The mechanism forks it free of the shell
+that asked for it - a new session, reparented to init, stdout and stderr to
+seats/<seat>/runs/<stamp>-<label>.log - because that shell is often a seat
+session that hands off and ends before an hour-long run returns, and a
+plain child of it died with it. By default the caller waits and prints the
+log when the run ends, so a foreground call reads as before, and Ctrl-C
+stops only the waiting; --detach prints the pid and the log path and
+returns at once. Either way the record (sessions.log, brain/<seat>/, and
+assignments.log when a bead is named) is the run's own and is complete
+whether or not the caller is still there.
 
 Memory: there is no /handoff in a headless run, so the prompt ends with
 orders to write a short journal entry to seats/<seat>/journal/<stamp>-<repo>.md
@@ -3307,7 +3471,8 @@ examples:
   curia run <seat> --prompt /tmp/oneoff.md --set date=2026-01-01
   curia run <crew> --prompt /abs/brief.md --repo <repo>   an office waking a crew seat on the crew seat's account
   curia run <seat> --prompt <name>.md --print-cmd   show account, model and cwd; run nothing
-  curia run <crew> --prompt /abs/brief.md --model <model>   this run on another model (say why in the handoff)""",
+  curia run <crew> --prompt /abs/brief.md --model <model>   this run on another model (say why in the handoff)
+  curia run <crew> --prompt /abs/brief.md --repo <repo> --detach   back at once; read brain/<crew>/ when sessions.log ends""",
     "limit": """\
 examples:
   curia limit current --hours 5        after claude reports a usage limit
@@ -3330,6 +3495,7 @@ examples:
 examples:
   curia dispatch <fleet> --bead <id> --repo <repo>            a worktree and a job
   curia dispatch <fleet> --bead <id> --repo <repo> --review <seat>   ...then a review
+  curia dispatch <fleet> --bead <id> --repo <repo> --detach   back at once; assignments.log says when it returned
   curia dispatch <fleet> --bead <id> --print-cmd              where it would go; run nothing""",
     "portcullis": """\
 examples:
@@ -3448,6 +3614,9 @@ def main() -> None:
     p.add_argument("--skip-permissions", action="store_true",
                    help="run with --dangerously-skip-permissions instead of the seat's tool list")
     p.add_argument("--model", help="model for this run only; default: the seat's run_model from the roster, else its model")
+    p.add_argument("--detach", action="store_true",
+                   help="return at once with the pid and the log path; the run (its own process either way) "
+                        "finishes its record without you. Default: wait and print the answer when it ends")
     p.add_argument("--print-cmd", dest="print_cmd", action="store_true", help="show account, model, cwd and prompt size without running")
     p.set_defaults(fn=cmd_run)
 
@@ -3462,6 +3631,9 @@ def main() -> None:
     p.add_argument("--skip-permissions", action="store_true",
                    help="run with --dangerously-skip-permissions instead of the seat's tool list")
     p.add_argument("--model", help="the worker's model for this job only (default: its run_model, else model)")
+    p.add_argument("--detach", action="store_true",
+                   help="return at once with the pid and the log path; the job (its own process either way) "
+                        "finishes its record without you. Default: wait and print the answers when it ends")
     p.add_argument("--print-cmd", dest="print_cmd", action="store_true",
                    help="show the worktree, branch, account and brief without touching git or running")
     p.set_defaults(fn=cmd_dispatch)

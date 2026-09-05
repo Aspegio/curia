@@ -1207,6 +1207,7 @@ def test_everything_works_the_board_until_it_is_clear_or_stuck(curia, cli, estat
 
     def fake(cmd, cwd, env, timeout=None, capture=False, watch=None):
         orders.append(cmd[-1])
+        assert env.get("CURIA_LOOP") == "1"   # the shift hook may promise a relaunch: there is one
         for i in ("al-1", "al-5") if len(orders) == 1 else ("al-2",):
             rows[i]["status"] = "closed"
         write(rows.values())
@@ -1503,3 +1504,112 @@ def test_usage_hook_keeps_a_time_series_of_headroom(curia, cli, estate, monkeypa
     # another session's lines do not throttle this one
     assert cli("hook", "usage", stdin=statusline_payload(sid="sess-2", five=(31.0, 3600)))[0] == 0
     assert len((tmp_path / "acct-a" / "curia-usage.log").read_text().splitlines()) == 4
+
+
+# --------------------------------------------------------------- detached
+
+def _wait_for(pred, seconds=40.0):
+    t0 = time.time()
+    while time.time() - t0 < seconds:
+        if pred():
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def test_headless_runs_are_their_own_processes_and_outlive_the_caller(curia, estate, tmp_path):
+    """The binary, not the in-process runner: a run (and a dispatch, same path)
+    forks free of the shell that asked for it - its own session, reparented to
+    init - so a seat session that hands off and ends mid-job takes nothing with
+    it. Three jobs were lost that way in one handoff before this held."""
+    import signal
+    import sys
+    fake = tmp_path / "fakebin" / "claude"
+    fake.parent.mkdir()
+    fake.write_text("#!/bin/sh\nsleep 2\n"
+                    "printf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"survived\","
+                    "\"session_id\":\"s-detached\",\"total_cost_usd\":0.1,\"num_turns\":1,\"duration_ms\":2000}'\n")
+    fake.chmod(0o755)
+    env = dict(os.environ, PATH=f"{fake.parent}:{os.environ['PATH']}")
+    env.pop("CURIA_SEAT", None)
+    brief = tmp_path / "brief.md"
+    brief.write_text("Do it.\n")
+    mech = Path(__file__).resolve().parent.parent / "bin" / "curia"
+    cmd = [sys.executable, str(mech), *E(estate), "run", "muse", "--prompt", str(brief), "--repo", "alpha"]
+    sd = estate.seat_dir("muse")
+
+    def ends():
+        return [e for e in curia.session_events(sd) if e[0] == "end"]
+
+    def starts():
+        return [e for e in curia.session_events(sd) if e[0] == "start"]
+
+    # --detach: back at once with the pid and the log; the job writes its own record
+    p = subprocess.run([*cmd, "--detach"], capture_output=True, text=True, env=env, timeout=30)
+    assert p.returncode == 0, p.stderr
+    m = re.search(r"Muse runs detached for brief: pid (\d+), log ([^;]+);", p.stdout)
+    assert m, p.stdout
+    pid, log = int(m.group(1)), Path(m.group(2))
+    assert not ends(), "the fake claude sleeps two seconds; the caller was back before it answered"
+    assert _wait_for(lambda: len(ends()) == 1), curia.session_events(sd)
+    assert f"pid={pid}" in starts()[0][2] and "session=s-detached" in ends()[0][2] and "rc=0" in ends()[0][2]
+    assert log.parent == sd / "runs" and "survived" in log.read_text()
+    # the waiting form reads as before: the answer on stdout, the exit status the job's
+    p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=30)
+    assert p.returncode == 0, p.stderr
+    assert "survived" in p.stdout and "waiting for it" in p.stderr and len(ends()) == 2
+    # ...and the caller dying, whole process group, does not take the job with it
+    caller = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+                              start_new_session=True)
+    assert _wait_for(lambda: len(starts()) == 3), curia.session_events(sd)
+    os.killpg(caller.pid, signal.SIGKILL)
+    caller.wait(timeout=10)
+    assert _wait_for(lambda: len(ends()) == 3), curia.session_events(sd)
+    assert "rc=0" in ends()[2][2] and "session=s-detached" in ends()[2][2]
+    assert len(list((estate.dir / "brain" / "muse").iterdir())) == 3
+
+
+def test_board_reads_the_export_as_pushed_when_the_repo_has_an_origin(curia, estate, tmp_path):
+    """The launcher reads the board from origin's integration branch: the
+    checkout the estate names may be one nobody pulls, and a stale export read
+    twice looks like a board that does not move."""
+    def bead(i, status="open"):
+        return {"id": i, "status": status, "title": i, "labels": [], "dependencies": []}
+
+    src = estate.root / "alpha"
+    git_repo(src)
+    export = src / ".beads" / "issues.jsonl"
+    export.write_text(json.dumps(bead("al-1")) + "\n")
+    git_commit(src, "export")
+    b = curia.board(estate, "alpha")
+    assert [i["id"] for i in b["ready"]] == ["al-1"] and b["source"] == "the export on disk"   # no origin yet
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    subprocess.run(["git", "-C", str(src), "remote", "add", "origin", str(origin)], check=True)
+    subprocess.run(["git", "-C", str(src), "push", "-q", "origin", "main"], check=True)
+    # the checkout moves on without pushing: the board is still what origin has
+    export.write_text(json.dumps(bead("al-1", "closed")) + "\n" + json.dumps(bead("al-2")) + "\n")
+    b = curia.board(estate, "alpha")
+    assert [i["id"] for i in b["ready"]] == ["al-1"] and b["closed"] == 0
+    assert b["source"].startswith("origin/main at ") and b["source"].endswith(", as pushed")
+    git_commit(src, "al-1 closed, al-2 filed")
+    subprocess.run(["git", "-C", str(src), "push", "-q", "origin", "main"], check=True)
+    b = curia.board(estate, "alpha")
+    assert [i["id"] for i in b["ready"]] == ["al-2"] and b["closed"] == 1
+    # the orders say where the board came from
+    assert "the board read from origin/main at" in curia.everything_orders("alpha", b)
+
+
+def test_shift_hook_promises_a_relaunch_only_under_a_loop(curia, cli, estate, monkeypatch, tmp_path):
+    sd = estate.seat_dir("muse")
+    as_seat(monkeypatch, estate, "muse", tmp_path / "acct-a")
+    monkeypatch.delenv("CURIA_LOOP", raising=False)
+    curia.log_session(sd, "start", f"account=a cwd=/x session=s1 pid={os.getpid()}")
+    cli("hook", "usage", stdin=statusline_payload("s1", five=(86, 900)))
+    rc, _, err = cli("hook", "shift", stdin="{}")
+    assert rc == 2 and "Shift over" in err and "no --loop" in err and "relaunch lands" not in err
+    assert "own processes" in err   # dispatched jobs are safe to leave
+    (sd / "SHIFT-OVER").unlink()
+    monkeypatch.setenv("CURIA_LOOP", "1")
+    rc, _, err = cli("hook", "shift", stdin="{}")
+    assert rc == 2 and "relaunch lands on an account with headroom" in err and "no --loop" not in err

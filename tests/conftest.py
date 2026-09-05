@@ -101,6 +101,7 @@ def estate(curia, cli, tmp_path, monkeypatch):
     tmp, one github repo with a nested second, and a seat of each kind."""
     monkeypatch.setattr(curia, "CONFIG_DIR", tmp_path / "config")
     monkeypatch.setattr(curia, "ESTATES_FILE", tmp_path / "config" / "estates.toml")
+    monkeypatch.setattr(curia, "DETACH_RUNS", False)   # fakes record in-process; the fork has its own test
     ws = tmp_path / "ws"
     rc, out, err = cli("init", str(ws), "--name", "Scratch", "--principal", "Nobody Inparticular")
     assert rc == 0, err

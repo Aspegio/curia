@@ -64,6 +64,7 @@ curia censor                     # check integration branches; wake the Censor w
 curia laurel <seat> "a user said the new page finally makes sense"
 curia mail <seat> "the brief is in the bead; start there"   # read at the seat's next waking; --all broadcasts
 curia dispatch <fleet> --bead <id> --repo <repo> --review <seat>   # a worker gets a worktree and a job; a reviewer judges it
+curia dispatch <fleet> --bead <id> --repo <repo> --detach   # ...back at once; the job is its own process either way and outlives your shell
 curia portcullis                 # land the seats' reviewed, green PRs and close their beads (a cron runs this)
 curia reap                       # close the record of dead sessions; remove worktrees whose branch landed
 curia rulings                    # the brain's rulings, with status and what enforces each
