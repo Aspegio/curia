@@ -66,7 +66,7 @@ curia mail <seat> "the brief is in the bead; start there"   # read at the seat's
 curia dispatch <fleet> --bead <id> --repo <repo> --review <seat>   # a worker gets a worktree and a job; a reviewer judges it
 curia dispatch <fleet> --bead <id> --repo <repo> --detach   # ...back at once; the job is its own process either way and outlives your shell
 curia portcullis                 # land the seats' reviewed, green PRs and close their beads (a cron runs this)
-curia reap                       # close the record of dead sessions; remove worktrees whose branch landed
+curia reap                       # close the record of dead sessions; remove worktrees that landed (or, --stale, went stale)
 curia rulings                    # the brain's rulings, with status and what enforces each
 curia limit <account> --hours 5  # an account hit its limit; launches fall back down the chain
 curia launch <seat> --account <acct>   # start on a named account, e.g. one with headroom
@@ -100,7 +100,7 @@ pool, which such estates share. Seats never roam between estates.
 - Crons watch, models act: `lictor` gathers facts deterministically; `censor` wakes a model only when something is red.
 - Read-only offices stay read-only: the Lictor never writes beads.
 - Design out the drudgery: no seat idle-waits on a PR. The Portcullis, a gate with no model behind it, lands what is reviewed and green and closes the bead.
-- A home of one's own: `dispatch` gives a fleet worker its own worktree and a job; `reap` takes the worktree back only once the branch has landed and nothing is uncommitted.
+- A home of one's own: `dispatch` gives a fleet worker its own worktree and a job; `reap` takes the worktree back only once the branch has landed and nothing is uncommitted. It clears each repo's scratch worktrees (`.claude/worktrees/`) the same way, never one on a standing branch, never one just touched, and runs by itself after every session of a seat whose roster entry says `reap_after`.
 - Seats talk to each other: `mail` is read at waking and archived by the reader, so the principal is not the relay.
 - Law grows teeth: a ruling carries a status (proposed, advisory, enacted, enforced, retired) and names what enforces it; `hooks.json` turns a rule into a refusal in every seat session; `check` faults a ruling with no status and `lictor` nudges when an enacted ruling has nothing enforcing it, or a postmortem has no ruling.
 - The envelope is the roster's: `disallowed_tools` are refused in every session, `tools` are allowed without asking.

@@ -70,9 +70,12 @@ WATCH_SECONDS = 5
 # account as limited past this, marker or none. shift_hours: the Stop hook
 # tells a seat to hand off after this long awake (0: never). wrap_minutes: how
 # long before --until to start wrapping up. budget_wrap_at: percent of --budget
-# at which to start wrapping up.
+# at which to start wrapping up. reap_quiet_hours: `reap` leaves a scratch
+# worktree alone until it has been quiet this long, in case someone is in it.
 THRESHOLDS = {"rotate_at": 70.0, "rotate_week_at": 90.0, "handoff_at": 85.0, "limited_at": 95.0,
-              "shift_hours": 6.0, "wrap_minutes": 45.0, "budget_wrap_at": 90.0}
+              "shift_hours": 6.0, "wrap_minutes": 45.0, "budget_wrap_at": 90.0, "reap_quiet_hours": 1.0}
+# Where Claude Code, and seats by hand, put a repo's scratch worktrees; `reap` clears the finished ones.
+SCRATCH_WORKTREES = ".claude/worktrees"
 # How many times the Censor asks gh for a branch's runs before saying gh is unavailable, and the wait between.
 CENSOR_GH_TRIES = 3
 CENSOR_GH_WAIT = 60.0
@@ -1565,6 +1568,8 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
             os.replace(limited_marker, sd / "LAST-LIMITED")   # the next prime says what happened
             tail += " limited"
         log_session(sd, "end", f"rc={rc} session={sid}{tail}")
+        if s.get("reap_after"):
+            reap_after_session(est, sd, title)
         if cut is not None:
             on = cut.get("account") or acct
             nxt, _ = walk_chain(est, want, own)
@@ -2280,10 +2285,11 @@ def cmd_dispatch(a) -> None:
     run_detached(sd, title, a.bead, body, wait=not a.detach)
 
 
-def branch_landed(src: Path, r: dict, branch: str) -> bool:
+def branch_landed(src: Path, r: dict, branch: str, ref: str | None = None) -> bool:
     """Has the branch landed on the integration branch: an ancestor of it, or,
-    since a squash merge loses ancestry, a merged PR with that head per gh."""
-    if git(["merge-base", "--is-ancestor", branch, integration_ref(src, r)], src, check=False).returncode == 0:
+    since a squash merge loses ancestry, a merged PR with that head per gh.
+    `ref` is the integration ref when the caller has already fetched it."""
+    if git(["merge-base", "--is-ancestor", branch, ref or integration_ref(src, r)], src, check=False).returncode == 0:
         return True
     if r.get("forge") == "github" and r.get("remote"):
         prs = gh_json(["pr", "list", "--repo", repo_slug(r["remote"]), "--head", branch, "--state", "merged",
@@ -2292,58 +2298,229 @@ def branch_landed(src: Path, r: dict, branch: str) -> bool:
     return False
 
 
-def cmd_reap(a) -> None:
-    """Clear away what is finished or dead, and only that: close the record of
-    a session whose launcher is gone; remove a worktree whose branch has
-    landed and which holds no uncommitted work. Nothing running and nothing
-    unfinished is touched."""
-    est = find_estate(a.estate)
-    dry = a.dry_run
+def seat_at_work(est: Estate, seat_key: str) -> bool:
+    """A session of the seat with no end whose launcher is still alive."""
+    return any(o["pid"] and pid_alive(o["pid"]) for o in open_sessions(est.seat_dir(seat_key)))
+
+
+def worktree_touched(wt: Path) -> float | None:
+    """Hours since the worktree was last touched: the newest of its HEAD
+    commit, its index and its admin HEAD file (checkout and commit move them).
+    Read it before running `git status` there, which can refresh the index."""
+    times: list[float] = []
+    p = git(["log", "-1", "--format=%ct"], wt, check=False)
+    if p.returncode == 0 and p.stdout.strip().isdigit():
+        times.append(float(p.stdout.strip()))
+    gd = git(["rev-parse", "--git-dir"], wt, check=False).stdout.strip()
+    if gd:
+        admin = Path(gd) if Path(gd).is_absolute() else wt / gd
+        times += [(admin / name).stat().st_mtime for name in ("HEAD", "index") if (admin / name).exists()]
+    return (time.time() - max(times)) / 3600 if times else None
+
+
+def linked_worktrees(src: Path) -> list[tuple[Path, str | None]]:
+    """(path, branch; None when detached) for every linked worktree of the
+    repo, deepest path first so a worktree nested in another goes first."""
+    out = git(["worktree", "list", "--porcelain"], src, check=False).stdout
+    items: list[tuple[Path, str | None]] = []
+    path: Path | None = None
+    branch: str | None = None
+    for line in out.splitlines() + [""]:
+        if line.startswith("worktree "):
+            path, branch = Path(line[len("worktree "):]), None
+        elif line.startswith("branch refs/heads/"):
+            branch = line[len("branch refs/heads/"):]
+        elif not line and path is not None:
+            items.append((path, branch))
+            path = None
+    return sorted(items[1:], key=lambda x: -len(x[0].parts))   # the first entry is the main worktree
+
+
+def open_pr_heads(r: dict) -> set[str] | None:
+    """The head branches of the repo's open PRs; None when gh cannot say. A
+    repo on no forge has no PRs to ask about."""
+    if r.get("forge") != "github" or not r.get("remote"):
+        return set()
+    prs = gh_json(["pr", "list", "--repo", repo_slug(r["remote"]), "--state", "open", "--limit", "200",
+                   "--json", "headRefName"])
+    return None if prs is None else {pr.get("headRefName", "") for pr in prs}
+
+
+def remove_worktree(src: Path, wt: Path, say) -> bool:
+    p = git(["worktree", "remove", str(wt)], src, check=False)
+    if p.returncode != 0:
+        say(f"  git would not remove {wt}: {(p.stderr or p.stdout).strip()}")
+        return False
+    return True
+
+
+def reap(est: Estate, *, dry: bool, stale_days: float | None = None, say=print) -> int:
+    """Clear away what is finished or dead, and only that; return how much went.
+    Sessions: close the record of one whose launcher is gone. Fleet homes
+    (<worktrees>/<seat>/<repo>): remove one whose branch has landed and which
+    is clean, unless its seat is at work; an office's standing home is never
+    touched. Scratch worktrees (<repo>/.claude/worktrees/): prune the entries
+    whose directory is gone; remove one whose branch (or detached commit) has
+    landed, is clean and has been quiet for reap_quiet_hours; with
+    stale_days, also remove one that is clean, unlanded, without an open PR
+    and untouched that long, keeping its branch. A worktree on the integration
+    or release branch is a standing one and stays. Nothing running, unfinished
+    or dirty is touched, and every such thing gets a line saying why."""
     did = 0
     for k in est.roster:
         sd = est.seat_dir(k)
         for o in open_sessions(sd):
             if not o["pid"]:
-                print(f"  {k}: a session from {age(o['at'])} ago has no end and no pid on record "
-                      "(before reap existed); close it by hand if it is dead")
+                say(f"  {k}: a session from {age(o['at'])} ago has no end and no pid on record "
+                    "(before reap existed); close it by hand if it is dead")
                 continue
             if pid_alive(o["pid"]):
                 continue
-            print(f"  {k}: session {o['sid'] or '?'} from {age(o['at'])} ago; launcher pid {o['pid']} is gone"
-                  + ("; would close the record" if dry else "; record closed"))
+            say(f"  {k}: session {o['sid'] or '?'} from {age(o['at'])} ago; launcher pid {o['pid']} is gone"
+                + ("; would close the record" if dry else "; record closed"))
             if not dry:
                 log_session(sd, "end", f"rc=- session={o['sid']} reaped: launcher pid {o['pid']} gone")
             did += 1
+    quiet = est.threshold("reap_quiet_hours")
+    refs: dict[str, str] = {}   # the integration ref per repo, fetched once
+
+    def ref_of(rk: str, src: Path, r: dict) -> str:
+        if rk not in refs:
+            refs[rk] = integration_ref(src, r)
+        return refs[rk]
+
+    homes: set[Path] = set()
     wd = est.worktrees_dir
     if wd.is_dir():
         for seat_dir in sorted(p for p in wd.iterdir() if p.is_dir()):
+            seat = next((x for x in est.roster if x.lower() == seat_dir.name.lower()), None)
             for wt in sorted(p for p in seat_dir.iterdir() if p.is_dir()):
                 if not (wt / ".git").exists():
                     continue
+                homes.add(wt.resolve())
                 rk = next((x for x in est.repos if x.lower() == wt.name.lower()), None)
                 if not rk:
-                    print(f"  {seat_dir.name}: {wt} is not a registered repo; leaving it")
+                    say(f"  {seat_dir.name}: {wt} is not a registered repo; leaving it")
+                    continue
+                if seat and est.roster[seat].get("kind") != "fleet":
+                    say(f"  {seat_dir.name}: {wt} is an office's standing home; leaving it")
+                    continue
+                if seat and seat_at_work(est, seat):
+                    say(f"  {seat_dir.name}: {wt} is a seat at work; leaving it")
                     continue
                 src, r = est.repo_path(rk), est.repos[rk]
                 branch = git(["rev-parse", "--abbrev-ref", "HEAD"], wt).stdout.strip()
                 if git(["status", "--porcelain"], wt).stdout.strip():
-                    print(f"  {seat_dir.name}: {wt} has uncommitted work on {branch}; leaving it")
+                    say(f"  {seat_dir.name}: {wt} has uncommitted work on {branch}; leaving it")
                     continue
-                if not branch_landed(src, r, branch):
-                    print(f"  {seat_dir.name}: {wt} on {branch}, not landed; leaving it")
+                if not branch_landed(src, r, branch, ref_of(rk, src, r)):
+                    say(f"  {seat_dir.name}: {wt} on {branch}, not landed; leaving it")
                     continue
-                print(f"  {seat_dir.name}: {wt} on {branch} has landed"
-                      + ("; would remove it" if dry else "; removed"))
+                say(f"  {seat_dir.name}: {wt} on {branch} has landed"
+                    + ("; would remove it" if dry else "; removed"))
                 if not dry:
-                    git(["worktree", "remove", str(wt)], src)
+                    if not remove_worktree(src, wt, say):
+                        continue
                     git(["branch", "-D", branch], src, check=False)
                     assignments_log(est.seat_dir(seat_dir.name), "reap", f"branch={branch} worktree={wt} landed")
                 did += 1
+    for rk, r in est.repos.items():
+        src = est.repo_path(rk)
+        if not (src / ".git").exists() or not r.get("integration_branch"):
+            continue
+        p = git(["worktree", "prune", "-v"] + (["-n"] if dry else []), src, check=False)
+        for line in (p.stdout + p.stderr).splitlines():
+            if line.strip():
+                say(f"  {rk}: {'would prune' if dry else 'pruned'}: {line.strip()}")
+                did += 1
+        standing = {r.get("integration_branch"), r.get("release_branch")} - {None, ""}
+        scratch = (src / SCRATCH_WORKTREES).resolve()
+        heads: set[str] | None | str = "unasked"   # open PR heads, asked once per repo and only when needed
+        elsewhere = 0
+        for wt, branch in linked_worktrees(src):
+            if not wt.exists():
+                continue   # prune's
+            rp = wt.resolve()
+            if rp in homes:
+                continue   # a fleet home, handled above
+            if scratch not in rp.parents:
+                elsewhere += 1
+                continue
+            what = branch or "a detached HEAD"
+            if branch in standing:
+                say(f"  {rk}: {wt} is on {branch}, a standing worktree; leaving it")
+                continue
+            hours = worktree_touched(wt)
+            if git(["status", "--porcelain"], wt, check=False).stdout.strip():
+                say(f"  {rk}: {wt} has uncommitted work on {what}; leaving it")
+                continue
+            if hours is not None and hours < quiet:
+                say(f"  {rk}: {wt} on {what} was touched {hours * 60:.0f} minutes ago; leaving it")
+                continue
+            ref = ref_of(rk, src, r)
+            if branch:
+                landed = branch_landed(src, r, branch, ref)
+            else:
+                sha = git(["rev-parse", "HEAD"], wt, check=False).stdout.strip()
+                landed = bool(sha) and git(["merge-base", "--is-ancestor", sha, ref], src, check=False).returncode == 0
+            if landed:
+                say(f"  {rk}: {wt} on {what} has landed" + ("; would remove it" if dry else "; removed"))
+                if not dry:
+                    if not remove_worktree(src, wt, say):
+                        continue
+                    if branch:
+                        git(["branch", "-D", branch], src, check=False)
+                did += 1
+                continue
+            if stale_days is None or hours is None or hours < stale_days * 24:
+                say(f"  {rk}: {wt} on {what}, not landed; leaving it")
+                continue
+            if heads == "unasked":
+                heads = open_pr_heads(r)
+            if heads is None:
+                say(f"  {rk}: {wt} on {what} is {hours / 24:.0f} days untouched, but gh cannot say whether "
+                    "a PR is open; leaving it")
+                continue
+            if branch in heads:
+                say(f"  {rk}: {wt} on {what} has an open PR; leaving it")
+                continue
+            say(f"  {rk}: {wt} on {what} is {hours / 24:.0f} days untouched, unlanded, with no open PR"
+                + ("; would remove it, keeping the branch" if dry else "; removed, branch kept"))
+            if not dry and not remove_worktree(src, wt, say):
+                continue
+            did += 1
+        if elsewhere:
+            say(f"  {rk}: {elsewhere} worktree(s) outside {SCRATCH_WORKTREES} and the fleet homes; left alone")
     if not did:
-        print("  nothing to reap")
+        say("  nothing to reap")
+    return did
 
 
-# -------------------------------------------------------------- portcullis
+def stale_days_of(est: Estate, given: float | None = None) -> float | None:
+    """The stale rule's threshold: --stale, else estate.toml reap_stale_days;
+    none or zero means the rule is off."""
+    v = given if given is not None else est.meta.get("reap_stale_days")
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+        return None
+    return float(v)
+
+
+def reap_after_session(est: Estate, sd: Path, title: str) -> None:
+    """After a session of a seat whose roster entry says reap_after (the seat
+    that merges, typically): reap, print what went, record the count."""
+    lines: list[str] = []
+    n = reap(est, dry=False, stale_days=stale_days_of(est), say=lines.append)
+    for line in lines:
+        if "leaving it" not in line and "left alone" not in line and "close it by hand" not in line:
+            print(f"curia: reap after {title}:{line}")
+    print(f"curia: reaped {n} thing(s) after {title}'s session")
+    log_session(sd, "reap", f"did={n}")
+
+
+def cmd_reap(a) -> None:
+    est = find_estate(a.estate)
+    reap(est, dry=a.dry_run, stale_days=stale_days_of(est, a.stale))
+
 
 def gh_run(args: list[str]) -> subprocess.CompletedProcess | None:
     """Run gh for its side effect; None when gh is missing or hangs."""
@@ -2967,7 +3144,7 @@ Watching (crons watch, models act; gates neither)
   lictor                    read-only nudge report across every repo
   censor                    check integration branches; wake the Censor where red
   portcullis                land the seats' PRs that are reviewed and green; close their beads (--dry-run)
-  reap                      close the record of dead sessions; remove worktrees whose branch landed (--dry-run)
+  reap                      close the record of dead sessions; remove worktrees that landed or went stale (--dry-run)
 
 The record
   handoff <seat>            show a seat's handoff (--begin/--done belong to the skill)
@@ -3109,12 +3286,27 @@ Clear away what is finished or dead, and only that. Sessions: a start in
 sessions.log with no end whose launcher pid is gone gets its end line
 (rc=-, reaped), so `status` stops calling the seat awake; a live launcher
 is left alone, and a start with no pid on record (before pids were
-recorded) is only mentioned. Worktrees: each <worktrees>/<seat>/<repo>
+recorded) is only mentioned. Fleet homes: each <worktrees>/<seat>/<repo>
 whose branch has landed - an ancestor of the integration branch, or a
 merged PR with that head per gh, since squash merges lose ancestry - and
 which holds no uncommitted work is removed with its local branch, and the
-seat's assignments.log says so. Anything unfinished, unlanded or dirty is
-left where it is, with a line saying why. --dry-run says what would go.""",
+seat's assignments.log says so; a seat at work keeps its home, and an
+office's home there (the merge worktree, say) is standing and never
+touched. Scratch worktrees, <repo>/.claude/worktrees/ in every registered
+repo (Claude Code's own, and the ones seats make by hand): an entry whose
+directory is gone is pruned; one whose branch or detached commit has
+landed, that is clean and has been quiet for reap_quiet_hours
+(estate.toml, default 1) is removed with its branch. With --stale DAYS, or
+reap_stale_days in estate.toml, one that is clean, unlanded, has no open
+PR per gh and was not touched that long is removed too, its branch kept so
+nothing is lost. A worktree on the integration or release branch is
+standing and stays. Anything unfinished, unlanded, dirty or in use is left
+where it is, with a line saying why. --dry-run says what would go.
+
+A seat with `reap_after = true` in the roster (the one that merges,
+typically) reaps at the end of every session `launch` gives it, and its
+sessions.log gets a `reap` line with the count; an estate that wants it
+nightly runs `curia reap` from launchd.""",
 
     "prime": """\
 Print the system prompt the seat would wake with: charter, last handoff,
@@ -3540,8 +3732,9 @@ examples:
   curia portcullis                     land it (the launchd unit does this on an interval)""",
     "reap": """\
 examples:
-  curia reap --dry-run                 what is dead or landed
-  curia reap                           close the records, remove the worktrees""",
+  curia reap --dry-run                 what is dead, landed or stale
+  curia reap                           close the records, remove the worktrees
+  curia reap --stale 30                also scratch worktrees untouched a month, unlanded, with no open PR""",
     "rulings": """\
 examples:
   curia rulings                        every ruling, its status, what enforces it
@@ -3723,8 +3916,11 @@ def main() -> None:
     p.add_argument("--label", help="the label that says reviewed (default: estate.toml land_label, else 'reviewed')")
     p.set_defaults(fn=cmd_portcullis)
 
-    p = parser("reap", "close the record of sessions whose launcher is gone; remove worktrees whose branch has landed")
+    p = parser("reap", "close the record of sessions whose launcher is gone; remove worktrees that landed or went stale")
     p.add_argument("--dry-run", action="store_true", help="say what would go; touch nothing")
+    p.add_argument("--stale", type=float, metavar="DAYS",
+                   help="also remove a clean, unlanded scratch worktree with no open PR untouched this long "
+                        "(its branch is kept); default estate.toml reap_stale_days, else off")
     p.set_defaults(fn=cmd_reap)
 
     p = parser("ingest", "capture beads from meeting notes: wake the intake office on the transcript(s)")

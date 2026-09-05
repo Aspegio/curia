@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -851,6 +852,136 @@ def test_dispatch_gives_a_worker_a_home_and_reap_takes_it_back_once_landed(curia
     assert (estate.seat_dir("worker") / "assignments.log").read_text().splitlines()[-1].startswith("reap ")
     branches = subprocess.run(["git", "-C", str(src), "branch"], capture_output=True, text=True).stdout
     assert "worker/al-2" not in branches and "worker/al-1" in branches
+
+
+
+def git_q(path, *args, env=None):
+    return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-C", str(path), *args],
+                          check=True, capture_output=True, text=True, env=env)
+
+
+def worktree_branches(src):
+    return subprocess.run(["git", "-C", str(src), "branch", "--format=%(refname:short)"],
+                          capture_output=True, text=True).stdout.split()
+
+
+def test_reap_clears_scratch_worktrees_and_spares_standing_homes_and_seats_at_work(curia, cli, estate, monkeypatch):
+    src = estate.root / "alpha"
+    git_repo(src)
+    meta = estate.dir / "estate.toml"
+    meta.write_text(meta.read_text() + "reap_quiet_hours = 0\n")   # fresh worktrees would otherwise be spared
+    scratch = src / ".claude" / "worktrees"
+    scratch.mkdir(parents=True)
+    git_q(src, "checkout", "-q", "-b", "elsewhere")          # so main can be checked out as a standing worktree
+    git_q(src, "worktree", "add", "-q", str(scratch / "standing"), "main")
+    git_q(src, "worktree", "add", "-q", "-b", "done", str(scratch / "done"), "main")
+    (scratch / "done" / "d.txt").write_text("d")
+    git_commit(scratch / "done", "done work")
+    git_q(scratch / "standing", "merge", "-q", "done")        # lands `done` on main
+    git_q(src, "worktree", "add", "-q", "-b", "wip", str(scratch / "wip"), "main")
+    (scratch / "wip" / "w.txt").write_text("w")
+    git_commit(scratch / "wip", "wip work")
+    git_q(src, "worktree", "add", "-q", "-b", "dirty", str(scratch / "dirty"), "main")
+    (scratch / "dirty" / "x.txt").write_text("x")
+    git_q(src, "worktree", "add", "-q", "--detach", str(scratch / "loose" / "nested"), "main")
+    git_q(src, "worktree", "add", "-q", "-b", "gone", str(scratch / "gone"), "main")
+    shutil.rmtree(scratch / "gone")
+    wd = estate.root / "worktrees"
+    git_q(src, "worktree", "add", "-q", "-b", "warden-merge", str(wd / "warden" / "alpha"), "main")
+    git_q(src, "worktree", "add", "-q", "-b", "worker/al-9", str(wd / "worker" / "alpha"), "main")
+    git_q(scratch / "standing", "merge", "-q", "warden-merge", "worker/al-9")   # both landed, both spared
+    curia.log_session(estate.seat_dir("worker"), "start",
+                      f"headless account=a model=m cwd=/x session=s9 pid={os.getpid()}")
+    monkeypatch.setattr(curia, "gh_json", lambda args: [])
+    rc, out, err = cli(*E(estate), "reap", "--dry-run")
+    assert rc == 0, err
+    assert f"{scratch / 'standing'} is on main, a standing worktree; leaving it" in out
+    assert f"{scratch / 'done'} on done has landed; would remove it" in out
+    assert f"{scratch / 'loose' / 'nested'} on a detached HEAD has landed; would remove it" in out
+    assert f"{scratch / 'wip'} on wip, not landed; leaving it" in out
+    assert f"{scratch / 'dirty'} has uncommitted work on dirty; leaving it" in out
+    assert "would prune" in out and "gone" in out
+    assert f"{wd / 'warden' / 'alpha'} is an office's standing home; leaving it" in out
+    assert f"{wd / 'worker' / 'alpha'} is a seat at work; leaving it" in out
+    assert (scratch / "done").exists() and "gone" in worktree_branches(src)
+    rc, out, err = cli(*E(estate), "reap")
+    assert rc == 0, err
+    assert "; removed" in out and "pruned" in out
+    assert not (scratch / "done").exists() and not (scratch / "loose" / "nested").exists()
+    assert (scratch / "wip").exists() and (scratch / "dirty").exists() and (scratch / "standing").exists()
+    assert (wd / "warden" / "alpha").exists() and (wd / "worker" / "alpha").exists()
+    branches = worktree_branches(src)
+    assert "done" not in branches and "wip" in branches and "dirty" in branches and "main" in branches
+    assert "gone" in branches   # prune drops the entry, never a branch
+    listed = subprocess.run(["git", "-C", str(src), "worktree", "list"], capture_output=True, text=True).stdout
+    assert "gone" not in listed
+    # the stale rule: untouched a long time, clean, unlanded, no open PR; the branch is kept
+    monkeypatch.setattr(curia, "worktree_touched", lambda wt: 24.0 * 45 if wt.name == "wip" else 0.0)
+    monkeypatch.setattr(curia, "gh_json", lambda args: [{"headRefName": "wip"}] if "--state" in args and "open" in args else [])
+    rc, out, _ = cli(*E(estate), "reap", "--stale", "30")
+    assert f"{scratch / 'wip'} on wip has an open PR; leaving it" in out and (scratch / "wip").exists()
+    monkeypatch.setattr(curia, "gh_json", lambda args: None)
+    rc, out, _ = cli(*E(estate), "reap", "--stale", "30")
+    assert "gh cannot say whether a PR is open; leaving it" in out and (scratch / "wip").exists()
+    monkeypatch.setattr(curia, "gh_json", lambda args: [])
+    rc, out, _ = cli(*E(estate), "reap", "--stale", "30", "--dry-run")
+    assert "45 days untouched, unlanded, with no open PR; would remove it, keeping the branch" in out
+    assert (scratch / "wip").exists()
+    rc, out, _ = cli(*E(estate), "reap", "--stale", "30")
+    assert "removed, branch kept" in out and not (scratch / "wip").exists() and "wip" in worktree_branches(src)
+    # the worker's session over, its landed home goes the old way
+    curia.log_session(estate.seat_dir("worker"), "end", "rc=0 session=s9")
+    rc, out, _ = cli(*E(estate), "reap")
+    assert f"{wd / 'worker' / 'alpha'} on worker/al-9 has landed; removed" in out
+    assert not (wd / "worker" / "alpha").exists() and (wd / "warden" / "alpha").exists()
+    rc, out, _ = cli(*E(estate), "reap")
+    assert "nothing to reap" in out
+
+
+def test_worktree_touched_reads_the_newest_of_commit_index_and_head(curia, tmp_path):
+    src = tmp_path / "repo"
+    git_repo(src)
+    wt = src / ".claude" / "worktrees" / "old"
+    git_q(src, "worktree", "add", "-q", "-b", "old", str(wt), "main")
+    assert 0 <= curia.worktree_touched(wt) < 1
+    long_ago = "2020-01-01T00:00:00"
+    env = dict(os.environ, GIT_AUTHOR_DATE=long_ago, GIT_COMMITTER_DATE=long_ago)
+    (wt / "o.txt").write_text("o")
+    git_q(wt, "add", ".", env=env)
+    git_q(wt, "commit", "-q", "-m", "old work", env=env)
+    assert curia.worktree_touched(wt) < 1   # the admin HEAD and index just moved
+    admin = Path(subprocess.run(["git", "-C", str(wt), "rev-parse", "--git-dir"], capture_output=True,
+                                text=True).stdout.strip())
+    then = time.time() - 10 * 86400
+    for name in ("HEAD", "index"):
+        os.utime(admin / name, (then, then))
+    assert curia.worktree_touched(wt) > 9 * 24
+
+
+def test_launch_reaps_after_a_session_of_a_seat_that_says_so(curia, cli, estate, monkeypatch):
+    src = estate.root / "alpha"
+    git_repo(src)
+    meta = estate.dir / "estate.toml"
+    meta.write_text(meta.read_text() + "reap_quiet_hours = 0\n")
+    roster = estate.dir / "roster.toml"
+    roster.write_text(roster.read_text().replace('[seats.muse]\n', '[seats.muse]\nreap_after = true\n'))
+    scratch = src / ".claude" / "worktrees"
+    git_q(src, "worktree", "add", "-q", "-b", "done", str(scratch / "done"), "main")
+    (scratch / "done" / "d.txt").write_text("d")
+    git_commit(scratch / "done", "done work")
+    git_q(src, "merge", "-q", "done")
+    monkeypatch.setattr(curia, "gh_json", lambda args: [])
+    monkeypatch.setattr(curia, "invoke_claude", lambda cmd, cwd, env, timeout=None, capture=False, watch=None: 0)
+    rc, out, err = cli(*E(estate), "launch", "muse")
+    assert rc == 0, err
+    assert f"reap after Muse:  alpha: {scratch / 'done'} on done has landed; removed" in out
+    assert "reaped 1 thing(s) after Muse's session" in out and not (scratch / "done").exists()
+    events = curia.session_events(estate.seat_dir("muse"))
+    assert [e[0] for e in events] == ["start", "end", "reap"] and "did=1" in events[-1][2]
+    rc, out, err = cli(*E(estate), "launch", "warden")   # no reap_after: nothing reaped, nothing said
+    assert rc == 0, err
+    assert "reaped" not in out and "reap after" not in out
+    assert [e[0] for e in curia.session_events(estate.seat_dir("warden"))] == ["start", "end"]
 
 
 # -------------------------------------------------------------- portcullis

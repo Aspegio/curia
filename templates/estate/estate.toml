@@ -14,6 +14,12 @@ notify = ""
 # Where fleet workers' homes go (`curia dispatch`): a directory relative to the
 # estate root, one worktree per seat per repo underneath it.
 worktrees = "worktrees"
+# Reaping (`curia reap`, and the end of every launched session of a seat with
+# reap_after = true in the roster): a scratch worktree (<repo>/.claude/worktrees/)
+# touched within reap_quiet_hours is left alone (default 1). With
+# reap_stale_days set, a clean, unlanded scratch worktree with no open PR and
+# untouched that long is removed too, its branch kept. Unset: only landed ones go.
+# reap_stale_days = 30
 # What a reviewer adds to a PR to say "land this" when it cannot approve (same
 # forge identity as the worker); an APPROVED review counts too. The Portcullis
 # lands PRs that carry it and are green.
