@@ -1613,3 +1613,27 @@ def test_shift_hook_promises_a_relaunch_only_under_a_loop(curia, cli, estate, mo
     monkeypatch.setenv("CURIA_LOOP", "1")
     rc, _, err = cli("hook", "shift", stdin="{}")
     assert rc == 2 and "relaunch lands on an account with headroom" in err and "no --loop" not in err
+
+
+def test_a_cut_run_takes_its_children_with_it(curia, estate, tmp_path):
+    """A run that hits --timeout is ended with its whole process group: the
+    seat's dev server started inside it does not go on holding its port."""
+    import sys
+    pidfile = tmp_path / "child.pid"
+    fake = tmp_path / "fakebin" / "claude"
+    fake.parent.mkdir()
+    fake.write_text(f"#!/bin/sh\nsleep 60 &\necho $! > {pidfile}\nsleep 60\n")
+    fake.chmod(0o755)
+    env = dict(os.environ, PATH=f"{fake.parent}:{os.environ['PATH']}")
+    env.pop("CURIA_SEAT", None)
+    brief = tmp_path / "brief.md"
+    brief.write_text("Do it.\n")
+    mech = Path(__file__).resolve().parent.parent / "bin" / "curia"
+    p = subprocess.run([sys.executable, str(mech), *E(estate), "run", "muse", "--prompt", str(brief), "--timeout", "2"],
+                       capture_output=True, text=True, env=env, timeout=60)
+    assert p.returncode == 1 and "[timeout after 2s]" in p.stdout, (p.stdout, p.stderr)
+    assert _wait_for(lambda: pidfile.exists(), 5)
+    child = int(pidfile.read_text().strip())
+    assert _wait_for(lambda: not curia.pid_alive(child), 15), "the run's child outlived the cut run"
+    events = curia.session_events(estate.seat_dir("muse"))
+    assert events[-1][0] == "end" and "rc=124" in events[-1][2]

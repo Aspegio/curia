@@ -25,6 +25,7 @@ import re
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -1023,8 +1024,18 @@ def invoke_claude(cmd: list[str], cwd: Path, env: dict, timeout: int | None = No
     soon as it returns true: the launcher ends a session whose account hit
     its limit, since nothing useful can happen there without tokens."""
     if capture:
-        return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True,
-                              timeout=timeout, stdin=subprocess.DEVNULL)
+        # The run leads a process group of its own, so a cut run takes its children with
+        # it: a seat's dev server and shells sit in that group, and killing claude alone
+        # left two of them holding their ports for two hours (2026-09-05).
+        p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+        try:
+            out, err = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            end_group(p)
+            out, err = p.communicate()
+            raise subprocess.TimeoutExpired(cmd, timeout or 0, output=out, stderr=err)
+        return subprocess.CompletedProcess(cmd, p.returncode, out, err)
     if watch is None:
         return subprocess.call(cmd, cwd=cwd, env=env)
     p = subprocess.Popen(cmd, cwd=cwd, env=env)
@@ -1040,6 +1051,30 @@ def invoke_claude(cmd: list[str], cwd: Path, env: dict, timeout: int | None = No
             except subprocess.TimeoutExpired:
                 p.kill()
                 return p.wait()
+
+
+def end_group(p: subprocess.Popen, wait_seconds: float = 10.0) -> None:
+    """End the process group a headless run leads: TERM, a wait, then KILL,
+    until no member is left. Reaps the run itself as it goes, so a zombie
+    does not count as a survivor; a member that cannot be signalled counts
+    as one until the wait is over."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(p.pid, sig)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            pass
+        t0 = time.time()
+        while time.time() - t0 < wait_seconds:
+            p.poll()
+            try:
+                os.killpg(p.pid, 0)
+            except ProcessLookupError:
+                return
+            except PermissionError:
+                pass
+            time.sleep(0.2)
 
 
 DETACH_RUNS = True   # tests run the body in-process; the binary detaches
@@ -3222,7 +3257,9 @@ log when the run ends, so a foreground call reads as before, and Ctrl-C
 stops only the waiting; --detach prints the pid and the log path and
 returns at once. Either way the record (sessions.log, brain/<seat>/, and
 assignments.log when a bead is named) is the run's own and is complete
-whether or not the caller is still there.
+whether or not the caller is still there. A run cut at --timeout is ended
+with its whole process group, so a server the seat started does not go on
+holding its port after the seat is gone.
 
 Memory: there is no /handoff in a headless run, so the prompt ends with
 orders to write a short journal entry to seats/<seat>/journal/<stamp>-<repo>.md
@@ -3610,7 +3647,8 @@ def main() -> None:
     p.add_argument("--bead", action="append",
                    help="the bead(s) this run is about (repeatable, or comma-separated); recorded with the run's "
                         "cost in the seat's assignments.log so spend attaches to work. --set bead=<id> does the same")
-    p.add_argument("--timeout", type=int, default=3600, help="seconds before the run is cut off (default 3600)")
+    p.add_argument("--timeout", type=int, default=3600,
+                   help="seconds before the run is cut off, with everything it started (default 3600)")
     p.add_argument("--skip-permissions", action="store_true",
                    help="run with --dangerously-skip-permissions instead of the seat's tool list")
     p.add_argument("--model", help="model for this run only; default: the seat's run_model from the roster, else its model")
@@ -3627,7 +3665,8 @@ def main() -> None:
     p.add_argument("--prompt", help="the worker's brief: a file in the estate's prompts/, or a path (default dispatch.md)")
     p.add_argument("--review", help="after the worker returns, wake this seat headless in the worktree to review")
     p.add_argument("--review-prompt", dest="review_prompt", help="the reviewer's brief (default review.md)")
-    p.add_argument("--timeout", type=int, default=3600, help="seconds before a waking is cut off (default 3600)")
+    p.add_argument("--timeout", type=int, default=3600,
+                   help="seconds before a waking is cut off, with everything it started (default 3600)")
     p.add_argument("--skip-permissions", action="store_true",
                    help="run with --dangerously-skip-permissions instead of the seat's tool list")
     p.add_argument("--model", help="the worker's model for this job only (default: its run_model, else model)")
