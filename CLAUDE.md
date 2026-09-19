@@ -27,10 +27,16 @@ weaken it to get green.
 - `bin/curia` - the whole CLI, one stdlib-only Python file (3.11+ for tomllib)
 - `skills/` - skills every seat gets; `launch` links them into the RESOLVED
   account's `$CLAUDE_CONFIG_DIR/skills`, not just `~/.claude/skills`
-- `templates/estate/` - what `curia init` copies for a new client
+- `templates/estate/` - what every estate gets from `curia init`
+- `templates/shapes/<shape>/` - the roster and README of each shape (`seat`,
+  `crew`, `factory`); `init` copies one over the base
+- `templates/charters/` - a charter scaffold per kind (`crew`, `office`,
+  `fleet`) and per office role the mechanism wakes (`censor`, `lictor`,
+  `notarius`); `init` stamps one per rostered seat with the roster's words
 - `templates/handoff.md` - the note shape a seat writes at sleep
 - `templates/ruling.md` - the shape of a ruling: `status:` and `enforced by:` lines the
   mechanism reads, then what, why, what enforces it
+- `tests/test_jev.py` - the judgment seam and everything built on it, all faked
 - `tests/` - the fence, plus `conftest.py`, which builds a scratch estate from
   the template with a fake `claude`, and `test_cli.py` on top of it
 
@@ -51,6 +57,11 @@ weaken it to get green.
 - Anything that runs git or gh does so through `git()`, `gh_json()`, `gh_run()`
   and `bd_close()`, so tests replace those and never reach a forge. A dispatch
   test builds a real git repo in the scratch estate; that is cheap, keep it.
+- Anything that asks the judgment model does so through `jev()`, and
+  `jev_open()` is the one place the network is. Tests replace `jev()` (see
+  `with_jev` in `tests/test_jev.py`); conftest's `no_network` fails any test
+  that reaches `jev_open()`. A new use gets three tests: off is unchanged,
+  on shows the output, no answer degrades to off.
 - **`curia help` is part of the change, not documentation of it.** Any new
   command, new flag, or changed behaviour updates the help in the same commit.
   There are four places and they are easy to half-do:
@@ -83,7 +94,8 @@ weaken it to get green.
   `rotate_at` on its fullest window as the seat's status line last read it.
   A running session cannot change account; that is a fact about the harness,
   not a gap to paper over. So the hooks make the session END well: the Stop
-  hook says "hand off now" past `handoff_at` or `shift_hours`, the StopFailure
+  hook says "hand off now" past `handoff_at`, `shift_hours` or `context_at`
+  (the status line's reading of the session's context window), the StopFailure
   hook marks the account when a turn dies on the limit and leaves LIMITED for
   the launcher, which ends the session and relaunches. A headless run is a
   launch, so it marks its own limit and retries down the chain; a `--loop`
@@ -92,12 +104,40 @@ weaken it to get green.
   no reading on file the walk is markers only. A headless run tries a roster
   `fallback_model` on the same account before it marks the account: a limit
   may be the model's. `shared = false` accounts are
-  nobody's fallback. `--carry` (copy the transcript, `--resume` on the next
-  account) is experimental and opt-in; it leans on Claude Code's transcript
-  layout, which is not ours.
+  nobody's fallback. A cut session is not carried to the next account:
+  `--carry` was tried and removed, because it leaned on Claude Code's
+  transcript layout, which is not ours; the handoff and the transcript path
+  in the prime are what the next session gets. A LIMITED marker names its
+  session, and a headless run's is named for the run, so a seat awake
+  interactively and reviewing headless at once never ends the wrong one.
+  Every account limited, a `--loop` launcher waits in fifteen-minute slices
+  and re-walks the chain after each.
 - How the principal is told is the estate's to say: `notify` in estate.toml is
   a command, and the mechanism only ever calls it with a subject, a body and a
   report path. Nothing here knows a channel.
+- Judgment selects and reports; it never writes, lands or ends anything.
+  `jev()` puts typed questions (noul, choice, score) to a small decision
+  model that generates no text. It is off until estate.toml names `jev_key`
+  (a command that prints the key: the mechanism holds no secret and knows no
+  keychain), and off means every command's output is what it was, byte for
+  byte; on and failing means the same, with the reason said. It chooses what
+  is put in front of a seat (`recall`, ## Recalled), says whose concern a
+  note is (`route`), and reports (`triage`, the ingest screen, a handoff's
+  NEEDS YOU, the Lictor's CUSTOM and its reading of a BUSY fence). It never
+  writes a seat's files or an estate's notes, and it is kept out of the
+  Portcullis, the `--everything` stop conditions, rotation, `reap` and every
+  hook. No network call inside `build_prime` (it is handed a finished
+  recall), `cmd_check`'s loop, or `handoff --done`: the launcher and the
+  offices ask. `handoff --lint` is the one question a session may put, before
+  --done, and it advises and refuses nothing. Dates, counts, ages and the choice of
+  candidates stay in code; each question gets small state, and the text
+  being judged goes in `state`, never in the instructions, so pasted text is
+  data. The one place a judgment has a consequence is where the principal
+  asks for it by flag (`mail --route`, `ingest --screen`), and both do
+  nothing when unsure or unanswered. The model is pinned, not an alias:
+  thresholds (`jev_*_at`, in `THRESHOLDS`) were judged against a version.
+  Every call is a line in `brain/jev/calls.log`; answers are cached a file
+  per request, since jobs overlap and nothing here locks.
 - Read-only offices stay read-only. If a command starts writing to a board,
   that is a new office, not a flag. The Portcullis is the one that writes
   (merges, closes beads), and it is a gate, not an office: its yes or no is
@@ -108,7 +148,14 @@ weaken it to get green.
   and the loop ends on mechanical conditions only - the board clear, the board
   unmoved for two wakings, the deadline reached, the budget reached - and none
   of them needs judgment; do not add one that does. That is the seat's, in its
-  handoff.
+  handoff. Each waking's reading of the board is a `board` line in
+  sessions.log and each handoff goes to the principal through `notify`, with
+  the board's movement and the handoff's own line for them; `progress` is the
+  read-only view over that record and writes nothing but the page `--html`
+  asks for. The default review brief keeps the board convergent for the same
+  reason: a reviewer fixes on the branch or hands the bead back, and never
+  files a new bead. An estate whose reviews file findings will find the loop
+  working its own reviews, not the backlog.
 - Mail is a file the reader archives. `seats/<seat>/mail.md` is read into the
   prime at every waking until the seat runs `curia mail <seat> --archive`;
   nothing archives it silently, and a seat mails a seat, never the outside.
@@ -119,15 +166,38 @@ weaken it to get green.
 - Fences are the estate's law with the mechanism as transport. `hooks.json`
   rides into every seat session through `--settings`; the mechanism ships
   `hook release-guard` as the worked example and nothing in it names a
-  branch. A ruling's `enforced by:` line names its program; `check` and
-  `lictor` say which rulings are still only custom. Do not add a fence that
-  needs an estate's facts to the mechanism; put the facts in repos.toml and
-  read them.
+  branch, and `hook record-guard`, which fences the mechanism's own record
+  (paths in `RECORD_GLOBS`, structural, no estate's facts). A ruling's
+  `enforced by:` line names its program; `check` and `lictor` say which
+  rulings are still only custom. Do not add a fence that needs an estate's
+  facts to the mechanism; put the facts in repos.toml and read them.
+  Fences are counted, never silently accumulated: every refusal by a
+  mechanism fence is a line in `brain/fences.log` (`fence_log`), the
+  Lictor reads it back for idle and busy fences, and `check` notes more
+  than `fences_max`. The mechanism reports the count; it never prunes.
+- Authority is in the prime. `build_prime` ends with what the seat may do
+  without asking, what is refused, the fences by name and the rulings in
+  force, so a seat looks its authority up rather than probes for it. Keep
+  that section factual: names and statuses, not exhortation.
+- A secondment is marked, not barred. A headless waking on a model that is
+  not the roster's for it (fallback or `--model`) is told so in its prime
+  and told to open its journal entry with `seconded: <model>`; the next
+  prime labels that entry. The mechanism never writes the mark into the
+  entry itself: the seat's memory stays the seat's to write.
+- A seat is parked, not deleted. `active = false` refuses launch, run and
+  dispatch and skips a broadcast, and keeps the directory. Nothing reads a
+  parked seat's memory away.
 - Skills are linked per ACCOUNT, at launch. Claude Code reads user skills from
   `$CLAUDE_CONFIG_DIR/skills`, and a seat runs under whichever account it
   resolved to - so linking into one config dir by hand leaves every seat on
   every other account without them (which is how `/handoff` went missing for a
   whole account's seats). Launch is the moment the account is known; link there.
+- A shape is where an estate starts, not what it is. `init --shape` lays
+  down a roster, a charter per seat and the prompts and units that roster
+  needs, and no more; afterwards the roster is the truth, and `check` asks
+  for an office prompt only where a seat needs it (`prompts_needed`). Do not
+  record the shape anywhere the mechanism reads: an estate grows by editing
+  its roster, and a recorded shape would only go stale.
 - The estate is discovered (`--estate`, `CURIA_ESTATE`, a walk up from the
   working directory, then the registry: the estate whose roster has the seat
   named, or the only one registered), so no command needs a particular

@@ -3,7 +3,7 @@
 <!-- Once a day at six. For a standing deploy-red watch, replace
      StartCalendarInterval with <key>StartInterval</key><integer>1800</integer>. -->
 <plist version="1.0"><dict>
-  <key>Label</key><string>curia.{{ESTATE}}.censor</string>
+  <key>Label</key><string>curia.{{ESTATE_KEY}}.censor</string>
   <key>ProgramArguments</key><array>
     <string>{{MECHANISM}}/bin/curia</string><string>--estate</string><string>{{ESTATE_DIR}}</string><string>censor</string>
   </array>

@@ -24,6 +24,17 @@ def curia():
     return mod
 
 
+@pytest.fixture(autouse=True)
+def no_network(curia, monkeypatch):
+    """A judgment a test forgot to fake never reaches the network, and no key
+    rides in from the shell. The module is session-scoped, so its error is reset."""
+    def refuse(req, timeout):
+        raise AssertionError("a test reached jev_open: fake curia.jev or curia.jev_open")
+    monkeypatch.setattr(curia, "jev_open", refuse)
+    monkeypatch.setattr(curia, "JEV_ERROR", "")
+    monkeypatch.delenv("CURIA_JEV_KEY", raising=False)
+
+
 @pytest.fixture
 def cli(curia, monkeypatch):
     """cli("--estate", path, "roster") -> (rc, stdout, stderr), run in-process."""
@@ -103,7 +114,7 @@ def estate(curia, cli, tmp_path, monkeypatch):
     monkeypatch.setattr(curia, "ESTATES_FILE", tmp_path / "config" / "estates.toml")
     monkeypatch.setattr(curia, "DETACH_RUNS", False)   # fakes record in-process; the fork has its own test
     ws = tmp_path / "ws"
-    rc, out, err = cli("init", str(ws), "--name", "Scratch", "--principal", "Nobody Inparticular")
+    rc, out, err = cli("init", str(ws), "--name", "Scratch", "--principal", "Nobody Inparticular", "--shape", "factory")
     assert rc == 0, err
     cd = ws / "curia"
     for acct in ("a", "b"):

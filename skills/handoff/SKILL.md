@@ -23,7 +23,14 @@ is you, reading your diary.
    (`templates/handoff.md` in the mechanism repo): where things stand, beads
    touched, decisions and why, loose ends and what next, for the principal,
    notes to self. Under about 150 lines. No secrets. Never falsify: if
-   something went wrong, that goes in plainly.
+   something went wrong, that goes in plainly. The first line under "For
+   the principal" reaches them on its own (the handoff notice, and `curia
+   progress`): what shipped and what needs them, in one plain line.
+   Optionally run `curia handoff <seat> --lint` now: where the estate has
+   judgment on, it says what the next session would trip on (a first loose
+   end too vague to start on, a decision with no reason). It refuses
+   nothing and answers in seconds or not at all; fix what is fair, then go
+   on. Never after --done.
 5. Run `curia handoff <seat> --done`. It records the session and sets the
    restart marker so a `--loop` launcher wakes you again with the new note.
 6. If this handoff is because the shift hook said so (the account is nearly
@@ -33,6 +40,8 @@ is you, reading your diary.
    `curia limit current --until "<reset time from the error, ISO>"` so the
    relaunch lands on the fallback account instead of the limited one.
 7. Tell the principal in one line that the handoff is written. This turn is
-   the session's last: the launcher ends the session when the turn ends and,
-   with --loop, wakes you again with the note. Do not exit yourself, and do
+   the session's last: the launcher ends the session when the turn ends,
+   prints the note's "For the principal" section and first loose end into
+   the terminal (claude clears the screen on exit; the launcher's print is
+   what they see), and, with --loop, wakes you again with the note. Do not exit yourself, and do
    nothing after --done that the record would need.

@@ -210,17 +210,31 @@ def test_looped_launch_waits_out_a_spent_chain(curia, cli, estate, monkeypatch):
 
     def fake_sleep(secs):
         slept.append(secs)
-        for acct in ("a", "b"):
-            curia.limit_marker(estate, acct).unlink(missing_ok=True)
+        if len(slept) == 2:   # during the second slice a limit lifts early (cleared by hand, say)
+            for acct in ("a", "b"):
+                curia.limit_marker(estate, acct).unlink(missing_ok=True)
 
     monkeypatch.setattr(curia.time, "sleep", fake_sleep)
     monkeypatch.setattr(curia, "invoke_claude", lambda cmd, cwd, env, timeout=None, capture=False, watch=None: 0)
     rc, out, err = cli(*E(estate), "launch", "muse", "--loop")
     assert rc == 0, err
-    assert len(slept) == 1 and 3 * 3600 - 120 < slept[0] < 3 * 3600 + 120
-    assert "waits until" in err
+    # slices, re-walking the chain after each, not one three-hour sleep; and said once, not per slice
+    assert slept == [curia.WAIT_SLICE_SECONDS] * 2
+    assert err.count("waits until") == 1
     assert [e[0] for e in curia.session_events(sd)] == ["wait", "start", "end"]
+    # a limit shorter than a slice is slept out exactly, plus a minute on top
+    for acct in ("a", "b"):
+        curia.mark_limited(estate, acct, curia.now() + dt.timedelta(minutes=5))
+    slept.clear()
 
+    def fake_sleep_short(secs):
+        slept.append(secs)
+        for acct in ("a", "b"):
+            curia.limit_marker(estate, acct).unlink(missing_ok=True)
+
+    monkeypatch.setattr(curia.time, "sleep", fake_sleep_short)
+    rc, out, err = cli(*E(estate), "launch", "muse", "--loop")
+    assert rc == 0 and len(slept) == 1 and 5 * 60 < slept[0] < 6 * 60 + 5
 
 def test_ingest_goes_through_launch(cli, estate):
     rc, out, err = cli(*E(estate), "ingest", "--print-cmd", "--repo", "alpha")
@@ -483,7 +497,7 @@ def test_rename_keeps_the_seat_memory(curia, cli, estate):
 def other_estate(cli, tmp_path, name, roster="", accounts=""):
     """A second registered estate beside the fixture's, with the roster and
     accounts given (else the template's)."""
-    rc, _, err = cli("init", str(tmp_path / name.lower()), "--name", name, "--principal", "X")
+    rc, _, err = cli("init", str(tmp_path / name.lower()), "--name", name, "--principal", "X", "--shape", "seat")
     assert rc == 0, err
     cd = tmp_path / name.lower() / "curia"
     if roster:
@@ -528,10 +542,10 @@ def test_check_notes_an_account_pooled_across_estates(cli, estate, tmp_path):
 # -------------------------------------------------------------------- init
 
 def test_init_refuses_a_registered_name(curia, cli, estate, tmp_path):
-    rc, _, err = cli("init", str(tmp_path / "elsewhere"), "--name", "Scratch", "--principal", "X")
+    rc, _, err = cli("init", str(tmp_path / "elsewhere"), "--name", "Scratch", "--principal", "X", "--shape", "seat")
     assert rc == 2 and "already registered" in err
     assert not (tmp_path / "elsewhere").exists()
-    rc, out, err = cli("init", str(tmp_path / "elsewhere"), "--name", "Second", "--principal", "X")
+    rc, out, err = cli("init", str(tmp_path / "elsewhere"), "--name", "Second", "--principal", "X", "--shape", "seat")
     assert rc == 0, err
     assert (tmp_path / "elsewhere" / "curia" / "estate.toml").exists()
     assert "[estates.second]" in curia.ESTATES_FILE.read_text()
@@ -827,6 +841,7 @@ def test_dispatch_gives_a_worker_a_home_and_reap_takes_it_back_once_landed(curia
     assert rcwd == wt and renv["CURIA_SEAT"] == "muse"
     rprompt = rcmd[rcmd.index("-p") + 1]
     assert "reviewing bead al-1 as implemented by Worker" in rprompt and "--add-label reviewed" in rprompt
+    assert "Never file a new bead" in rprompt   # the default brief keeps a worked board convergent
     assert "--- review by Muse ---" in out and "implemented" in out
     assert branch_of(wt) == "worker/al-1"
     log = (estate.seat_dir("worker") / "assignments.log").read_text()
@@ -1049,7 +1064,7 @@ def test_portcullis_lands_reviewed_green_prs_and_closes_their_beads(curia, cli, 
 
 
 def test_init_stamps_the_mechanism_into_the_estate_fences(curia, cli, estate, tmp_path):
-    rc, _, err = cli("init", str(tmp_path / "third"), "--name", "Third", "--principal", "X")
+    rc, _, err = cli("init", str(tmp_path / "third"), "--name", "Third", "--principal", "X", "--shape", "factory")
     assert rc == 0, err
     cd = tmp_path / "third" / "curia"
     hooks = json.loads((cd / "hooks.json").read_text())
@@ -1057,6 +1072,92 @@ def test_init_stamps_the_mechanism_into_the_estate_fences(curia, cli, estate, tm
     assert (cd / "brain" / "rulings").is_dir()
     assert (cd / "prompts" / "dispatch.md").exists() and (cd / "prompts" / "review.md").exists()
     assert "portcullis" in (cd / "launchd" / "portcullis.plist").read_text()
+    assert "curia.third.lictor" in (cd / "launchd" / "lictor.plist").read_text()
+
+
+def test_init_lays_down_a_shape(curia, cli, estate, tmp_path):
+    """Three shapes: what each lays down, every placeholder stamped, a charter
+    per seat the roster names, stamped with the roster's own words."""
+    made = {}
+    for shape in ("seat", "crew", "factory"):
+        rc, out, err = cli("init", str(tmp_path / shape), "--name", f"Shape {shape}", "--principal", "P",
+                           "--shape", shape)
+        assert rc == 0, err
+        cd = tmp_path / shape / "curia"
+        made[shape] = cd
+        assert f"in the {shape} shape" in out and "`curia rename <seat> <name>` for " in out and "example_crew" in out
+        assert f"[estates.shape_{shape}]" in curia.ESTATES_FILE.read_text()
+        for f in cd.rglob("*"):
+            if f.is_file():
+                assert "{{" not in f.read_text(), f
+        assert not (cd / ".DS_Store").exists()
+        for k in curia.load_toml(cd / "roster.toml")["seats"]:
+            assert (cd / "seats" / k / "charter.md").exists(), k
+        assert f'created = "{curia.today()}"' in (cd / "estate.toml").read_text()
+    seat, crew, factory = made["seat"], made["crew"], made["factory"]
+    # seat: one crew seat, nothing scheduled, the fences and the brain still there
+    assert list(curia.load_toml(seat / "roster.toml")["seats"]) == ["example_crew"]
+    assert not (seat / "prompts").exists() and not (seat / "launchd").exists()
+    assert (seat / "hooks.json").exists() and (seat / "brain" / "rulings").is_dir()
+    assert "in the seat shape" in (seat / "README.md").read_text()
+    # crew: a clerk and a censor office, no fleet; the censor's prompt only; three units
+    r = curia.load_toml(crew / "roster.toml")["seats"]
+    assert r["censor"]["role"] == "censor" and r["example_clerk"]["kind"] == "crew"
+    assert not any(v["kind"] == "fleet" for v in r.values())
+    assert sorted(f.name for f in (crew / "prompts").iterdir()) == ["censor.md"]
+    assert sorted(f.name for f in (crew / "launchd").iterdir()) == ["censor.plist", "lictor.plist", "portcullis.plist"]
+    assert "curia.shape_crew.lictor" in (crew / "launchd" / "lictor.plist").read_text()
+    assert "lictor --write" in (crew / "launchd" / "lictor.plist").read_text().replace("</string><string>", " ")
+    # factory: every office the mechanism wakes, a fleet managed by the office, every prompt
+    r = curia.load_toml(factory / "roster.toml")["seats"]
+    assert {v.get("role") for v in r.values()} >= {"censor", "lictor", "notarius"}
+    workers = [k for k, v in r.items() if v["kind"] == "fleet"]
+    assert workers and all(r[k]["managed_by"] == "example_office" for k in workers)
+    assert sorted(f.name for f in (factory / "prompts").iterdir()) == sorted(curia.OFFICE_PROMPTS)
+    # charters: by role for an office the mechanism wakes, by kind otherwise
+    assert "the Censor of the Shape factory estate" in (factory / "seats" / "censor" / "charter.md").read_text()
+    assert "Example Office" in (factory / "seats" / "example_worker_1" / "charter.md").read_text()
+    office = (factory / "seats" / "example_office" / "charter.md").read_text()
+    assert "curia launch example_office --loop" in office
+    clerk = (factory / "seats" / "example_clerk" / "charter.md").read_text()
+    assert "- documents, decks, correspondence" in clerk and "Fill in for this estate" in clerk
+    assert "You are Example Clerk, a crew seat of the Shape factory estate: The principal's clerk" in clerk
+    # no shape, no estate
+    rc, _, err = cli("init", str(tmp_path / "fourth"), "--name", "Fourth", "--principal", "P")
+    assert rc == 2 and "--shape" in err and not (tmp_path / "fourth").exists()
+
+
+def test_check_asks_for_the_prompts_the_roster_needs(curia, cli, tmp_path, monkeypatch):
+    """A seat-shaped estate needs no office prompt; a scaffolded charter is a
+    fault until written; a fleet seat makes the briefs required."""
+    monkeypatch.setattr(curia, "CONFIG_DIR", tmp_path / "config")
+    monkeypatch.setattr(curia, "ESTATES_FILE", tmp_path / "config" / "estates.toml")
+    rc, _, err = cli("init", str(tmp_path / "ws"), "--name", "Solo", "--principal", "P", "--shape", "seat")
+    assert rc == 0, err
+    cd = tmp_path / "ws" / "curia"
+    rc, out, _ = cli("--estate", str(cd), "check")
+    assert rc == 1
+    assert "prompts/" not in out
+    assert "! seat example_crew: charter.md still carries template text; write it" in out
+    assert "- seat example_crew: a placeholder name from the template; `curia rename example_crew <name>`" in out
+    assert "- roster.toml still carries template text" in out
+    (cd / "seats" / "example_crew" / "charter.md").write_text("Charter.\n")
+    rc, out, _ = cli("--estate", str(cd), "check")
+    assert "charter.md still carries" not in out
+    with open(cd / "roster.toml", "a") as f:
+        f.write('\n[seats.w]\ntitle = "W"\nkind = "fleet"\nmodel = "m"\naccount = "main"\nmanaged_by = "example_crew"\n')
+    (cd / "seats" / "w").mkdir()
+    (cd / "seats" / "w" / "charter.md").write_text("W.\n")
+    rc, out, _ = cli("--estate", str(cd), "check")
+    assert "! prompts/dispatch.md missing: dispatch briefs a fleet worker with it" in out
+    assert "! prompts/review.md missing: dispatch --review briefs the reviewer with it" in out
+    assert "censor.md" not in out and "lictor-cloud.md" not in out
+    with open(cd / "roster.toml", "a") as f:
+        f.write('\n[seats.warden]\ntitle = "Warden"\nrole = "censor"\nkind = "office"\nmodel = "m"\naccount = "main"\n')
+    (cd / "seats" / "warden").mkdir()
+    (cd / "seats" / "warden" / "charter.md").write_text("Warden.\n")
+    rc, out, _ = cli("--estate", str(cd), "check")
+    assert "! prompts/censor.md missing: the censor seat wakes with it" in out
 
 
 # ---------------------------------------------------------------- rotation
@@ -1279,39 +1380,6 @@ def test_status_shows_the_burn_and_the_launcher_records_interactive_cost(curia, 
     assert seen["env"]["CURIA_HEADLESS"] == "1"
 
 
-def test_carry_resumes_the_cut_session_on_the_next_account_or_wakes_fresh(curia, cli, estate, monkeypatch, tmp_path):
-    calls = []
-
-    def fake(cmd, cwd, env, timeout=None, capture=False, watch=None):
-        calls.append(cmd)
-        cfg = Path(env["CLAUDE_CONFIG_DIR"])
-        if len(calls) == 1:
-            sid = cmd[cmd.index("--session-id") + 1]
-            transcript = cfg / "projects" / "-ws" / f"{sid}.jsonl"
-            transcript.parent.mkdir(parents=True)
-            transcript.write_text("{}\n")
-            curia.write_json(estate.seat_dir("muse") / "LIMITED",
-                             {"at": "t", "account": "a", "until": "u", "session_id": sid,
-                              "transcript_path": str(transcript)})
-            curia.mark_limited(estate, "a", curia.now() + dt.timedelta(hours=1))
-            return 143
-        if len(calls) == 2:
-            sid = cmd[cmd.index("--resume") + 1]
-            assert "--session-id" not in cmd and (cfg / "projects" / "-ws" / f"{sid}.jsonl").exists()
-            return 1   # the resume did not take
-        assert "--session-id" in cmd and "--resume" not in cmd
-        return 0
-
-    monkeypatch.setattr(curia, "invoke_claude", fake)
-    rc, out, err = cli(*E(estate), "launch", "muse", "--loop", "--carry")
-    assert rc == 0, err
-    assert len(calls) == 3 and "failed at once" in err and "carrying session" in out
-    starts = [e for e in curia.session_events(estate.seat_dir("muse")) if e[0] == "start"]
-    assert "carried" in starts[1][2] and "acct-b" not in starts[0][2] and "carried" not in starts[2][2]
-
-
-# -------------------------------------------------------------- everything
-
 def test_everything_works_the_board_until_it_is_clear_or_stuck(curia, cli, estate, monkeypatch, tmp_path):
     export = estate.root / "alpha" / ".beads" / "issues.jsonl"
 
@@ -1407,7 +1475,8 @@ def test_everything_works_several_boards_in_the_order_given(curia, cli, estate, 
     assert [w[0] for w in wakings] == ["alpha", "alpha", "sub"]   # alpha stalls after two wakings, then nested
     assert "work alpha's board" in wakings[0][1] and "work nested's board" in wakings[2][1]
     assert "moving on to the next board" in err and "moves on to nested's board (0 more after it)" in out
-    assert told.read_text() == "Warden: no progress in alpha;Warden: board clear in nested;"
+    assert told.read_text() == ("Warden handed off in alpha;Warden handed off in alpha;Warden: no progress in alpha;"
+                                "Warden handed off in nested;Warden: board clear in nested;")
     events = [e for e, _, _ in curia.session_events(estate.seat_dir("warden")) if e in ("clear", "stalled", "next")]
     assert events == ["stalled", "next", "clear"]
     # every name is checked before the first board is worked; a plain launch starts in one repo
@@ -1657,7 +1726,7 @@ def test_headless_runs_are_their_own_processes_and_outlive_the_caller(curia, est
     import sys
     fake = tmp_path / "fakebin" / "claude"
     fake.parent.mkdir()
-    fake.write_text("#!/bin/sh\nsleep 2\n"
+    fake.write_text("#!/bin/sh\nsleep 1\n"
                     "printf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"survived\","
                     "\"session_id\":\"s-detached\",\"total_cost_usd\":0.1,\"num_turns\":1,\"duration_ms\":2000}'\n")
     fake.chmod(0o755)
@@ -1681,7 +1750,7 @@ def test_headless_runs_are_their_own_processes_and_outlive_the_caller(curia, est
     m = re.search(r"Muse runs detached for brief: pid (\d+), log ([^;]+);", p.stdout)
     assert m, p.stdout
     pid, log = int(m.group(1)), Path(m.group(2))
-    assert not ends(), "the fake claude sleeps two seconds; the caller was back before it answered"
+    assert not ends(), "the fake claude sleeps a second; the caller was back before it answered"
     assert _wait_for(lambda: len(ends()) == 1), curia.session_events(sd)
     assert f"pid={pid}" in starts()[0][2] and "session=s-detached" in ends()[0][2] and "rc=0" in ends()[0][2]
     assert log.parent == sd / "runs" and "survived" in log.read_text()
@@ -1760,11 +1829,588 @@ def test_a_cut_run_takes_its_children_with_it(curia, estate, tmp_path):
     brief = tmp_path / "brief.md"
     brief.write_text("Do it.\n")
     mech = Path(__file__).resolve().parent.parent / "bin" / "curia"
-    p = subprocess.run([sys.executable, str(mech), *E(estate), "run", "muse", "--prompt", str(brief), "--timeout", "2"],
+    p = subprocess.run([sys.executable, str(mech), *E(estate), "run", "muse", "--prompt", str(brief), "--timeout", "1"],
                        capture_output=True, text=True, env=env, timeout=60)
-    assert p.returncode == 1 and "[timeout after 2s]" in p.stdout, (p.stdout, p.stderr)
+    assert p.returncode == 1 and "[timeout after 1s]" in p.stdout, (p.stdout, p.stderr)
     assert _wait_for(lambda: pidfile.exists(), 5)
     child = int(pidfile.read_text().strip())
     assert _wait_for(lambda: not curia.pid_alive(child), 15), "the run's child outlived the cut run"
     events = curia.session_events(estate.seat_dir("muse"))
     assert events[-1][0] == "end" and "rc=124" in events[-1][2]
+
+
+def test_everything_counts_a_status_change_as_movement_and_a_failed_fetch_as_nothing(curia, cli, estate, monkeypatch):
+    export = estate.root / "alpha" / ".beads" / "issues.jsonl"
+    rows = {"al-1": {"id": "al-1", "status": "open", "title": "al-1", "labels": [], "dependencies": []}}
+
+    def write():
+        export.write_text("".join(json.dumps(r) + "\n" for r in rows.values()))
+
+    write()
+    orders = []
+    sd = estate.seat_dir("warden")
+
+    def fake(cmd, cwd, env, timeout=None, capture=False, watch=None):
+        orders.append(cmd[-1])
+        if len(orders) == 1:
+            rows["al-1"]["status"] = "in_progress"   # taken up, not closed: the board moved
+            write()
+        (sd / "RESTART").touch()
+        return 0
+
+    monkeypatch.setattr(curia, "invoke_claude", fake)
+    rc, out, err = cli(*E(estate), "launch", "warden", "--repo", "alpha", "--everything")
+    assert rc == 0 and "without the board moving" in err
+    assert len(orders) == 3   # woke and moved it; woke, idle once; woke, idle twice; then stopped
+    # a reading whose fetch failed is the old board again: it does not count as idle, and says so
+    text = export.read_text()
+    monkeypatch.setattr(curia, "board_export",
+                        lambda est, repo: (text, "origin/main at abc1234, as last fetched (this fetch FAILED)", False))
+    orders.clear()
+
+    def fake_cut(cmd, cwd, env, timeout=None, capture=False, watch=None):
+        orders.append(cmd[-1])
+        if len(orders) < 4:
+            (sd / "RESTART").touch()
+            return 0
+        return 1   # ends at once with no handoff: that ends the night, not a stall
+
+    monkeypatch.setattr(curia, "invoke_claude", fake_cut)
+    rc, out, err = cli(*E(estate), "launch", "warden", "--repo", "alpha", "--everything")
+    assert rc == 0 and len(orders) == 4
+    assert err.count("could not be fetched") == 4 and "without the board moving" not in err
+    assert "as last fetched (this fetch FAILED)" in orders[0]
+    assert curia.session_events(sd)[-1][0] == "end"   # the night ended on the cut, not on a stall
+
+
+def test_a_headless_limit_is_the_runs_own_and_an_empty_payload_is_not_a_limit(curia, cli, estate, monkeypatch, tmp_path):
+    sd = estate.seat_dir("muse")
+    as_seat(monkeypatch, estate, "muse", tmp_path / "acct-a")
+    # an empty payload is a hook that could not read its input: nothing is marked
+    rc, _, _ = cli("hook", "limited", stdin="")
+    assert rc == 0 and not (sd / "LIMITED").exists() and curia.account_limited(estate, "a") is None
+    # headless, the marker is named for the run, so a launcher watching LIMITED never takes it
+    monkeypatch.setenv("CURIA_HEADLESS", "1")
+    rc, _, _ = cli("hook", "limited", stdin=json.dumps({"session_id": "s-h", "error_type": "rate_limit",
+                                                         "error": "You've hit your limit"}))
+    assert rc == 0 and (sd / "LIMITED-s-h").exists() and not (sd / "LIMITED").exists()
+    assert curia.account_limited(estate, "a") and not curia.marker_names(sd / "LIMITED", "s-h")
+    # interactively the marker names its session, and only that launcher takes it
+    monkeypatch.delenv("CURIA_HEADLESS")
+    curia.limit_marker(estate, "a").unlink()
+    rc, _, _ = cli("hook", "limited", stdin=json.dumps({"session_id": "s-i", "error_type": "rate_limit",
+                                                         "error": "You've hit your limit"}))
+    assert rc == 0 and curia.marker_names(sd / "LIMITED", "s-i") and not curia.marker_names(sd / "LIMITED", "s-x")
+    curia.write_json(sd / "LIMITED", {"account": "a"})   # a hook that did not know its session
+    assert curia.marker_names(sd / "LIMITED", "anyone")
+
+
+def test_run_takes_the_hooks_limit_marker_before_the_banner(curia, cli, estate, monkeypatch, tmp_path):
+    brief = tmp_path / "brief.md"
+    brief.write_text("Do it.\n")
+    sd = estate.seat_dir("muse")
+    seen = []
+    until = (curia.now() + dt.timedelta(minutes=42)).isoformat(timespec="seconds")
+
+    def fake(cmd, cwd, env, timeout=None, capture=False, watch=None):
+        seen.append(Path(env["CLAUDE_CONFIG_DIR"]).name)
+        sid = cmd[cmd.index("--session-id") + 1]
+        if env["CLAUDE_CONFIG_DIR"].endswith("acct-a"):
+            # what the StopFailure hook leaves a headless run: named for it, with the reset it worked out
+            curia.write_json(sd / f"LIMITED-{sid}", {"account": "a", "until": until, "session_id": sid})
+            return completed(cmd, 1, "", "the turn died; nothing here names a limit")
+        return completed(cmd, 0, result_json("Done on b", session_id="s2"))
+
+    monkeypatch.setattr(curia, "invoke_claude", fake)
+    rc, out, err = cli(*E(estate), "run", "muse", "--prompt", str(brief))
+    assert rc == 0, err
+    assert out.strip() == "Done on b" and seen == ["acct-a", "acct-b"]
+    assert curia.account_limited(estate, "a") == curia.parse_iso(until)
+    assert not list(sd.glob("LIMITED-*"))
+
+
+def test_reap_keeps_a_branch_reused_after_its_pr_landed(curia, tmp_path, monkeypatch):
+    src = tmp_path / "r"
+    git_repo(src)
+    git_q(src, "checkout", "-q", "-b", "w/b1")
+    (src / "one.txt").write_text("1")
+    git_commit(src, "one")
+    c1 = git_q(src, "rev-parse", "HEAD").stdout.strip()
+    r = {"forge": "github", "remote": "git@github.com:o/r.git", "integration_branch": "main"}
+    asked = []
+    monkeypatch.setattr(curia, "gh_json", lambda args: asked.append(args) or [{"headRefName": "w/b1", "headRefOid": c1}])
+    assert curia.branch_landed(src, r, "w/b1", "main", head=c1)   # the PR's head: landed (a squash lost the ancestry)
+    assert asked and "--state" in asked[0] and "merged" in asked[0]
+    (src / "two.txt").write_text("2")
+    git_commit(src, "two")
+    c2 = git_q(src, "rev-parse", "HEAD").stdout.strip()
+    assert not curia.branch_landed(src, r, "w/b1", "main", head=c2)   # new work under the old name: not landed
+    assert curia.branch_landed(src, r, "w/b1", "main", head=c1, merged={"w/b1": c2})   # behind the PR's head: landed
+    assert not curia.branch_landed(src, r, "w/b1", "main", head=c2, merged={})   # no such PR
+    assert curia.merged_heads({"forge": "gitlab"}) == {}
+
+
+def test_a_launcher_is_alive_only_while_it_is_the_recorded_process(curia):
+    me = os.getpid()
+    fresh = {"pid": me, "at": (curia.now() - dt.timedelta(seconds=5)).isoformat(timespec="seconds")}
+    assert curia.launcher_alive(fresh)
+    # a start line hours older than this process: the pid was a launcher's once and is ours now
+    old = {"pid": me, "at": (curia.now() - dt.timedelta(hours=3)).isoformat(timespec="seconds")}
+    assert not curia.launcher_alive(old)
+    assert not curia.launcher_alive({"pid": None, "at": fresh["at"]})
+    assert curia.parse_etime("01-02:03:04") == 93784 and curia.parse_etime("12:34") == 754
+    assert curia.parse_etime("x") is None
+
+
+def test_check_notes_a_prime_over_the_size_it_is_given(curia, cli, estate):
+    sd = estate.seat_dir("muse")
+    (sd / "charter.md").write_text("# Charter\n" + ("law " * 9000))   # about 35 KB
+    rc, out, _ = cli(*E(estate), "check")
+    assert "seat muse: wakes with a" in out and "KB prime" in out and "charter 35 KB" in out
+    (estate.dir / "estate.toml").write_text((estate.dir / "estate.toml").read_text() + "\nprime_max_kb = 64\n")
+    rc, out, _ = cli(*E(estate), "check")
+    assert "KB prime" not in out
+
+
+def test_gh_json_says_why_it_answered_nothing(curia, monkeypatch):
+    monkeypatch.setattr(curia.shutil, "which", lambda name: None)
+    assert curia.gh_json(["pr", "list"]) is None and curia.GH_ERROR == "gh not on PATH"
+    monkeypatch.setattr(curia.shutil, "which", lambda name: "/usr/bin/gh")
+    monkeypatch.setattr(curia.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a, 4, "", "gh: not logged in\n"))
+    assert curia.gh_json(["pr", "list"]) is None and curia.GH_ERROR == "gh exit 4: gh: not logged in"
+
+
+def test_everything_records_the_board_and_tells_the_principal_at_each_handoff(curia, cli, estate, monkeypatch, tmp_path):
+    export = estate.root / "alpha" / ".beads" / "issues.jsonl"
+    rows = {f"al-{i}": {"id": f"al-{i}", "status": "open", "title": f"al-{i}", "labels": [], "dependencies": []}
+            for i in (1, 2, 3)}
+    rows["al-9"] = {"id": "al-9", "status": "open", "title": "al-9", "labels": ["needs-principal"], "dependencies": []}
+
+    def write():
+        export.write_text("".join(json.dumps(r) + "\n" for r in rows.values()))
+
+    write()
+    told = tmp_path / "told.txt"
+    meta = (estate.dir / "estate.toml").read_text().replace(
+        'notify = ""', f'notify = \'printf "%s|%s|%s\\n" "$CURIA_SUBJECT" "$CURIA_BODY" "$CURIA_REPORT" >> {told}\'')
+    (estate.dir / "estate.toml").write_text(meta)
+    sd = estate.seat_dir("warden")
+    clock = {"t": dt.datetime(2026, 6, 1, 12, 0, tzinfo=UTC)}
+
+    def tick():   # every look at the clock is half a minute later: sessions last, stamps differ
+        clock["t"] += dt.timedelta(seconds=30)
+        return clock["t"]
+
+    monkeypatch.setattr(curia, "now", tick)
+    n = 0
+
+    def fake(cmd, cwd, env, timeout=None, capture=False, watch=None):
+        nonlocal n
+        n += 1
+        if n == 1:   # the first waking closes two and files one; the second closes the rest
+            rows["al-1"]["status"] = rows["al-2"]["status"] = "closed"
+            rows["al-4"] = {"id": "al-4", "status": "open", "title": "al-4", "labels": [], "dependencies": []}
+        else:
+            rows["al-3"]["status"] = rows["al-4"]["status"] = "closed"
+        write()
+        assert cli(*E(estate), "handoff", "warden", "--begin")[0] == 0   # as the skill does
+        (sd / "handoff.md").write_text("# Handoff\n\n" + "".join(
+            f"## {h}\n{'- **Waking ' + str(n) + '** shipped `things`.' if h == 'For the principal' else 'nothing'}\n\n"
+            for h in curia.handoff_sections()))
+        assert cli(*E(estate), "handoff", "warden", "--done")[0] == 0
+        (sd / "ENDED").touch()   # the Stop hook, after --done
+        sid = cmd[cmd.index("--session-id") + 1]
+        usage = Path(env["CLAUDE_CONFIG_DIR"]) / "curia-usage"
+        usage.mkdir(exist_ok=True)
+        (usage / f"{sid}.json").write_text(json.dumps({"cost_usd": 4.5, "duration_ms": 120000}))
+        return 0
+
+    monkeypatch.setattr(curia, "invoke_claude", fake)
+    rc, out, err = cli(*E(estate), "launch", "warden", "--repo", "alpha", "--everything")
+    assert rc == 0, err
+    boards = [d for e, _, d in curia.session_events(sd) if e == "board"]
+    assert boards == ["repo=alpha ready=3 working=0 blocked=0 human=1 closed=0 fresh=yes",
+                      "repo=alpha ready=2 working=0 blocked=0 human=1 closed=2 fresh=yes",
+                      "repo=alpha ready=0 working=0 blocked=0 human=1 closed=4 fresh=yes"]
+    lines = told.read_text().splitlines()
+    assert lines[0] == ("Warden handed off in alpha|Warden handed off after 2 min ($4.50): workable 3 -> 2 "
+                        f"(closed +2, filed +1); 1 waiting on a person. Waking 1 shipped things.|{sd / 'handoff.md'}")
+    assert lines[1].startswith("Warden handed off in alpha|Warden handed off after 2 min ($4.50): workable 2 -> 0 "
+                               "(closed +2, filed +0); 1 waiting on a person. Waking 2 shipped things.|")
+    assert lines[2].startswith("Warden: board clear in alpha|")
+    # progress reads it back: the launcher's readings, each handoff's line, the distance to done
+    rc, out, err = cli(*E(estate), "progress", "warden")
+    assert rc == 0, err
+    assert "2 waking(s) under this launcher (pid" in out and "the board of alpha" in out
+    assert "3 -> 2" in out and "2 -> 0" in out
+    assert "Waking 1 shipped things." in out and "Waking 2 shipped things." in out and "handed-off" in out
+    assert ("0 ready, 0 in progress, 0 blocked = 0 workable; the loop ends at 0. "
+            "1 waiting on a person (needs-principal 1).") in out
+    assert "2 waking(s), 2 handoff(s), $9.00, 4 minutes" in out
+    assert "launcher's own readings" in out
+    page = tmp_path / "p.html"
+    rc, out, err = cli(*E(estate), "progress", "warden", "--html", str(page))
+    assert rc == 0 and f"written {page}" in out
+    text = page.read_text()
+    assert "<svg" in text and "workable 0" in text and "Waking 2 shipped things." in text and "$4.50" in text
+    rc, out, err = cli(*E(estate), "progress", "warden", "--html")
+    assert rc == 0 and (estate.dir / "brain" / "progress" / "warden.html").exists()
+    # --since widens the window past this launcher; a seat never woken has nothing to show
+    rc, out, err = cli(*E(estate), "progress", "warden", "--since", "2026-01-01")
+    assert rc == 0 and "since 2026-01-01" in out
+    rc, _, err = cli(*E(estate), "progress", "muse")
+    assert rc == 2 and "never woken" in err
+
+
+def test_progress_rebuilds_the_board_from_the_export_before_board_lines_exist(curia, cli, estate, monkeypatch):
+    def bead(i, status, created, closed=None, labels=()):
+        return {"id": i, "status": status, "title": i, "labels": list(labels), "dependencies": [],
+                "created_at": created, "closed_at": closed}
+
+    rows = [bead("al-1", "closed", "2026-06-01T00:00:00Z", "2026-06-01T13:00:00Z"),
+            bead("al-2", "closed", "2026-06-01T00:00:00Z", "2026-06-02T01:00:00Z"),
+            bead("al-3", "open", "2026-06-01T14:00:00Z"),   # filed by the first session
+            bead("al-4", "open", "2026-06-01T00:00:00Z", labels=("needs-principal",))]
+    (estate.root / "alpha" / ".beads" / "issues.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    sd = estate.seat_dir("warden")
+    sd.mkdir(exist_ok=True)
+    cwd = f"cwd={estate.repo_path('alpha')}"
+    (sd / "sessions.log").write_text(
+        f"start 2026-06-01T12:00:00+00:00 account=a model=m {cwd} session=s1 pid=77\n"
+        "handoff 2026-06-01T15:00:00+00:00\n"
+        "end 2026-06-01T15:00:10+00:00 rc=0 session=s1 cost=$3.00 minutes=180.0 handed-off\n"
+        f"start 2026-06-01T23:00:00+00:00 account=a model=m {cwd} session=s2 pid=77\n"
+        "end 2026-06-02T02:00:00+00:00 rc=143 session=s2 cost=$2.00 minutes=180.0 limited\n")
+    (sd / "history").mkdir()
+    (sd / "history" / "2026-06-01T230005Z.md").write_text("# Handoff\n\n## For the principal\n- Ruling wanted on `al-4`.\n")
+    monkeypatch.setattr(curia, "now", lambda: dt.datetime(2026, 6, 2, 12, 0, tzinfo=UTC))
+    rc, out, err = cli(*E(estate), "progress", "warden")
+    assert rc == 0, err
+    # noon 1 Jun: al-1 and al-2 open, al-4 human -> 2 workable; 15:00: al-1 closed, al-3 filed -> 2; 02:00 next day: al-2 closed -> 1
+    assert "2 -> 2" in out and "2 -> 1" in out and "Ruling wanted on al-4." in out and "limited" in out
+    assert "rebuilt from the export's timestamps" in out
+    assert "1 ready, 0 in progress, 0 blocked = 1 workable; the loop ends at 0. 1 waiting on a person (needs-principal 1)." in out
+    assert "2 waking(s), 1 handoff(s), $5.00, 360 minutes; beads closed 2, filed 1." in out
+    rc, out, err = cli(*E(estate), "progress", "warden", "--since", "3h")
+    assert rc == 2 and "no sessions since" in err
+
+
+# ------------------------------------------ authority, fences, secondment, context, parking
+
+def test_prime_states_the_authority_the_fences_and_the_law(curia, cli, estate):
+    (estate.dir / "hooks.json").write_text(json.dumps({"hooks": {"PreToolUse": [
+        {"matcher": "Bash", "hooks": [{"type": "command", "command": "/m/bin/curia hook release-guard"}]},
+        {"matcher": "Edit|Write", "hooks": [{"type": "command", "command": "/m/bin/curia hook record-guard"}]},
+        {"hooks": [{"type": "command", "command": "/usr/local/bin/no-secrets.sh"}]}]}}))
+    roster = (estate.dir / "roster.toml").read_text().replace(
+        'tools = ["Bash", "Read"]\n', 'tools = ["Bash", "Read"]\ndisallowed_tools = ["WebFetch"]\neffort = "low"\n')
+    (estate.dir / "roster.toml").write_text(roster)
+    rd = estate.dir / "brain" / "rulings"
+    (rd / "2026-01-01-no-force-push.md").write_text("status: enacted\nenforced by: nothing yet\n")
+    (rd / "2026-01-02-tests-first.md").write_text("status: enforced\nenforced by: a test\n")
+    (rd / "2026-01-03-old.md").write_text("status: retired\nenforced by: -\n")
+    estate = curia.Estate(estate.dir)   # the roster as now written
+    prime = curia.build_prime(estate, "warden")
+    auth = prime.split("## Your authority", 1)[1]
+    assert "- Allowed without asking: Bash, Read." in auth
+    assert "- Refused in every session: WebFetch." in auth
+    assert "release-guard (PreToolUse on Bash)" in auth and "record-guard (PreToolUse on Edit|Write)" in auth
+    assert "/usr/local/bin/no-secrets.sh (PreToolUse)" in auth
+    assert "  - 2026-01-01-no-force-push: enacted\n" in auth
+    assert "  - 2026-01-02-tests-first: enforced, enforced by a test" in auth
+    assert "2026-01-03-old" not in auth
+    assert "Effort: low" in prime
+    # interactively a seat with no list has the account's permissions; headless, the default list
+    prime = curia.build_prime(estate, "muse")
+    assert "whatever the account's own permissions say" in prime
+    prime = curia.build_prime(estate, "muse", journal_path=Path("/j.md"))
+    assert "- Allowed without asking: Bash, Read, Edit, Write, Glob, Grep, Agent." in prime
+    # a broken hooks.json does not kill the prime (check faults it); no rulings is said too
+    (estate.dir / "hooks.json").write_text("{not json")
+    for f in rd.iterdir():
+        f.unlink()
+    rc, out, _ = cli(*E(estate), "prime", "warden")
+    assert rc == 0 and "## Your authority" in out and "Rulings in force: none yet" in out
+    assert "Fences (programs that refuse, in every seat session): and the mechanism's own" in out
+
+
+def test_effort_rides_the_envelope_and_check_faults_a_bad_one(curia, cli, estate, monkeypatch):
+    roster = (estate.dir / "roster.toml").read_text().replace(
+        'tools = ["Bash", "Read"]\n', 'tools = ["Bash", "Read"]\neffort = "low"\n')
+    (estate.dir / "roster.toml").write_text(roster)
+    seen = {}
+
+    def fake(cmd, cwd, env, timeout=None, capture=False, watch=None):
+        seen["cmd"] = cmd
+        return completed(cmd, 0, result_json("ok")) if capture else 0
+
+    monkeypatch.setattr(curia, "invoke_claude", fake)
+    rc, _, err = cli(*E(estate), "launch", "warden")
+    assert rc == 0, err
+    assert seen["cmd"][seen["cmd"].index("--effort") + 1] == "low"
+    (estate.dir / "prompts" / "b.md").write_text("do\n")
+    rc, _, err = cli(*E(estate), "run", "warden", "--prompt", "b.md")
+    assert rc == 0, err
+    assert seen["cmd"][seen["cmd"].index("--effort") + 1] == "low"
+    rc, out, _ = cli(*E(estate), "run", "warden", "--prompt", "b.md", "--print-cmd")
+    assert "--effort low" in out
+    rc, _, _ = cli(*E(estate), "launch", "muse")
+    assert "--effort" not in seen["cmd"]   # no roster effort, no flag
+    (estate.dir / "roster.toml").write_text(roster.replace('effort = "low"', 'effort = "turbo"'))
+    monkeypatch.setattr(curia.shutil, "which", lambda name: f"/bin/{name}")
+    rc, out, _ = cli(*E(estate), "check")
+    assert rc == 1 and "! seat warden: effort 'turbo' is not one Claude Code takes (low, medium, high, xhigh, max)" in out
+
+
+def test_fences_log_their_refusals_and_the_lictor_watches_them(curia, cli, estate, monkeypatch):
+    monkeypatch.setenv("CURIA_SEAT", "muse")
+    monkeypatch.setenv("CURIA_ESTATE", str(estate.dir))
+    repos = (estate.dir / "repos.toml").read_text().replace('release_branch = "main"', 'release_branch = "release"')
+    (estate.dir / "repos.toml").write_text(repos)
+    hooks = estate.dir / "hooks.json"
+    hooks.write_text(json.dumps({"hooks": {"PreToolUse": [
+        {"matcher": "Bash", "hooks": [{"type": "command", "command": "/m/bin/curia hook release-guard"}]},
+        {"matcher": "Edit|Write", "hooks": [{"type": "command", "command": "/m/bin/curia hook record-guard"}]}]}}))
+    push = json.dumps({"tool_name": "Bash", "tool_input": {"command": "git push origin HEAD:release"}})
+    rc, _, _ = cli("hook", "release-guard", stdin=push)
+    assert rc == 2
+    log = estate.dir / "brain" / "fences.log"
+    lines = log.read_text().splitlines()
+    assert len(lines) == 1 and " seat=muse fence=release-guard repo=alpha command=git push origin HEAD:release" in lines[0]
+    assert curia.parse_iso(lines[0].split()[0]) is not None
+    rc, _, _ = cli("hook", "precompact", stdin='{"trigger": "manual"}')
+    assert rc == 2 and "fence=precompact" in log.read_text()
+    # the lictor: the count, then busy and idle
+    monkeypatch.setattr(curia, "gh_json", lambda args: None)
+    rc, out, _ = cli(*E(estate), "lictor")
+    assert rc == 0, out
+    law = out.split("## Law", 1)[1].split("## alpha", 1)[0]
+    assert "- no rulings in brain/rulings/" in law
+    assert "- 2 fence(s) declared in hooks.json, plus the mechanism's precompact; 2 refusal(s) in 30d" in law
+    assert "IDLE" not in law and "BUSY" not in law
+    for _ in range(9):
+        cli("hook", "release-guard", stdin=push)
+    rc, out, _ = cli(*E(estate), "lictor")
+    assert "- BUSY fence release-guard: 10 refusal(s) in 30d (muse 10)" in out
+    assert "IDLE fence record-guard" not in out   # hooks.json is younger than the window
+    old = time.time() - 40 * 86400
+    os.utime(hooks, (old, old))
+    rc, out, _ = cli(*E(estate), "lictor")
+    assert "- IDLE fence record-guard: no refusal in 30d" in out and "IDLE fence release-guard" not in out
+    assert "IDLE fence precompact" not in out
+    rc, out, _ = cli(*E(estate), "lictor", "--fence-days", "60", "--fence-busy", "20")
+    assert "IDLE" not in out and "BUSY" not in out and "11 refusal(s) in 60d" in out
+    # nudges are counted in status; check notes too many fences
+    rc, out, _ = cli(*E(estate), "lictor", "--write")
+    rc, out, _ = cli(*E(estate), "status")
+    assert re.search(r"lictor .* 2 nudge\(s\)", out)
+    (estate.dir / "estate.toml").write_text((estate.dir / "estate.toml").read_text() + "\nfences_max = 1\n")
+    rc, out, _ = cli(*E(estate), "check")
+    assert "- hooks.json declares 2 fences, over fences_max (1)" in out
+
+
+def test_record_guard_refuses_edits_to_the_record_but_not_this_wakings_journal(curia, cli, estate, monkeypatch):
+    monkeypatch.setenv("CURIA_SEAT", "muse")
+    monkeypatch.setenv("CURIA_ESTATE", str(estate.dir))
+    sd = estate.seat_dir("muse")
+
+    def payload(path, tool="Write"):
+        return json.dumps({"tool_name": tool, "tool_input": {"file_path": str(path)}, "cwd": str(estate.root)})
+
+    refused = [sd / "sessions.log", sd / "assignments.log", sd / "laurels.md", sd / "history" / "2026-01-01.md",
+               sd / "journal" / "2026-01-01T000000Z-alpha.md", sd / "runs" / "x.log",
+               estate.dir / "brain" / "lictor" / "x.md", estate.dir / "brain" / "muse" / "x.log",
+               estate.dir / "brain" / "fences.log"]
+    for p in refused:
+        rc, _, err = cli("hook", "record-guard", stdin=payload(p))
+        assert rc == 2 and "never falsify the record" in err, p
+    allowed = [sd / "handoff.md", sd / "charter.md", sd / "mail.md", estate.dir / "brain" / "rulings" / "x.md",
+               estate.dir / "house-rules.md", estate.root / "alpha" / "README.md", Path("/tmp/elsewhere.md")]
+    for p in allowed:
+        rc, _, err = cli("hook", "record-guard", stdin=payload(p))
+        assert rc == 0, (p, err)
+    rc, _, _ = cli("hook", "record-guard", stdin=json.dumps(
+        {"tool_name": "Edit", "tool_input": {"file_path": "curia/seats/muse/sessions.log"}, "cwd": str(estate.root)}))
+    assert rc == 2   # relative to the session's cwd
+    own = sd / "journal" / "2026-01-02T000000Z-alpha.md"
+    monkeypatch.setenv("CURIA_JOURNAL", str(own))
+    rc, _, _ = cli("hook", "record-guard", stdin=payload(own))
+    assert rc == 0   # this waking's own entry
+    rc, _, _ = cli("hook", "record-guard", stdin=payload(sd / "journal" / "2026-01-01T000000Z-alpha.md"))
+    assert rc == 2   # another waking's is still the record
+    rc, _, _ = cli("hook", "record-guard", stdin=payload(sd / "sessions.log", tool="Bash"))
+    assert rc == 0   # not this hook's tool
+    logged = [l for l in (estate.dir / "brain" / "fences.log").read_text().splitlines() if "fence=record-guard" in l]
+    assert len(logged) == len(refused) + 2 and "path=seats/muse/sessions.log" in logged[0]
+    # the template wires it in beside release-guard, so a scratch estate carries it
+    hooks = json.loads((estate.dir / "hooks.json").read_text())
+    commands = [h["command"] for e in hooks["hooks"]["PreToolUse"] for h in e["hooks"]]
+    assert any(c.endswith("curia hook record-guard") for c in commands)
+    assert [n for n, _ in curia.fence_names(estate)] == ["release-guard", "record-guard"]
+
+
+def test_a_seconded_waking_is_told_so_and_its_entry_is_marked(curia, cli, estate, monkeypatch, tmp_path):
+    brief = tmp_path / "brief.md"
+    brief.write_text("Do it.\n")
+    seen = []
+
+    def fake(cmd, cwd, env, timeout=None, capture=False, watch=None):
+        model = cmd[cmd.index("--model") + 1]
+        prompt = cmd[cmd.index("-p") + 1]
+        prime = Path(cmd[cmd.index("--append-system-prompt-file") + 1]).read_text()
+        seen.append((model, prompt, prime))
+        if model == "model-y" and "limit" in fake.__dict__:
+            return completed(cmd, 1, "", "You've hit your usage limit")
+        Path(env["CURIA_JOURNAL"]).write_text(
+            (f"seconded: {model}\nDid it as a substitute.\n" if "seconded:" in prompt else "Did it.\n"))
+        return completed(cmd, 0, result_json("ok"))
+
+    monkeypatch.setattr(curia, "invoke_claude", fake)
+    rc, _, err = cli(*E(estate), "run", "muse", "--prompt", str(brief))
+    assert rc == 0, err
+    model, prompt, prime = seen[-1]
+    assert model == "model-y" and "Secondment" not in prime and "seconded:" not in prompt
+    rc, _, err = cli(*E(estate), "run", "muse", "--prompt", str(brief), "--model", "model-q")
+    assert rc == 0, err
+    model, prompt, prime = seen[-1]
+    assert "## Secondment" in prime and "on model-q, not the seat's usual model-y" in prime
+    assert "`seconded: model-q`" in prompt and "not yours to edit" in prompt
+    events = curia.session_events(estate.seat_dir("muse"))
+    assert "model=model-q" in events[-2][2] and events[-2][2].endswith(" seconded")
+    assert "model=model-y" in events[0][2] and not events[0][2].endswith(" seconded")
+    # the next waking reads the entry back, labelled
+    prime = curia.build_prime(estate, "muse")
+    assert prime.count("(seconded: model-q)") == 1 and "Did it as a substitute." in prime and "Did it.\n" in prime
+    assert "written by a substitute model" in prime
+    # the fallback after a limit is a secondment too
+    roster = (estate.dir / "roster.toml").read_text().replace(
+        'run_model = "model-y"\n', 'run_model = "model-y"\nfallback_model = "model-z"\n')
+    (estate.dir / "roster.toml").write_text(roster)
+    fake.limit = True
+    rc, _, err = cli(*E(estate), "run", "muse", "--prompt", str(brief))
+    assert rc == 0, err
+    model, prompt, prime = seen[-1]
+    assert model == "model-z" and "on model-z, not the seat's usual model-y" in prime and "seconded: model-z" in prompt
+    assert "Secondment" not in seen[-2][2]   # the primary's own prime said nothing of the kind
+
+
+def test_shift_hook_hands_off_on_context_depth(curia, cli, estate, monkeypatch, tmp_path):
+    sd = estate.seat_dir("muse")
+    as_seat(monkeypatch, estate, "muse", tmp_path / "acct-a")
+    curia.log_session(sd, "start", f"account=a cwd=/x session=s1 pid={os.getpid()}")
+    payload = json.loads(statusline_payload("s1", five=(10, 900)))
+    payload["context_window"] = {"used_percentage": 72.0, "total_input_tokens": 144000, "context_window_size": 200000}
+    rc, out, _ = cli("hook", "usage", stdin=json.dumps(payload))
+    assert rc == 0 and "| ctx 72% |" in out
+    assert curia.session_usage(tmp_path / "acct-a", "s1")["context_pct"] == 72.0
+    assert " context=72 " in (tmp_path / "acct-a" / "curia-usage.log").read_text() + " "
+    rc, _, err = cli("hook", "shift", stdin='{"session_id": "s1"}')
+    assert rc == 2 and "this session's context is 72% full (context_at is 60%)" in err
+    (sd / "SHIFT-OVER").unlink()
+    payload["context_window"]["used_percentage"] = 40.0
+    cli("hook", "usage", stdin=json.dumps(payload))
+    rc, _, err = cli("hook", "shift", stdin='{"session_id": "s1"}')
+    assert rc == 0 and not err
+    payload["context_window"]["used_percentage"] = 90.0
+    cli("hook", "usage", stdin=json.dumps(payload))
+    (estate.dir / "estate.toml").write_text((estate.dir / "estate.toml").read_text().replace("context_at = 60", "context_at = 0"))
+    rc, _, err = cli("hook", "shift", stdin='{"session_id": "s1"}')
+    assert rc == 0 and not err   # turned off
+    del payload["context_window"]
+    rc, out, _ = cli("hook", "usage", stdin=json.dumps(payload))
+    assert "ctx" not in out and curia.session_usage(tmp_path / "acct-a", "s1")["context_pct"] is None
+
+
+def test_a_parked_seat_is_woken_by_nothing_and_keeps_its_memory(curia, cli, estate, monkeypatch):
+    roster = (estate.dir / "roster.toml").read_text().replace(
+        'jurisdiction = ["the one concern"]\n', 'jurisdiction = ["the one concern"]\nactive = false\n')
+    (estate.dir / "roster.toml").write_text(roster)
+    sd = estate.seat_dir("muse")
+    (sd / "handoff.md").write_text(FULL_HANDOFF)
+    called = []
+    monkeypatch.setattr(curia, "invoke_claude", lambda *a, **k: called.append(1))
+    rc, _, err = cli(*E(estate), "launch", "muse")
+    assert rc == 2 and "muse is parked" in err and "its memory stays" in err
+    (estate.dir / "prompts" / "b.md").write_text("do\n")
+    rc, _, err = cli(*E(estate), "run", "muse", "--prompt", "b.md")
+    assert rc == 2 and "parked" in err
+    rc, _, err = cli(*E(estate), "dispatch", "worker", "--bead", "al-1", "--repo", "alpha", "--review", "muse")
+    assert rc == 2 and "muse is parked" in err and "another reviewer" in err
+    assert not called
+    rc, _, err = cli(*E(estate), "mail", "--all", "the brief is in the bead")
+    assert rc == 0, err
+    assert not (sd / "mail.md").exists() and (estate.seat_dir("warden") / "mail.md").exists()
+    rc, out, _ = cli(*E(estate), "status")
+    assert re.search(r"^  Muse .* parked$", out, re.M)
+    rc, out, _ = cli(*E(estate), "roster")
+    assert "(parked)" in out
+    rc, out, _ = cli(*E(estate), "check")
+    assert "- seat muse: parked (active = false); nothing wakes it and its memory stays" in out
+    assert (sd / "handoff.md").read_text() == FULL_HANDOFF
+
+
+def test_status_spend_shows_the_last_seven_days(curia, cli, estate, monkeypatch):
+    sd = estate.seat_dir("muse")
+    real_now = curia.now
+    monkeypatch.setattr(curia, "now", lambda: real_now() - dt.timedelta(days=10))
+    curia.log_session(sd, "start", "headless account=a model=m cwd=/x session=s1 pid=1")
+    curia.log_session(sd, "end", "rc=0 session=s1 cost=$4.00 turns=2 minutes=1.0")
+    monkeypatch.setattr(curia, "now", real_now)
+    curia.log_session(sd, "start", "headless account=a model=m cwd=/x session=s2 pid=1")
+    curia.log_session(sd, "end", "rc=0 session=s2 cost=$1.00 turns=2 minutes=1.0")
+    rc, out, _ = cli(*E(estate), "status")
+    assert rc == 0
+    assert re.search(r"seat     Muse\s+wakings 2\s+\$5\.00\s+turns 4\s+minutes 2\s+7d: wakings 1\s+\$1\.00", out)
+    assert re.search(r"account  a\s+wakings 2\s+\$5\.00.*7d: wakings 1\s+\$1\.00", out)
+    assert "all time, then the last seven days" in out
+
+
+def test_launch_prints_the_handoff_into_the_terminal_when_the_session_ends(curia, cli, estate, monkeypatch, tmp_path):
+    sd = estate.seat_dir("muse")
+    calls = []
+    body = {"Where things stand": "Landed the thing.",
+            "Beads touched": "- `x-1` - closed",
+            "Decisions and why": "None.",
+            "Loose ends and what next": "1. **Check the gate** on the pushed head\n   before anything else.\n2. Then the mail.",
+            "For the principal": "- Filed one bead; the six packs still need sending.\n- The gate is red on main.",
+            "Notes to self": "Short turns."}
+
+    def fake(cmd, cwd, env, timeout=None, capture=False, watch=None):
+        calls.append(cmd)
+        sid = cmd[cmd.index("--session-id") + 1]
+        usage = Path(env["CLAUDE_CONFIG_DIR"]) / "curia-usage"
+        usage.mkdir(exist_ok=True)
+        (usage / f"{sid}.json").write_text(json.dumps({"cost_usd": 3.1, "duration_ms": 42 * 60000}))
+        if len(calls) == 1:
+            (sd / "handoff.md").write_text("# Handoff - muse, 2026-06-01\n\n"
+                                           + "".join(f"## {h}\n{b}\n\n" for h, b in body.items()))
+            (sd / "RESTART").touch()   # --done
+            (sd / "ENDED").touch()     # the Stop hook at the end of that turn
+            return 143
+        return 0                        # ended by hand, no handoff
+
+    monkeypatch.setattr(curia, "invoke_claude", fake)
+    rc, out, err = cli(*E(estate), "launch", "muse")
+    assert rc == 0, err
+    assert len(calls) == 1
+    # the whole "For the principal" section, the first loose end as one line, the cost and the path
+    assert "curia: Muse handed off (session 1, 42 min, $3.10)" in out
+    assert "    - Filed one bead; the six packs still need sending.\n    - The gate is red on main." in out
+    assert "  Next: **Check the gate** on the pushed head before anything else." in out
+    assert "Then the mail" not in out
+    assert f"  Note: {sd / 'handoff.md'}" in out
+    assert "without a handoff" not in err
+    # a session that ends without one says so, naming the note still on file
+    (sd / "RESTART").unlink(missing_ok=True)
+    rc, out, err = cli(*E(estate), "launch", "muse")
+    assert rc == 0, err
+    assert "handed off (session" not in out
+    assert "Muse's session ended (rc 0) without a handoff; the note on file is still 'Handoff - muse, 2026-06-01'" in err
+    # a note with no section for the principal says so rather than print nothing
+    (sd / "handoff.md").write_text("# Handoff - muse, 2026-06-02\n\n"
+                                   + "".join(f"## {h}\n{b}\n\n" for h, b in body.items() if h != "For the principal")
+                                   + "## For the principal\n\n")
+    assert curia.session_epilogue("Muse", sd, 3, "") == (
+        f"curia: Muse handed off (session 3)\n  For the principal:\n    (nothing)\n"
+        f"  Next: **Check the gate** on the pushed head before anything else.\n  Note: {sd / 'handoff.md'}")

@@ -1,0 +1,63 @@
+# Seats. kind = office | crew | fleet. Jurisdictions are concerns, not repos.
+# Laid down in the crew shape: crew seats by jurisdiction and a clerk, which
+# the principal launches; a Censor that rolls a red integration branch
+# forward; the Lictor and the Portcullis on launchd, which wake no model.
+# No fleet: the crew builds, another seat or the principal reviews, the gate
+# lands. Add a crew block per concern; a record seat when postmortems and
+# rulings pile up (the factory roster has one).
+#
+# example_* seats are placeholders: `curia rename <old> <new>` moves one into
+# your naming family (estate.toml `naming_family`) with its directory, then
+# write its charter. Offices are keyed by their role; renamed or not, the
+# mechanism finds them by `role`, but a second estate with the same office
+# names needs --estate from outside a workspace, so a naming family covers
+# them too. pronouns are declared by the seat itself; record them here when
+# it does.
+# tools / disallowed_tools are the authority envelope: disallowed_tools are
+# refused in every session (the fence); tools are allowed without asking
+# (headless: this list or the default; interactive: only when listed).
+# effort = "low" | "medium" | "high" | "xhigh" | "max" is passed to Claude Code
+# as --effort: a reviewer pool can run low and an office high.
+# active = false parks a seat: launch, run, dispatch and a broadcast mail pass
+# it by, status marks it, its memory stays. Each seat costs its wakings; a
+# roster shrinks by parking before it shrinks by deleting.
+
+# ---- crew: the principal talks to these ------------------------------------
+
+[seats.example_crew]
+title = "Example Crew"
+kind = "crew"
+model = "claude-fable-5-1"
+# fallback_model = "claude-opus-5"   # tried on the same account when a headless run dies on a limit
+account = "main"
+home = "estate"   # or a key from repos.toml; launched from inside a repo, the seat starts there anyway
+pronouns = ""
+jurisdiction = ["Fill in for this estate: a concern this seat owns, end to end"]
+summary = "Builds within its jurisdiction, and reviews the other seats' work there."
+
+[seats.example_clerk]
+title = "Example Clerk"
+kind = "crew"
+model = "claude-fable-5-1"
+account = "main"
+home = "estate"
+pronouns = ""
+jurisdiction = [
+  "documents, decks, correspondence and research on the principal's behalf",
+  "questions about the estate and its repos, answered from their own files",
+  "whatever is not building software and belongs to no other seat",
+]
+summary = "The principal's clerk: the seat for everything that is not building software."
+
+# ---- offices: scheduled, or on demand ---------------------------------------
+
+[seats.censor]
+role = "censor"
+title = "Censor"
+kind = "office"
+model = "claude-fable-5-1"
+account = "main"
+home = "estate"
+pronouns = ""
+tools = ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Agent"]
+summary = "Woken by `curia censor` (launchd, mornings) only where an integration branch is red: diagnoses, opens draft fix PRs, files a postmortem bead. Never touches a release branch."

@@ -18,4 +18,9 @@ nothing enforcing it, or an open postmortem bead has gone a while with no
 ruling citing it. A ruling is never deleted.
 
 Office reports: `censor/` (morning), `lictor/` (nudges), `portcullis/` (what
-landed, what was held and why).
+landed, what was held and why), `triage/` (what `curia triage` found in a
+seat's old notes or the estate's notes; a report, never read into a prime).
+
+Where estate.toml names `jev_key`, `jev/calls.log` has a line for every
+question put to the judgment model (why, tokens, cost, cached, how long,
+any error) and `jev/cache/` holds its answers, a file each, gitignored.

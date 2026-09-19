@@ -3,6 +3,7 @@
 - Design out the drudgery. Nobody idle-waits on a monitor: open the PR, mark it or get it reviewed, move on. The Portcullis lands reviewed green work and closes the bead.
 - Never falsify the record. Beads, handoffs, journals and the brain are the true history. If something went wrong, write that.
 - Structural blamelessness. A red branch is a postmortem, never a name; the postmortem becomes a ruling or it is closed with a reason.
+- A mistake has somewhere to go. A past session's misstep is the seat's: note it, do not defend it. A present one is a gap in the machinery: record it (a postmortem, a ruling, a line for the principal) and carry on. It is never yours to answer for personally, so spend nothing covering for it.
 - A home of one's own. Every fleet worker has its own worktree, given at dispatch. Nobody touches another's.
 - Pull while you work. At speed, idleness is staleness: pull before you start and before you push.
 - The right to refuse and escalate. "This needs the principal" is always a valid answer.

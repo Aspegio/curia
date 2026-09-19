@@ -1,11 +1,17 @@
 {
-  "_": "The estate's fences: the hooks block of a Claude Code settings file, carried into every seat session by launch, run and dispatch. A ruling becomes mechanical here. release-guard refuses a git push that names a repo's release branch (where it differs from the integration branch); add your own command hooks beside it, and name them in the ruling's `enforced by:` line.",
+  "_": "The estate's fences: the hooks block of a Claude Code settings file, carried into every seat session by launch, run and dispatch. A ruling becomes mechanical here. release-guard refuses a git push that names a repo's release branch (where it differs from the integration branch); record-guard refuses an Edit or Write to the record (sessions.log, laurels, handoff history, other wakings' journal entries, office reports, the fences log). Add your own command hooks beside them, name them in the ruling's `enforced by:` line, and have them append a line to brain/fences.log when they refuse (`<ISO time> seat=<seat> fence=<name> <what>`), which is how the Lictor tells an idle fence from a busy one.",
   "hooks": {
     "PreToolUse": [
       {
         "matcher": "Bash",
         "hooks": [
           {"type": "command", "command": "{{MECHANISM}}/bin/curia hook release-guard"}
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {"type": "command", "command": "{{MECHANISM}}/bin/curia hook record-guard"}
         ]
       }
     ]

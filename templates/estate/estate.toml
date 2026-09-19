@@ -2,7 +2,7 @@ name = "{{ESTATE}}"
 principal = "{{PRINCIPAL}}"
 mechanism = "{{MECHANISM}}"
 naming_family = "choose one per estate so a seat name is never ambiguous"
-created = "YYYY-MM-DD"
+created = "{{DATE}}"
 # Words the mechanism repo must never contain. The fence test reads these.
 denylist = ["{{ESTATE}}", "{{PRINCIPAL}}"]
 # How the offices reach you: a shell command run with CURIA_SUBJECT, CURIA_BODY
@@ -11,6 +11,30 @@ denylist = ["{{ESTATE}}", "{{PRINCIPAL}}"]
 # limit. Empty means nobody is told. macOS:
 # notify = 'osascript -e "display notification \"$CURIA_BODY\" with title \"$CURIA_SUBJECT\""'
 notify = ""
+# Judgment without a waking (`curia recall`, `route`, `triage`, and the lines it
+# adds to `ingest`, `lictor` and a handoff's notice): typed questions put to a
+# small decision model, which answers with probabilities and writes nothing.
+# `jev_key` is a shell command that prints the API key, so no secret lives in
+# this file; empty means off, and off changes nothing anywhere. Every call
+# sends the text being judged (journal entries, handoffs, notes) to that
+# service, and is a line in brain/jev/calls.log. Use a key made for this alone,
+# with a spending limit on it: a seat that may run Bash runs as you, and can
+# run this command too. CURIA_JEV_KEY in the environment wins over it, and
+# CURIA_JEV=off turns judgment off for one command. macOS:
+# jev_key = 'security find-generic-password -s curia-jev -w'
+jev_key = ""
+# jev_model and jev_url name another model or endpoint that takes the same
+# request; the thresholds (a noul is 0 to 1, a score over three levels 0 to 2)
+# are the mechanism's defaults and were judged against its pinned model.
+# jev_recall_at = 1.2
+# jev_same_at = 1.2
+# jev_route_at = 0.6
+# jev_needs_at = 0.7
+# jev_screen_at = 0.3
+# jev_durable_at = 0.6
+# Where the estate's notes live (a vault, a folder of markdown), for
+# `curia triage --notes`, which reads it and moves nothing. Unset: no notes triage.
+# notes = "~/notes"
 # Where fleet workers' homes go (`curia dispatch`): a directory relative to the
 # estate root, one worktree per seat per repo underneath it.
 worktrees = "worktrees"
@@ -20,6 +44,10 @@ worktrees = "worktrees"
 # reap_stale_days set, a clean, unlanded scratch worktree with no open PR and
 # untouched that long is removed too, its branch kept. Unset: only landed ones go.
 # reap_stale_days = 30
+# `check` notes a seat whose prime (charter, handoff, laurels, mail, house rules,
+# the tables) is over this many KB: standing text a seat can read on demand
+# costs less in a file than read at every waking (default 32).
+# prime_max_kb = 32
 # What a reviewer adds to a PR to say "land this" when it cannot approve (same
 # forge identity as the worker); an APPROVED review counts too. The Portcullis
 # lands PRs that carry it and are green.
@@ -32,7 +60,10 @@ land_label = "reviewed"
 # shift_hours - the Stop hook tells a seat to hand off after this long awake
 # (0: never); wrap_minutes - how long before --until to start wrapping up
 # (0: no margin); budget_wrap_at - percent of --budget at which to start
-# wrapping up. These are the mechanism's defaults; change them here.
+# wrapping up; context_at - the Stop hook tells a seat to hand off once its
+# context window is this full (percent; a long context costs more every turn
+# and hands off worse; 0: never). These are the mechanism's defaults; change
+# them here.
 rotate_at = 70
 # rotate_week_at - the same on the seven-day and spend windows, which empty slowly
 rotate_week_at = 90
@@ -41,6 +72,11 @@ limited_at = 95
 shift_hours = 6
 wrap_minutes = 45
 budget_wrap_at = 90
+context_at = 60
+# `check` notes hooks.json declaring more fences than this. Fences are distrust
+# written down; past a point no work is legal. The Lictor says which are idle
+# and which are busy (brain/fences.log); the principal decides what stays.
+# fences_max = 20
 # Labels that say a bead waits on a person. `launch --everything` leaves those
 # beads alone and stops when nothing else remains.
 human_labels = ["needs-principal", "needs-human", "blocked-by-human"]

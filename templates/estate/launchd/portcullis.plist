@@ -4,7 +4,7 @@
      not wait for anyone. StartInterval is seconds; a Censor that should watch
      continuously rather than at six can use the same key. -->
 <plist version="1.0"><dict>
-  <key>Label</key><string>curia.{{ESTATE}}.portcullis</string>
+  <key>Label</key><string>curia.{{ESTATE_KEY}}.portcullis</string>
   <key>ProgramArguments</key><array>
     <string>{{MECHANISM}}/bin/curia</string><string>--estate</string><string>{{ESTATE_DIR}}</string><string>portcullis</string>
   </array>
