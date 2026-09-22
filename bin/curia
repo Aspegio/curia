@@ -3417,6 +3417,7 @@ class Bead:
     labels: tuple = ()
     linked: frozenset = frozenset()
     summary: str = ""
+    parent: str = ""   # a dotted id's stem, or what a parent-child dependency names
 
     @property
     def text(self) -> str:
@@ -3450,6 +3451,7 @@ class BoardTriage:
     pairs: list = dataclasses.field(default_factory=list)      # (BoardPair, answers)
     landed: list = dataclasses.field(default_factory=list)     # (Bead, evidence, answers)
     beads: list = dataclasses.field(default_factory=list)      # (Bead, answers)
+    parents: dict = dataclasses.field(default_factory=dict)    # bead -> parent, the whole export (board_parents)
 
 
 def board_home(est: Estate, repo: str, make: bool = False) -> Path:
@@ -3498,6 +3500,30 @@ def board_summary(description: str, heading: str) -> str:
     return ""
 
 
+def board_deps(row: dict) -> list[dict]:
+    deps = row.get("dependencies") or []
+    if isinstance(deps, str):
+        try:
+            deps = json.loads(deps)
+        except ValueError:
+            deps = []
+    return [d for d in deps if isinstance(d, dict)] if isinstance(deps, list) else []
+
+
+def board_parent(row: dict) -> str:
+    """A bead's parent: what its parent-child dependency names, else a dotted id's stem, else ''."""
+    for d in board_deps(row):
+        if str(d.get("type") or "") == "parent-child" and d.get("depends_on_id"):
+            return str(d["depends_on_id"])
+    bid = str(row.get("id") or "")
+    return bid.rsplit(".", 1)[0] if re.search(r"\.[0-9]+$", bid) else ""
+
+
+def board_parents(rows: list[dict]) -> dict[str, str]:
+    """Every bead's parent in the export, open or closed: what a new parent must not loop through."""
+    return {str(row.get("id") or ""): p for row in rows for p in [board_parent(row)] if p}
+
+
 def board_beads(est: Estate, rows: list[dict]) -> list[Bead]:
     """The open beads of an export, by id. Labels are stripped and lower-cased;
     a dependency of any type ties two beads (they are never paired)."""
@@ -3512,17 +3538,11 @@ def board_beads(est: Estate, rows: list[dict]) -> list[Bead]:
             label = str(raw).strip().lower()
             if label and label not in labels:
                 labels.append(label)
-        deps = row.get("dependencies") or []
-        if isinstance(deps, str):
-            try:
-                deps = json.loads(deps)
-            except ValueError:
-                deps = []
-        linked = frozenset(str(d.get("depends_on_id") or "") for d in deps if isinstance(d, dict)) - {""}
+        linked = frozenset(str(d.get("depends_on_id") or "") for d in board_deps(row)) - {""}
         desc = str(row.get("description") or "")
         out.append(Bead(str(row.get("id") or ""), str(row.get("title") or ""), desc, status,
                         str(row.get("issue_type") or "").lower(), str(row.get("created_at") or ""),
-                        tuple(labels), linked, board_summary(desc, heading)))
+                        tuple(labels), linked, board_summary(desc, heading), board_parent(row)))
     return sorted(out, key=lambda b: b.id)
 
 
@@ -3886,7 +3906,7 @@ def board_triage(est: Estate, asker: BoardAsker, rows: list[dict], subjects: lis
     """The passes asked: pairs (same work? one a part of the other?), landed
     (does the history naming it say it is done?) and beads (a finish line,
     startable, a size, a kind). Code chooses every candidate."""
-    tri = BoardTriage()
+    tri = BoardTriage(parents=board_parents(rows))
     board = board_beads(est, rows)
     tri.board = len(board)
     sendable = []
@@ -3959,15 +3979,19 @@ def board_duplicates(pairs: list, same_at: float) -> list[BoardProposal]:
 def board_proposals(tri: BoardTriage, thresholds: dict[str, float]) -> list[BoardProposal]:
     """Only a question with a threshold proposes anything, and every bead is
     the subject of one proposal at most: duplicates are clustered first, a bead
-    closed as a duplicate is not also closed as landed, and a new parent never
-    touches a bead this list closes, never gives a bead two parents, never
-    makes a loop, and never moves a child bead or an epic."""
+    closed as a duplicate is not also closed as landed, nor is a duplicate's
+    survivor (the next run, its duplicates closed, proposes it), and a new
+    parent never touches a bead this list closes, never moves a bead that has
+    a parent already (bd's --parent would take it from that one) or an epic,
+    and never makes a loop, through the parents the export records as well as
+    the ones proposed."""
     same_at, part_at, landed_at = thresholds.get("same"), thresholds.get("part"), thresholds.get("landed")
     out = board_duplicates(tri.pairs, same_at) if same_at is not None else []
     closed = {p.bead for p in out}
+    kept = {p.target for p in out}
     for b, evidence, ans in tri.landed:
         p = float(ans["landed"]["p"])
-        if landed_at is not None and p >= landed_at and b.id not in closed:
+        if landed_at is not None and p >= landed_at and b.id not in closed and b.id not in kept:
             shas = " ".join(line.split(" ", 1)[0] for line in evidence.split("\n\n")[:3])
             out.append(BoardProposal("close-landed", b.id, "", p, shas))
             closed.add(b.id)
@@ -3980,14 +4004,16 @@ def board_proposals(tri: BoardTriage, thresholds: dict[str, float]) -> list[Boar
             if part["pick"] not in ("first_in_second", "second_in_first") or float(part["p"]) < part_at:
                 continue
             child, parent = (pair.a, pair.b) if part["pick"] == "first_in_second" else (pair.b, pair.a)
-            if "." in child.id or child.issue_type == "epic":
+            if child.parent or "." in child.id or child.issue_type == "epic":
                 continue
             if child.id in closed or parent.id in closed or child.id in parent_of:
                 continue
             up, seen = parent.id, set()
-            while up in parent_of and up not in seen:   # would the new parent reach the child? a loop
+            while up != child.id and up not in seen:   # would the new parent reach the child? a loop
                 seen.add(up)
-                up = parent_of[up]
+                up = parent_of.get(up) or tri.parents.get(up) or ""
+                if not up:
+                    break
             if up == child.id:
                 continue
             parent_of[child.id] = parent.id
@@ -6294,11 +6320,13 @@ person, a size and a kind. It writes <stamp>-report.md and proposals.tsv.
 Only a question with a threshold in thresholds.json proposes: duplicates
 (one survivor per cluster, work in progress first, then the older; no bead
 closed twice, none closed and kept as another's survivor), a close as
-landed, and a new parent (never for a bead the list closes or onto one,
-never a second parent, never a loop, never for a child bead or an epic). A
-question with no threshold proposes nothing: its rows are listed by
-probability under UNCALIBRATED. Per-bead flags are advice and never
-become a bd line.
+landed (never for a survivor: the next run proposes it), and a new parent
+(never for a bead the list closes or onto one, never for a bead that has a
+parent already, by a dotted id or a parent-child dependency, since bd's
+--parent would move it, never for an epic, never a loop through the
+parents the export records or the list proposes). A question with no
+threshold proposes nothing: its rows are listed by probability under
+UNCALIBRATED. Per-bead flags are advice and never become a bd line.
 
 sample writes labels-<date>.csv: pairs spread down the similarity ranking
 and beads with landed evidence, with an empty truth column for a person to

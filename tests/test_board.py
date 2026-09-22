@@ -405,6 +405,37 @@ def test_new_parents_never_give_a_bead_two_or_make_a_loop_or_move_a_child_or_an_
     assert [(p.bead, p.target) for p in got] == [("al-aaa1", "al-bbb2"), ("al-bbb2", "al-ccc3")]
 
 
+def test_a_survivor_is_never_also_closed_as_landed(curia, estate):
+    a, b = beads(curia, estate, ("al-aaa1", "Load column", {}), ("al-bbb2", "Load column again", {}))
+    landed = {"landed": {"p": 0.95}}
+    tri = curia.BoardTriage(pairs=[(curia.BoardPair(a, b, 0.9), answers(0.99))],
+                            landed=[(a, "abc1234 2026-09-10 al-aaa1 CLOSED", landed),
+                                    (b, "def5678 2026-09-10 al-bbb2 CLOSED", landed)])
+    got = [(p.action, p.bead, p.target) for p in curia.board_proposals(tri, {"same": 0.8, "landed": 0.8})]
+    assert got == [("duplicate", "al-bbb2", "al-aaa1")]   # the survivor stays open until its duplicates are closed
+
+
+def test_a_bead_under_a_parent_already_is_not_moved_and_no_loop_runs_through_the_recorded_parents(curia, estate):
+    rows = [row("al-aaa1", "Load column"),
+            row("al-bbb2", "Load column rework", dependencies=[
+                {"issue_id": "al-bbb2", "depends_on_id": "al-epic9", "type": "parent-child"}]),
+            row("al-ccc3", "Crane data tables", dependencies=[
+                {"issue_id": "al-ccc3", "depends_on_id": "al-xxx9", "type": "parent-child"}]),
+            row("al-xxx9", "Closed middle", status="closed", dependencies=[
+                {"issue_id": "al-xxx9", "depends_on_id": "al-aaa1", "type": "parent-child"}]),
+            row("al-ddd4", "Crane report tables")]
+    a, b, c, d = curia.board_beads(estate, rows)
+    assert (b.parent, c.parent, a.parent) == ("al-epic9", "al-xxx9", "")
+    assert curia.board_beads(estate, [row("al-aaa1.2", "A child")])[0].parent == "al-aaa1"
+    P = curia.BoardPair
+    tri = curia.BoardTriage(parents=curia.board_parents(rows), pairs=[
+        (P(b, d, 0.4), answers(0.05, "first_in_second", 0.95)),   # b is under al-epic9 already: not moved
+        (P(a, c, 0.4), answers(0.05, "first_in_second", 0.9)),    # a under c, and c is under al-xxx9 under a: a loop
+        (P(d, c, 0.4), answers(0.05, "first_in_second", 0.85))])  # d has no parent and no loop: stands
+    got = [(p.action, p.bead, p.target) for p in curia.board_proposals(tri, {"part": 0.8})]
+    assert got == [("reparent", "al-ddd4", "al-ccc3")]
+
+
 def test_work_in_progress_is_the_bead_kept(curia, estate, monkeypatch):
     board = [dict(r) for r in BOARD]
     board[1]["status"] = "in_progress"
