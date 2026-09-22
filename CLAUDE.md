@@ -123,11 +123,12 @@ weaken it to get green.
   byte; on and failing means the same, with the reason said. It chooses what
   is put in front of a seat (`recall`, ## Recalled), says whose concern a
   note is (`route`), and reports (`triage`, the ingest screen, a handoff's
-  NEEDS YOU, the Lictor's CUSTOM and its reading of a BUSY fence). It never
-  writes a seat's files or an estate's notes, and it is kept out of the
-  Portcullis, the `--everything` stop conditions, rotation, `reap` and every
-  hook. No network call inside `build_prime` (it is handed a finished
-  recall), `cmd_check`'s loop, or `handoff --done`: the launcher and the
+  NEEDS YOU, the Lictor's CUSTOM and its reading of a BUSY fence, `board`'s
+  proposals on a repo's open beads, which a person approves and runs: it
+  never runs bd). It never writes a seat's files or an estate's notes, and
+  it is kept out of the Portcullis, the `--everything` stop conditions,
+  rotation, `reap` and every hook. No network call inside `build_prime` (it
+  is handed a finished recall), `cmd_check`'s loop, or `handoff --done`: the launcher and the
   offices ask. `handoff --lint` is the one question a session may put, before
   --done, and it advises and refuses nothing. Dates, counts, ages and the choice of
   candidates stay in code; each question gets small state, and the text

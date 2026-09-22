@@ -33,6 +33,17 @@ jev_key = ""
 # jev_needs_at = 0.7
 # jev_screen_at = 0.3
 # jev_durable_at = 0.6
+# `curia board` (judgment on a repo's open beads, as proposals a person
+# approves; it never runs bd). A bead carrying one of these labels, or whose
+# text holds one of these words (plurals too), is never sent, alone or in a
+# pair, and commit lines get the same word screen. The defaults are shown.
+# board_exclude_labels = ["security"]
+# board_sensitive_words = ["security", "secret", "credential", "password"]
+# The heading a bead's description puts its plain summary under, as it stands
+# on its line (unset: no summary flag), and labels besides human_labels that
+# say a bead waits on someone.
+# board_summary_heading = "## Summary"
+# board_waiting_labels = []
 # Where the estate's notes live (a vault, a folder of markdown), for
 # `curia triage --notes --jev`, which reads it and moves nothing. Unset: no notes triage.
 # notes = "~/notes"

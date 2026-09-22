@@ -6212,8 +6212,10 @@ and the mechanism never lets it decide what lands, what ends a night, which
 account a seat wakes on, or what is reaped: those stay mechanical. What it
 does is select and report: `recall` and the ## Recalled section of a prime,
 `route`, `triage`, the screen and shortlist `ingest` hands the intake
-office, the notice on a handoff that needs the principal, and two lines in
-the Lictor's report. Dates, counts and ages are still worked out in code.
+office, the notice on a handoff that needs the principal, two lines in the
+Lictor's report, and `board`'s proposals on a repo's open beads, which a
+person approves and runs (it never runs bd). Dates, counts and ages are
+still worked out in code.
 
 It is off until estate.toml names `jev_key`, a shell command that prints
 the API key (a keychain read, say), so no secret lives in the estate;
@@ -6232,15 +6234,16 @@ or `ingest --screen`, which is itself a request for a judgment. Without it
 `triage --notes` refuses and says why.
 
 What to know before turning it on: every question sends the text being
-judged (journal entries, handoffs, notes, a bead) to the service behind
-`jev_url`. A seat that may run Bash runs as you and can run the key command
-too, so the containment is the key itself: one made for this alone, with a
-spending limit on it. Every call, answered, cached or failed, is a line in
-brain/jev/calls.log; answers are cached a file each under
-brain/jev/cache/ (gitignored), because the model is pinned and the same
-question about the same text has the same answer. `jev_model`, `jev_url`
-and the jev_*_at thresholds in estate.toml override the defaults; a
-threshold was judged against the pinned model, so move both together.""",
+judged (journal entries, handoffs, notes, a bead, the commit lines naming
+one) to the service behind `jev_url`. A seat that may run Bash runs as you
+and can run the key command too, so the containment is the key itself: one
+made for this alone, with a spending limit on it. Every call, answered,
+cached or failed, is a line in brain/jev/calls.log; answers are cached a
+file each under brain/jev/cache/ (gitignored), because the model is pinned
+and the same question about the same text has the same answer.
+`jev_model`, `jev_url` and the jev_*_at thresholds in estate.toml override
+the defaults; a threshold was judged against the pinned model, so move
+both together.""",
     "triage": """\
 A report on what deserves attention, in a seat's memory or in the estate's
 notes. It reads and reports. It edits, moves, tags, merges and deletes
