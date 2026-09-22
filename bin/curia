@@ -4063,8 +4063,11 @@ def board_thresholds(est: Estate, repo: str) -> tuple[dict[str, float], str]:
     if payload.get("jev_model") != model:
         return {}, (f"thresholds.json ignored: measured against {payload.get('jev_model')!r}, and jev now asks "
                     f"{model!r}; run calibrate again")
+    named = payload.get("thresholds") or {}
+    if not isinstance(named, dict):
+        die(f"board: {path} thresholds must be a map of question to threshold, not {named!r}")
     got = {}
-    for k, v in (payload.get("thresholds") or {}).items():
+    for k, v in named.items():
         if k not in BOARD_THRESHOLDS:
             continue
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 1:
@@ -4148,19 +4151,24 @@ def board_emit(est: Estate, repo: str, sheet: Path, day: str) -> list[str]:
     every cell that reaches a line is checked: ids must be the repo's bead ids
     (repos.toml beads_prefix), a duplicate or a new parent names its target, a
     landed close's note is the short shas propose wrote, and a bead is the
-    subject of one row and never both closed and another row's target. One bad
+    subject of one row, never its own target, never both closed and another
+    row's target, and the new parents make no loop. A repo that declares no
+    beads_prefix has no ids to check against, so nothing is printed. One bad
     row and there are no lines at all."""
-    prefixes = [str(x) for x in est.repos[repo].get("beads_prefix") or []]
-    ids = re.compile(rf"(?:{'|'.join(map(re.escape, prefixes))})-[a-z0-9]+(?:\.\d+)*" if prefixes
-                     else r"[a-z][a-z0-9]*-[a-z0-9]+(?:\.\d+)*")
+    prefixes = [str(x) for x in est.repos[repo].get("beads_prefix") or [] if str(x)]
+    if not prefixes:
+        die(f"board emit: repos.toml names no beads_prefix for {repo}, so no id can be checked as {repo}'s; nothing "
+            "printed")
+    ids = re.compile(rf"(?:{'|'.join(map(re.escape, prefixes))})-[a-z0-9]+(?:\.[0-9]+)*")
     try:
-        text = sheet.read_text()
-    except OSError as e:
+        text = sheet.read_text(encoding="utf-8-sig")   # a spreadsheet may save a byte-order mark
+    except (OSError, UnicodeDecodeError) as e:
         die(f"board emit: {sheet} did not read ({e})")
     lines: list[str] = []
     subjects: set[str] = set()
     closed: set[str] = set()
     targets: set[str] = set()
+    parent_of: dict[str, str] = {}
     for row in csv.DictReader(text.splitlines(), delimiter="\t"):
         if (row.get("approved") or "").strip().lower() not in ("y", "yes"):
             continue
@@ -4173,25 +4181,36 @@ def board_emit(est: Estate, repo: str, sheet: Path, day: str) -> list[str]:
         subjects.add(bead)
         if action in ("duplicate", "reparent") and not target:
             die(f"board emit: refusing a {action} row with no target: {row}; nothing printed")
+        if target == bead:
+            die(f"board emit: refusing a row that names {bead} as its own target: {row}; nothing printed")
+        b, t = shlex.quote(bead), shlex.quote(target)   # checked above; quoted all the same
         if action == "duplicate":
-            lines.append(f"bd duplicate {bead} --of {target}")
+            lines.append(f"bd duplicate {b} --of {t}")
             closed.add(bead)
             targets.add(target)
         elif action == "reparent":
-            lines.append(f"bd update {bead} --parent {target}")
+            lines.append(f"bd update {b} --parent {t}")
             targets.add(target)
+            parent_of[bead] = target
         elif action == "close-landed":
             note = (row.get("note") or "").strip()
             if target or not BOARD_SHAS_RE.fullmatch(note):
                 die(f"board emit: refusing a close-landed row whose note is not the short shas propose wrote (or "
                     f"which names a target): {row}; nothing printed")
-            lines.append(f"bd close {bead} --reason {shlex.quote(f'landed; board triage {day} ({note})')}")
+            lines.append(f"bd close {b} --reason {shlex.quote(f'landed; board triage {day} ({note})')}")
             closed.add(bead)
         else:
             die(f"board emit: unknown action {action!r} in {row}; nothing printed")
     if closed & targets:
         die(f"board emit: refusing: {', '.join(sorted(closed & targets))} would be closed and named as another "
             "row's target; nothing printed")
+    for start in parent_of:
+        up, seen = start, set()
+        while up in parent_of and up not in seen:
+            seen.add(up)
+            up = parent_of[up]
+        if up in seen:
+            die(f"board emit: refusing: the approved new parents make a loop through {start}; nothing printed")
     return lines
 
 
@@ -4225,20 +4244,23 @@ def board_calibrate(est: Estate, repo: str, sheet: Path, beads: list[Bead], subj
     apply here exactly as in propose; a person picks the thresholds."""
     by_id = {b.id: b for b in beads}
     asked: dict[str, list] = {"same": [], "landed": []}
-    unknown = 0
+    unknown = unasked = 0
     try:
-        text = sheet.read_text()
-    except OSError as e:
+        text = sheet.read_text(encoding="utf-8-sig")   # a spreadsheet may save a byte-order mark
+    except (OSError, UnicodeDecodeError) as e:
         die(f"board calibrate: {sheet} did not read ({e})")
     for row in csv.DictReader(text.splitlines()):
         truth = (row.get("truth") or "").strip().lower()
         if truth not in ("y", "yes", "n", "no"):
             continue
+        question = (row.get("question") or "").strip()
         a = by_id.get((row.get("a") or "").strip())
         b = by_id.get((row.get("b") or "").strip())
-        if a is None or (row.get("question") == "same" and b is None):
+        if question not in asked:
+            unasked += 1
+        elif a is None or (question == "same" and b is None):
             unknown += 1
-        elif row.get("question") == "same":
+        elif question == "same":
             asked["same"].append((([a, b], []), truth.startswith("y")))
         else:
             asked["landed"].append((([a], [board_evidence(a.id, subjects)]), truth.startswith("y")))
@@ -4246,7 +4268,8 @@ def board_calibrate(est: Estate, repo: str, sheet: Path, beads: list[Bead], subj
     for name, kind in (("same", "pairs"), ("landed", "landed")):
         got = asker.ask(kind, [item for item, _ in asked[name]], why=f"board:{repo}:calibrate")
         scored[name] = [(float(ans[name]["p"]), truth) for (_, truth), ans in zip(asked[name], got) if ans]
-    out = [f"Questions {BOARD_QUESTIONS}, jev model {asker.model}. Labelled rows not on the open board: {unknown}."]
+    out = [f"Questions {BOARD_QUESTIONS}, jev model {asker.model}. Labelled rows not on the open board: {unknown}."
+           + (f" Labelled rows naming no question it asks (same or landed): {unasked}." if unasked else "")]
     out += [f"Not scored ({reason}): {n}." for reason, n in sorted(asker.skipped.items())]
     for name, points in scored.items():
         out += ["", f"## {name}: {len(points)} labelled, {sum(1 for _, t in points if t)} yes", "",
@@ -4292,7 +4315,8 @@ def cmd_board(a) -> None:
     if a.action == "emit":
         sheet = Path(a.file).expanduser() if a.file else board_home(est, repo) / "proposals.tsv"
         lines = board_emit(est, repo, sheet, day)
-        print(f"# {len(lines)} approved row(s) of {sheet}: run in {est.repo_path(repo)}, where bd reads {repo}'s board")
+        where = " ".join(f"{sheet}: run in {est.repo_path(repo)}".splitlines())   # a comment stays one line
+        print(f"# {len(lines)} approved row(s) of {where}, where bd reads {repo}'s board")
         if lines:
             print("\n".join(lines))
         return
@@ -6345,11 +6369,12 @@ Advice; it exits 0.
 emit [sheet] prints `bd duplicate`, `bd update --parent` and `bd close`
 lines for the rows marked y (default brain/board/<repo>/proposals.tsv).
 The sheet is hand-edited, so every cell is checked: ids must be the repo's
-bead ids (repos.toml beads_prefix), a duplicate or a new parent must name
-its target, a landed close's note must be the short shas propose wrote
-(and is shell-quoted all the same), and a bead may be the subject of one
-row and never both closed and another row's target. One bad row and no
-line is printed. It needs no jev.
+bead ids (repos.toml beads_prefix; a repo that declares none gets no
+lines), a duplicate or a new parent must name its target and not itself, a
+landed close's note must be the short shas propose wrote, every id and
+note is shell-quoted all the same, a bead may be the subject of one row
+and never both closed and another row's target, and the new parents may
+make no loop. One bad row and no line is printed. It needs no jev.
 
 The fences stand in front of every request, on every action, whoever asks:
 a bead carrying a label in estate.toml board_exclude_labels (default:

@@ -566,6 +566,12 @@ def test_emit_prints_only_the_approved_rows(curia, cli, estate):
     "y\tdelete\tal-bbb2\t\t0.9\tt",
     "y\tduplicate\tal-bbb2\tal-aaa1\t0.9\tt\ny\treparent\tal-bbb2\tal-ccc3\t0.9\tt",    # one bead, two rows
     "y\tduplicate\tal-bbb2\tal-aaa1\t0.9\tt\ny\treparent\tal-ccc3\tal-bbb2\t0.9\tt",    # closed, and a target
+    "y\treparent\tal-bbb2\tal-bbb2\t0.9\tt",                                         # its own parent
+    "y\treparent\tal-bbb2\tal-ccc3\t0.9\tt\ny\treparent\tal-ccc3\tal-bbb2\t0.9\tt",   # a loop
+    "y\tduplicate\tal-bbb2.\u0663\tal-aaa1\t0.9\tt",                                  # a digit that is not 0-9
+    'y\tclose-landed\tal-eee5\t\t0.9\t"abc1234\nrm -rf x"',                            # a newline in a cell
+    "y\tclose-landed\tal-eee5\t\t0.9\tabc1234 `id` $(id)",
+    "y\tduplicate\tal-bbb2\t'al-aaa1'\t0.9\tt",
 ])
 def test_emit_refuses_a_row_it_did_not_write_and_prints_nothing(curia, cli, estate, tmp_path, bad):
     sheet = tmp_path / "approved.tsv"
@@ -573,6 +579,33 @@ def test_emit_refuses_a_row_it_did_not_write_and_prints_nothing(curia, cli, esta
                      + bad + "\n")
     rc, out, err = cli(*E(estate), "board", "emit", str(sheet), "--repo", "alpha")
     assert rc == 2 and out == "" and ("refusing" in err or "unknown action" in err)
+
+
+def test_emit_wants_the_repos_prefix_and_reads_a_sheet_a_spreadsheet_saved(curia, cli, estate, tmp_path):
+    sheet = tmp_path / "approved.tsv"
+    sheet.write_text("\ufeff" + "\t".join(curia.BOARD_PROPOSAL_COLUMNS) + "\ny\tduplicate\tal-bbb2\tal-aaa1\t0.9\tt\n")
+    rc, out, err = cli(*E(estate), "board", "emit", str(sheet), "--repo", "alpha")
+    assert rc == 0 and out.splitlines()[1:] == ["bd duplicate al-bbb2 --of al-aaa1"], err
+    p = estate.dir / "repos.toml"
+    p.write_text(p.read_text().replace('beads_prefix = ["al"]\n', ""))
+    rc, out, err = cli(*E(estate), "board", "emit", str(sheet), "--repo", "alpha")
+    assert rc == 2 and out == "" and "names no beads_prefix for alpha" in err
+
+
+def test_a_thresholds_file_of_the_wrong_shape_is_refused_and_calibrate_counts_rows_it_cannot_ask(curia, cli, estate,
+                                                                                              monkeypatch, tmp_path):
+    commit_board(estate, BOARD, "abc: al-ccc3 CLOSED")
+    board_jev(curia, estate, monkeypatch)
+    home = estate.dir / "brain" / "board" / "alpha"
+    home.mkdir(parents=True)
+    (home / "thresholds.json").write_text(json.dumps({"questions_version": curia.BOARD_QUESTIONS,
+                                                      "jev_model": curia.JEV_MODEL, "thresholds": [0.5]}))
+    rc, _, err = cli(*E(estate), "board", "propose", "--repo", "alpha", "--passes", "beads")
+    assert rc == 2 and "thresholds must be a map" in err
+    sheet = tmp_path / "labels.csv"
+    sheet.write_text(",".join(curia.BOARD_SHEET_COLUMNS) + "\nsmae,al-ccc3,al-aaa1,0.5,,,y\nlanded,al-ccc3,,,,,y\n")
+    rc, out, err = cli(*E(estate), "board", "calibrate", str(sheet), "--repo", "alpha")
+    assert rc == 0 and "naming no question it asks (same or landed): 1." in out and "## landed: 1 labelled" in out
 
 
 def test_operating_table_and_window_cut(curia):
