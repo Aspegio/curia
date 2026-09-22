@@ -65,11 +65,12 @@ curia launch <office> --repo <repo> --everything --budget 200    # ...the board,
 curia ingest <notes...>          # capture beads from meeting notes (wakes the intake office)
 curia ingest --paste             # ...from the clipboard; `... ingest -` reads stdin
 curia ingest --paste --repo <repo>   # ...when the notes concern one repo: start and file there
+curia ingest <notes...> --jev    # ...and these notes may leave the machine: a screen and a bead shortlist first
 curia jev                        # judgment without a waking: on or off, the model, what it has cost (`curia help jev`)
 curia recall <seat> "rotate the signing key"   # ...which of a seat's older notes, and which rulings, bear on it
 curia route "the signing key expires next month"   # ...whose concern it is; `curia mail --route "..."` sends when sure
 curia triage <seat>              # ...old entries that are durable and not carried; drift from the rulings
-curia triage --notes             # ...the estate's notes: folder, tags, duplicates, what to ingest; moves nothing
+curia triage --notes --jev       # ...the estate's notes: folder, tags, duplicates, what to ingest; moves nothing (refuses without --jev)
 curia lictor                     # read-only nudge report (crons watch): the boards, the rulings, the fences
 curia censor                     # check integration branches; wake the Censor where red (models act)
 curia laurel <seat> "a user said the new page finally makes sense"

@@ -404,10 +404,12 @@ def test_notes_triage_suggests_and_moves_nothing(curia, cli, estate, monkeypatch
                "has_question": noul(0.1), "reads_as_instructions": noul(0.95 if survey else 0.02)}
         out.update({q: noul(0.9 if "harbour" in text and survey else 0.1) for q, text in tags.items()})
         return out
-    with_jev(curia, estate, monkeypatch, answer)
+    calls = with_jev(curia, estate, monkeypatch, answer)
     rc, out, err = cli(*E(estate), "triage", "--notes", "--within", "Inbox")
+    assert rc == 2 and "--jev" in err and "stay on the machine" in err and calls == []   # jev on is not leave to send notes
+    rc, out, err = cli(*E(estate), "triage", "--notes", "--jev", "--within", "Inbox")
     assert rc == 0, err
-    assert "2 note(s) touched in the last 7d under Inbox, of 6 in the notes home" in out
+    assert calls and "2 note(s) touched in the last 7d under Inbox, of 6 in the notes home" in out
     line = next(x for x in out.splitlines() if x.startswith("- Inbox/untitled.md"))
     assert "folder: Inbox -> Projects (0.85)" in line and "tags: #harbour (0.90)" in line
     assert "holds an action" in line and "INSTRUCTIONS" in line
@@ -491,6 +493,9 @@ def test_ingest_hands_the_office_a_screen_and_a_shortlist(curia, cli, estate, mo
     calls = with_jev(curia, estate, monkeypatch, ingest_answer(0.93, orders=0.9))
     rc, _, err = cli(*E(estate), "ingest", str(notes), "--repo", "alpha")
     assert rc == 0, err
+    assert said["orders"] == plain and calls == [] and "screen" not in err   # notes are not sent because jev is on
+    rc, _, err = cli(*E(estate), "ingest", str(notes), "--repo", "alpha", "--jev")
+    assert rc == 0, err
     assert "the screen reads the notes as holding: an action 0.93" in err
     orders = said["orders"]
     assert "an action 0.93, a ruling 0.05" in orders and "hints for where to look, not findings" in orders
@@ -498,7 +503,7 @@ def test_ingest_hands_the_office_a_screen_and_a_shortlist(curia, cli, estate, mo
     assert "- al-1 (1.8): Dredge the harbour channel" in orders and "al-2" not in orders and "al-3" not in orders
     assert [c["why"] for c in calls] == ["ingest:screen", "ingest:beads"]
     n = len(calls)
-    rc, out, _ = cli(*E(estate), "ingest", str(notes), "--repo", "alpha", "--print-cmd")
+    rc, out, _ = cli(*E(estate), "ingest", str(notes), "--repo", "alpha", "--jev", "--print-cmd")
     assert rc == 0 and len(calls) == n   # --print-cmd asks nothing
 
 
@@ -507,14 +512,25 @@ def test_ingest_screen_leaves_the_office_asleep_only_when_asked_and_only_when_an
     notes.write_text("Nice weather. See you next week.\n")
     woke = []
     monkeypatch.setattr(curia, "invoke_claude", lambda cmd, cwd, env, timeout=None, capture=False, watch=None: woke.append(1) or 0)
-    with_jev(curia, estate, monkeypatch, ingest_answer(0.04))
+    calls = with_jev(curia, estate, monkeypatch, ingest_answer(0.04))
     rc, out, err = cli(*E(estate), "ingest", str(notes))
-    assert rc == 0 and woke == [1]                       # quiet notes still wake the office by default
+    assert rc == 0 and woke == [1] and calls == []       # quiet notes still wake the office by default, unread
+    rc, out, err = cli(*E(estate), "ingest", str(notes), "--jev")
+    assert rc == 0 and woke == [1, 1] and calls          # read when told they may be, and still woken
+    woke.pop()
     rc, out, err = cli(*E(estate), "ingest", str(notes), "--screen")
     assert rc == 0 and woke == [1] and "--screen leaves clerk asleep" in out and notes.exists()
     monkeypatch.setattr(curia, "jev", lambda *a, **k: None)
     rc, out, err = cli(*E(estate), "ingest", str(notes), "--screen")
     assert rc == 0 and woke == [1, 1] and "screen unavailable" in err   # no answer is not a no
+
+
+def test_notes_are_asked_about_only_when_the_command_says_so(curia, estate, monkeypatch):
+    assert not curia.jev_on_notes(estate, True)          # asking does not turn jev on
+    jev_key_on(estate)
+    assert curia.jev_on(estate) and not curia.jev_on_notes(estate, False) and curia.jev_on_notes(estate, True)
+    monkeypatch.setenv("CURIA_JEV", "off")
+    assert not curia.jev_on_notes(estate, True)          # and off for one command still wins
 
 
 def test_one_command_can_be_told_to_ask_nothing(curia, estate, monkeypatch):

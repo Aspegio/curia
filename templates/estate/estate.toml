@@ -20,7 +20,8 @@ notify = ""
 # service, and is a line in brain/jev/calls.log. Use a key made for this alone,
 # with a spending limit on it: a seat that may run Bash runs as you, and can
 # run this command too. CURIA_JEV_KEY in the environment wins over it, and
-# CURIA_JEV=off turns judgment off for one command. macOS:
+# CURIA_JEV=off turns judgment off for one command. Notes are never sent
+# because this is set: `ingest` and `triage --notes` ask only with --jev. macOS:
 # jev_key = 'security find-generic-password -s curia-jev -w'
 jev_key = ""
 # jev_model and jev_url name another model or endpoint that takes the same
@@ -33,7 +34,7 @@ jev_key = ""
 # jev_screen_at = 0.3
 # jev_durable_at = 0.6
 # Where the estate's notes live (a vault, a folder of markdown), for
-# `curia triage --notes`, which reads it and moves nothing. Unset: no notes triage.
+# `curia triage --notes --jev`, which reads it and moves nothing. Unset: no notes triage.
 # notes = "~/notes"
 # Where fleet workers' homes go (`curia dispatch`): a directory relative to the
 # estate root, one worktree per seat per repo underneath it.
