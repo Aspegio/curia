@@ -18,12 +18,14 @@ Vocabulary
 from __future__ import annotations
 
 import argparse
+import csv
 import dataclasses
 import datetime as dt
 import fnmatch
 import hashlib
 import html
 import json
+import math
 import re
 import os
 import shlex
@@ -112,7 +114,7 @@ EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 RECORD_GLOBS = ("seats/*/sessions.log", "seats/*/assignments.log", "seats/*/laurels.md",
                 "seats/*/history/*", "seats/*/journal/*", "seats/*/runs/*",
                 "brain/fences.log", "brain/censor/*", "brain/lictor/*", "brain/portcullis/*", "brain/progress/*",
-                "brain/triage/*", "brain/*/*.log")
+                "brain/triage/*", "brain/board/*/*-report.md", "brain/*/*.log")
 # How long a --loop launcher sleeps at a time while every account is limited, before re-walking the chain.
 WAIT_SLICE_SECONDS = 900
 # How long a fetch of origin may take; a launcher reads the board through one at every waking.
@@ -3362,6 +3364,950 @@ def cmd_censor(a) -> None:
     notify(est, subject, "\n".join(line for line in summary if line.startswith("- ")), path)
 
 
+# ------------------------------------------------------------------- board
+# Judgment on a repo's open beads, as proposals a person approves. It reads the
+# beads export committed on the integration branch, and the commit subjects
+# there, asks jev typed questions in batches, and writes a report, proposals.tsv
+# and labelling sheets under brain/board/<repo>/ (gitignored but for
+# thresholds.json, which a person writes after `board calibrate`). It never runs
+# bd: `board emit` prints bd lines for the rows a person approved. A question
+# with no threshold proposes nothing. The fences are read again at every
+# request: a bead with an excluded label, or whose text holds a sensitive word
+# or matches the repo's name digests, is never asked about, alone or in a pair,
+# and commit evidence gets the same text screen.
+
+BOARD_QUESTIONS = "2026-09-22a"   # the questions' wording: answers and thresholds belong to it; bump when it moves
+BOARD_OPEN = ("open", "blocked", "deferred", "in_progress")
+BOARD_EXCLUDE_LABELS = ["security"]                                        # estate.toml board_exclude_labels overrides
+BOARD_SENSITIVE_WORDS = ["security", "secret", "credential", "password"]   # ...board_sensitive_words; plurals match too
+BOARD_WINDOW = 3000        # one bead's text, and one bead's commit lines, as sent, in characters
+BOARD_EXCERPT = 300        # characters of a commit subject kept either side of the bead id
+BOARD_COMMITS = 12         # commit lines kept per bead, newest first
+BOARD_LOG_DEPTH = 5000     # commits the landed pass reads
+BOARD_BATCH = 8            # items in one request at most; fewer where their text would pass JEV_CHARS
+BOARD_MIN_SIMILARITY, BOARD_NEIGHBOURS, BOARD_MAX_PAIRS = 0.25, 5, 600
+BOARD_TITLE_WEIGHT, BOARD_HEAD_CHARS, BOARD_NGRAM = 3, 600, 4
+BOARD_SPLIT_AT = 3.5       # a size at or past this, on a bead that is not an epic, says split it
+BOARD_SIZES = ["Under an hour of work.", "A few hours of work.", "About a day of work.", "Several days of work.",
+               "Weeks of work that should be split into smaller pieces."]
+BOARD_KINDS = {"product": "A change a person using the product would notice.",
+               "internals": "Build, test, tooling or process work no product user would notice.",
+               "question": "Waiting for an answer or a decision from a named person.",
+               "followup": "A loose end or clean-up left over from other finished work.",
+               "none": "None of these."}
+BOARD_STOPWORDS = frozenset("the and for that this with from are was not but has have its into when then than only "
+                            "also must does each per via one two new now can may will would should technical "
+                            "acceptance bead beads".split())
+BOARD_SHAS_RE = re.compile(r"[0-9a-f]{7,40}(?: [0-9a-f]{7,40})*")
+BOARD_THRESHOLDS = ("same", "part", "landed", "acceptance", "startable")
+BOARD_PROPOSAL_COLUMNS = ("approved", "action", "bead", "target", "probability", "note")
+BOARD_SHEET_COLUMNS = ("question", "a", "b", "similarity", "title_a", "title_b", "truth")
+
+
+@dataclasses.dataclass(frozen=True)
+class Bead:
+    """An open bead as the board reads it: the text a request may carry, and
+    what code pairs and ranks it by."""
+    id: str
+    title: str
+    description: str
+    status: str = "open"
+    issue_type: str = "task"
+    created_at: str = ""
+    labels: tuple = ()
+    linked: frozenset = frozenset()
+    summary: str = ""
+
+    @property
+    def text(self) -> str:
+        return f"{self.title}\n\n{self.description}".strip()
+
+    @property
+    def window(self) -> str:
+        return cut_window(self.text, BOARD_WINDOW)
+
+
+@dataclasses.dataclass(frozen=True)
+class BoardPair:
+    a: Bead
+    b: Bead
+    similarity: float
+
+
+@dataclasses.dataclass(frozen=True)
+class BoardProposal:
+    action: str   # duplicate | reparent | close-landed
+    bead: str
+    target: str
+    p: float
+    note: str
+
+
+@dataclasses.dataclass
+class BoardTriage:
+    board: int = 0
+    excluded: dict = dataclasses.field(default_factory=dict)   # reason -> beads never asked about
+    pairs: list = dataclasses.field(default_factory=list)      # (BoardPair, answers)
+    landed: list = dataclasses.field(default_factory=list)     # (Bead, evidence, answers)
+    beads: list = dataclasses.field(default_factory=list)      # (Bead, answers)
+
+
+def board_home(est: Estate, repo: str, make: bool = False) -> Path:
+    """brain/board/<repo>/: gitignored but for thresholds.json, which a person
+    writes and the estate commits."""
+    d = est.dir / "brain" / "board" / repo
+    if make:
+        d.mkdir(parents=True, exist_ok=True)
+        if not (d / ".gitignore").exists():
+            (d / ".gitignore").write_text("*\n!.gitignore\n!thresholds.json\n")
+    return d
+
+
+def board_norm(text: str) -> str:
+    """Lower case, and every run of what is not a letter or a digit one space:
+    how words are screened, and how a name digest is made."""
+    return " ".join("".join(ch if ch.isalnum() else " " for ch in text.lower()).split())
+
+
+def cut_window(text: str, cap: int) -> str:
+    """Whole paragraphs up to `cap`; a first paragraph over it is cut at a word."""
+    if len(text) <= cap:
+        return text
+    kept: list[str] = []
+    used = 0
+    for para in text.split("\n\n"):
+        extra = len(para) + (2 if kept else 0)
+        if used + extra > cap:
+            break
+        kept.append(para)
+        used += extra
+    return "\n\n".join(kept) if kept else text[:cap].rsplit(" ", 1)[0]
+
+
+def board_summary(description: str, heading: str) -> str:
+    """The text under `heading` (a line of its own) up to the next heading, or ''."""
+    lines = description.splitlines() if heading else []
+    for n, line in enumerate(lines):
+        if line.strip() == heading:
+            body = []
+            for rest in lines[n + 1:]:
+                if rest.startswith("#"):
+                    break
+                body.append(rest)
+            return "\n".join(body).strip()
+    return ""
+
+
+def board_beads(est: Estate, rows: list[dict]) -> list[Bead]:
+    """The open beads of an export, by id. Labels are stripped and lower-cased;
+    a dependency of any type ties two beads (they are never paired)."""
+    heading = str(est.meta.get("board_summary_heading") or "")
+    out = []
+    for row in rows:
+        status = str(row.get("status") or "").lower()
+        if status not in BOARD_OPEN:
+            continue
+        labels: list[str] = []
+        for raw in row.get("labels") or []:
+            label = str(raw).strip().lower()
+            if label and label not in labels:
+                labels.append(label)
+        deps = row.get("dependencies") or []
+        if isinstance(deps, str):
+            try:
+                deps = json.loads(deps)
+            except ValueError:
+                deps = []
+        linked = frozenset(str(d.get("depends_on_id") or "") for d in deps if isinstance(d, dict)) - {""}
+        desc = str(row.get("description") or "")
+        out.append(Bead(str(row.get("id") or ""), str(row.get("title") or ""), desc, status,
+                        str(row.get("issue_type") or "").lower(), str(row.get("created_at") or ""),
+                        tuple(labels), linked, board_summary(desc, heading)))
+    return sorted(out, key=lambda b: b.id)
+
+
+class BoardScreen:
+    """The fences in front of every request: an excluded label, a sensitive word
+    (or its plural), a window of one to four words whose digest is in the
+    repo's name digests. `digests` None: the repo names none, and no name screen
+    runs; a named set that did not load never gets this far (board_screen)."""
+
+    def __init__(self, labels: list[str], words: list[str], digests: frozenset | None, said: str):
+        self.labels = {str(x).strip().lower() for x in labels}
+        self.words = [w for w in (board_norm(str(x)) for x in words) if w]
+        self.digests = digests
+        self.said = said
+
+    def text(self, text: str) -> str | None:
+        norm = board_norm(text)
+        found, padded = set(norm.split()), f" {norm} "
+        for w in self.words:
+            if (w in found or f"{w}s" in found) if " " not in w else (f" {w} " in padded or f" {w}s " in padded):
+                return f"word {w}"
+        if self.digests is not None:
+            if not self.digests:
+                return "name digests empty"
+            tokens = norm.split()
+            for size in range(1, BOARD_NGRAM + 1):
+                for start in range(len(tokens) - size + 1):
+                    if hashlib.sha256(" ".join(tokens[start:start + size]).encode()).hexdigest() in self.digests:
+                        return "name digest"
+        return None
+
+    def bead(self, b: Bead) -> str | None:
+        for label in b.labels:
+            if label in self.labels:
+                return f"label {label}"
+        return self.text(b.text)
+
+
+def board_list(est: Estate, key: str, default: list[str]) -> list[str]:
+    v = est.meta.get(key, default)
+    if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+        die(f"estate.toml {key} must be a list of strings, not {v!r}")
+    return v
+
+
+def board_screen(est: Estate, repo: str) -> BoardScreen:
+    """The fences for a repo's board, from estate.toml and repos.toml. A
+    name_digests file repos.toml names that does not load, or holds no digest,
+    is a refusal: the name screen fails closed, before anything is read."""
+    labels = board_list(est, "board_exclude_labels", BOARD_EXCLUDE_LABELS)
+    words = board_list(est, "board_sensitive_words", BOARD_SENSITIVE_WORDS)
+    rel = est.repos[repo].get("name_digests")
+    if not rel:
+        return BoardScreen(labels, words, None, f"no name screen ran: repos.toml names no name_digests for {repo}")
+    path = est.repo_path(repo) / str(rel)
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        die(f"board: {repo}'s name_digests ({rel}) did not load ({e}); the name screen fails closed, so nothing "
+            "was read or asked")
+    got = payload.get("digests") if isinstance(payload, dict) else payload
+    digests = frozenset(str(d).strip().lower() for d in got if str(d).strip()) if isinstance(got, list) else frozenset()
+    if not digests:
+        die(f"board: {repo}'s name_digests ({rel}) holds no digest; the name screen fails closed, so nothing was "
+            "read or asked")
+    return BoardScreen(labels, words, digests, f"name screen: {rel}, {len(digests)} digest(s)")
+
+
+def board_stop(est: Estate) -> frozenset:
+    """Words the pairing ignores: the common ones, and the summary heading's."""
+    return BOARD_STOPWORDS | set(board_norm(str(est.meta.get("board_summary_heading") or "")).split())
+
+
+def board_tokens(b: Bead, stop: frozenset) -> dict[str, int]:
+    """Title three times, the summary, and the head of the rest: what a pair is found by."""
+    rest = b.description.replace(b.summary, "", 1) if b.summary else b.description
+    counts: dict[str, int] = {}
+    for w in board_norm(" ".join([b.title] * BOARD_TITLE_WEIGHT + [b.summary, rest[:BOARD_HEAD_CHARS]])).split():
+        if len(w) > 2 and w not in stop and not w.isdigit():
+            counts[w] = counts.get(w, 0) + 1
+    return counts
+
+
+def board_vectors(docs: list[dict[str, int]]) -> list[dict[str, float]]:
+    """Unit-length TF-IDF vectors, so a dot product is a cosine."""
+    seen: dict[str, int] = {}
+    for doc in docs:
+        for t in doc:
+            seen[t] = seen.get(t, 0) + 1
+    total = max(len(docs), 1)
+    out = []
+    for doc in docs:
+        w = {t: (1.0 + math.log(c)) * math.log((1 + total) / (1 + seen[t]) + 1.0) for t, c in doc.items()}
+        norm = math.sqrt(sum(v * v for v in w.values())) or 1.0
+        out.append({t: v / norm for t, v in w.items()})
+    return out
+
+
+def board_related(a: Bead, b: Bead) -> bool:
+    """Already tied together: a parent and its child, or a recorded dependency."""
+    return b.id.startswith(a.id + ".") or a.id.startswith(b.id + ".") or b.id in a.linked or a.id in b.linked
+
+
+def board_pairs(beads: list[Bead], stop: frozenset, min_similarity: float = BOARD_MIN_SIMILARITY,
+                neighbours: int = BOARD_NEIGHBOURS, max_pairs: int = BOARD_MAX_PAIRS) -> list[BoardPair]:
+    """Each bead's nearest few unrelated beads over the floor, best first."""
+    vecs = board_vectors([board_tokens(b, stop) for b in beads])
+    nearest: dict[int, list[tuple[float, int]]] = {i: [] for i in range(len(beads))}
+    for i in range(len(beads)):
+        for j in range(i + 1, len(beads)):
+            if board_related(beads[i], beads[j]):
+                continue
+            small, big = sorted((vecs[i], vecs[j]), key=len)
+            score = sum(v * big.get(t, 0.0) for t, v in small.items())
+            if score >= min_similarity:
+                nearest[i].append((score, j))
+                nearest[j].append((score, i))
+    chosen: dict[tuple[int, int], float] = {}
+    for i, scored in nearest.items():
+        for score, j in sorted(scored, reverse=True)[:neighbours]:
+            chosen[(min(i, j), max(i, j))] = score
+    ranked = sorted(chosen.items(), key=lambda kv: (-kv[1], kv[0]))[:max_pairs]
+    return [BoardPair(beads[i], beads[j], round(score, 4)) for (i, j), score in ranked]
+
+
+def board_rows(est: Estate, repo: str) -> tuple[list[dict], Path, str, str]:
+    """The export as committed on the integration branch (origin's, after a
+    fetch, where there is an origin), never the working tree: the rows, the
+    checkout, the ref, and a line saying where they came from."""
+    src, r = est.repo_path(repo), est.repos[repo]
+    if not src.is_dir():
+        die(f"board: repo {repo} is not at {src}")
+    b = r.get("integration_branch")
+    if not b:
+        die(f"board: repo {repo} names no integration_branch in repos.toml; the board is read as committed there")
+    fetched = True
+    if git(["remote", "get-url", "origin"], src, check=False).returncode == 0:
+        fetched = fetch_origin(src, b)
+    ref = integration_ref(src, r, fetch=False)
+    p = git(["show", f"{ref}:.beads/issues.jsonl"], src, check=False)
+    if p.returncode != 0:
+        die(f"board: no beads export committed at {ref} in {src} ({(p.stderr or p.stdout).strip()}); the board is "
+            "read as committed, never from the working tree")
+    rows = []
+    for n, line in enumerate(p.stdout.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            die(f"board: line {n} of the export at {ref} is not JSON")
+        if isinstance(row, dict):
+            rows.append(row)
+    sha = git(["rev-parse", "--short", ref], src, check=False).stdout.strip()
+    return rows, src, ref, f"{ref} at {sha}" + ("" if fetched else ", as last fetched (this fetch FAILED)")
+
+
+def board_subjects(src: Path, ref: str) -> list[str]:
+    """`<short sha> <date> <subject>` lines, newest first. A history that will
+    not read is a refusal, never an empty list: an empty list reads as "no
+    commit names any bead", which would hide a bad ref behind a clean report."""
+    p = git(["log", f"-n{BOARD_LOG_DEPTH}", "--format=%h %cs %s", ref], src, check=False)
+    if p.returncode != 0:
+        die(f"board: git log {ref} failed in {src} ({(p.stderr or p.stdout).strip() or f'exit {p.returncode}'}); "
+            "an unread history is not an empty one, so nothing was asked")
+    return p.stdout.splitlines()
+
+
+def board_evidence(bead_id: str, subjects: list[str]) -> str:
+    """The commit lines naming this bead, each cut to the text around the id.
+    `<id>` never matches inside `<id>.2` or `x<id>`, and the sha is split off,
+    never sliced at a column: its width grows with the repository."""
+    pat = re.compile(rf"(?<![\w.-]){re.escape(bead_id)}(?![\w-]|\.\w)")
+    out: list[str] = []
+    for line in subjects:
+        parts = line.split(" ", 2)
+        if len(parts) < 3 or bead_id not in parts[2]:
+            continue
+        sha, date, subject = parts
+        m = pat.search(subject)
+        if not m:
+            continue
+        start, end = max(m.start() - BOARD_EXCERPT, 0), m.end() + BOARD_EXCERPT
+        out.append(f"{sha} {date} " + ("..." if start else "") + subject[start:end]
+                   + ("..." if end < len(subject) else ""))
+        if len(out) == BOARD_COMMITS:
+            break
+    return cut_window("\n\n".join(out), BOARD_WINDOW)
+
+
+def board_entry(kind: str, texts: list[str]):
+    """One item's place in a request's state: entries.i<n>."""
+    if kind == "pairs":
+        return {"w0": texts[0], "w1": texts[1]}
+    if kind == "landed":
+        return {"entry": texts[0], "history": texts[1]}
+    return texts[0]
+
+
+def board_questions(kind: str, i: int) -> dict:
+    """The questions about item i of a request, keyed i<n>_<name>. The text
+    judged is in the state at entries.i<n>; none of it is in here."""
+    e = f"entries.i{i}"
+    if kind == "pairs":
+        lead = f"`w0` means `{e}.w0` and `w1` means `{e}.w1`: two entries from a software team's work list."
+        return {f"i{i}_same": {"type": "noul", "instructions": f"{lead} Do they describe the same piece of work?",
+                               "criteria": {"true": "Finishing either one would leave nothing to do for the other.",
+                                            "false": "They are different work, even if they touch the same area."}},
+                f"i{i}_part": {"type": "choice", "instructions": f"{lead} Is one of them a part of the other?",
+                               "criteria": {"first_in_second": "`w0` is one part of the larger work `w1` describes.",
+                                            "second_in_first": "`w1` is one part of the larger work `w0` describes.",
+                                            "none": "Neither is a part of the other."}}}
+    if kind == "landed":
+        return {f"i{i}_landed": {
+            "type": "noul",
+            "instructions": f"`entry` means `{e}.entry`, an entry from a software team's work list. `history` means "
+                            f"`{e}.history`, every line of the commit history that names it, newest first. Does "
+                            "`history` say the work `entry` describes is finished and merged?",
+            "criteria": {"true": "A line says it is closed, landed, merged or complete, and no newer line says more "
+                                 "of it remains.",
+                         "false": "The lines only say it was filed, claimed, dispatched, designed or noted, or that "
+                                  "one part of several landed."}}}
+    lead = f"`entry` means `{e}`, an entry from a software team's work list."
+    return {f"i{i}_acceptance": {"type": "noul", "instructions": f"{lead} Does it state how anyone will tell that "
+                                                                  "the work is done?",
+                                 "criteria": {"true": "It names acceptance criteria, a test, or an observable result.",
+                                              "false": "It describes a wish or a problem with no stated finish line."}},
+            f"i{i}_startable": {"type": "noul", "instructions": f"{lead} Could an engineer start it today without "
+                                                                "first waiting on a person?",
+                                "criteria": {"true": "Everything needed to begin is written in the entry.",
+                                             "false": "It waits on an answer, a decision, a signature, a design or a "
+                                                      "document that somebody else must supply."}},
+            f"i{i}_size": {"type": "score", "instructions": f"{lead} How much work is it?", "criteria": BOARD_SIZES},
+            f"i{i}_kind": {"type": "choice", "instructions": f"{lead} What kind of entry is it?",
+                           "criteria": BOARD_KINDS}}
+
+
+def board_record(kind: str, ans: dict | None, i: int) -> dict | None:
+    """Item i's answers as plain JSON, by question name; None when any is missing."""
+    rec: dict = {}
+    for qid, spec in board_questions(kind, i).items():
+        name = qid.split("_", 1)[1]
+        if spec["type"] == "choice":
+            got = jev_choice(ans, qid)
+            if got is None:
+                return None
+            rec[name] = {"pick": got[0], "p": round(got[2].get(got[0], got[1]), 4)}
+            continue
+        v = jev_noul(ans, qid) if spec["type"] == "noul" else jev_score(ans, qid)
+        if v is None:
+            return None
+        rec[name] = {"p": round(v, 4)} if spec["type"] == "noul" else {"value": round(v, 3)}
+    return rec
+
+
+class BoardAsker:
+    """Every question about a board goes through ask(): the fences again for
+    each bead and each piece of evidence named, whoever calls (propose,
+    calibrate, check); then the answers on disk, keyed on the questions'
+    wording, the jev model and the texts; then one request per batch, sized to
+    JEV_CHARS. It runs in one thread, so it holds no lock, and an item asked
+    twice in one run is sent once. A refused key stops the asking."""
+
+    def __init__(self, est: Estate, repo: str, screen: BoardScreen):
+        self.est, self.repo, self.screen = est, repo, screen
+        self.model = str(est.meta.get("jev_model", JEV_MODEL))
+        self.cache = board_home(est, repo, make=True) / "cache"
+        self.started = now().replace(microsecond=0)
+        self.requests = self.sent = self.cached = 0
+        self.skipped: dict[str, int] = {}
+        self.stopped = ""
+
+    def skip(self, reason: str, n: int = 1) -> None:
+        self.skipped[reason] = self.skipped.get(reason, 0) + n
+
+    def ask(self, kind: str, items: list[tuple[list[Bead], list[str]]], why: str = "") -> list[dict | None]:
+        """Each item's answers, in order: None where it was fenced, empty or unanswered."""
+        out: list[dict | None] = [None] * len(items)
+        todo: dict[str, list[int]] = {}
+        texts: dict[str, list[str]] = {}
+        for n, (beads, evidence) in enumerate(items):
+            reason = next(filter(None, [self.screen.bead(b) for b in beads]
+                                 + [self.screen.text(t) for t in evidence]), None)
+            if reason:
+                self.skip(f"excluded: {reason}")
+                continue
+            got = [b.window for b in beads] + list(evidence)
+            if not got or not all(t.strip() for t in got):
+                self.skip("empty window")
+                continue
+            key = hashlib.sha256(json.dumps([BOARD_QUESTIONS, self.model, kind, got]).encode()).hexdigest()
+            hit = read_json(self.cache / f"{key}.json")
+            if hit and isinstance(hit.get("answers"), dict):
+                self.cached += 1
+                out[n] = hit["answers"]
+                continue
+            todo.setdefault(key, []).append(n)
+            texts[key] = got
+        batches: list[list[str]] = []
+        size = 0
+        for key in todo:
+            cost = len(json.dumps(board_entry(kind, texts[key]))) + len(json.dumps(board_questions(kind, 0))) + 16
+            if not batches or len(batches[-1]) >= BOARD_BATCH or size + cost > JEV_CHARS:
+                batches.append([])
+                size = 0
+            batches[-1].append(key)
+            size += cost
+        for batch in batches:
+            count = sum(len(todo[k]) for k in batch)
+            if self.stopped:
+                self.skip(f"not asked: {self.stopped}", count)
+                continue
+            questions: dict = {}
+            for i in range(len(batch)):
+                questions.update(board_questions(kind, i))
+            ans = jev(self.est, {"entries": {f"i{i}": board_entry(kind, texts[k]) for i, k in enumerate(batch)}},
+                      questions, why=why or f"board:{self.repo}:{kind}", cache=False)
+            self.requests += 1
+            if ans is None:
+                err = JEV_ERROR or "no reason given"
+                self.skip(f"not answered: {err}", count)
+                if err.startswith("jev_key") or re.match(r"HTTP 40[123]\b", err):
+                    self.stopped = f"jev refused ({err})"
+                continue
+            for i, k in enumerate(batch):
+                rec = board_record(kind, ans, i)
+                if rec is None:
+                    self.skip("not answered: the answer left the item out", len(todo[k]))
+                    continue
+                self.sent += 1
+                self.cached += len(todo[k]) - 1
+                write_json(self.cache / f"{k}.json", {"answers": rec})
+                for n in todo[k]:
+                    out[n] = rec
+        return out
+
+
+def board_triage(est: Estate, asker: BoardAsker, rows: list[dict], subjects: list[str], passes: list[str],
+                 min_similarity: float = BOARD_MIN_SIMILARITY, neighbours: int = BOARD_NEIGHBOURS,
+                 max_pairs: int = BOARD_MAX_PAIRS) -> BoardTriage:
+    """The passes asked: pairs (same work? one a part of the other?), landed
+    (does the history naming it say it is done?) and beads (a finish line,
+    startable, a size, a kind). Code chooses every candidate."""
+    tri = BoardTriage()
+    board = board_beads(est, rows)
+    tri.board = len(board)
+    sendable = []
+    for b in board:
+        reason = asker.screen.bead(b)
+        if reason:
+            tri.excluded[reason] = tri.excluded.get(reason, 0) + 1
+        else:
+            sendable.append(b)
+    if "pairs" in passes:
+        pairs = board_pairs(sendable, board_stop(est), min_similarity, neighbours, max_pairs)
+        got = asker.ask("pairs", [([p.a, p.b], []) for p in pairs])
+        tri.pairs = [(p, a) for p, a in zip(pairs, got) if a is not None]
+    if "landed" in passes:
+        evidenced = [(b, e) for b in sendable for e in [board_evidence(b.id, subjects)] if e]
+        got = asker.ask("landed", [([b], [e]) for b, e in evidenced])
+        tri.landed = [(b, e, a) for (b, e), a in zip(evidenced, got) if a is not None]
+    if "beads" in passes:
+        got = asker.ask("beads", [([b], []) for b in sendable])
+        tri.beads = [(b, a) for b, a in zip(sendable, got) if a is not None]
+    return tri
+
+
+def board_duplicates(pairs: list, same_at: float) -> list[BoardProposal]:
+    """One survivor per cluster of same-work pairs (A~B and B~C are one
+    cluster), one line per bead closed: no bead is closed twice, and none this
+    list closes is named as another's survivor. Work in progress is kept
+    first, then the older bead. A member judged against another member than
+    the survivor says via whom."""
+    root: dict[str, str] = {}
+    members: dict[str, Bead] = {}
+    edges: dict[str, list[tuple[float, str]]] = {}
+
+    def find(x: str) -> str:
+        while root[x] != x:
+            root[x] = root[root[x]]
+            x = root[x]
+        return x
+
+    for pair, ans in pairs:
+        p = float(ans["same"]["p"])
+        if p < same_at:
+            continue
+        for b in (pair.a, pair.b):
+            members.setdefault(b.id, b)
+            root.setdefault(b.id, b.id)
+        edges.setdefault(pair.a.id, []).append((p, pair.b.id))
+        edges.setdefault(pair.b.id, []).append((p, pair.a.id))
+        first, second = find(pair.a.id), find(pair.b.id)
+        if first != second:
+            root[first] = second
+    clusters: dict[str, list[Bead]] = {}
+    for bid, b in members.items():
+        clusters.setdefault(find(bid), []).append(b)
+    out = []
+    for cluster in clusters.values():
+        kept = min(cluster, key=lambda b: (b.status != "in_progress", b.created_at, b.id))
+        for b in cluster:
+            if b.id == kept.id:
+                continue
+            direct = [p for p, other in edges[b.id] if other == kept.id]
+            if direct:
+                out.append(BoardProposal("duplicate", b.id, kept.id, max(direct), kept.title))
+            else:
+                p, via = max(edges[b.id])
+                out.append(BoardProposal("duplicate", b.id, kept.id, p, f"via {via}: {kept.title}"))
+    return out
+
+
+def board_proposals(tri: BoardTriage, thresholds: dict[str, float]) -> list[BoardProposal]:
+    """Only a question with a threshold proposes anything, and every bead is
+    the subject of one proposal at most: duplicates are clustered first, a bead
+    closed as a duplicate is not also closed as landed, and a new parent never
+    touches a bead this list closes, never gives a bead two parents, never
+    makes a loop, and never moves a child bead or an epic."""
+    same_at, part_at, landed_at = thresholds.get("same"), thresholds.get("part"), thresholds.get("landed")
+    out = board_duplicates(tri.pairs, same_at) if same_at is not None else []
+    closed = {p.bead for p in out}
+    for b, evidence, ans in tri.landed:
+        p = float(ans["landed"]["p"])
+        if landed_at is not None and p >= landed_at and b.id not in closed:
+            shas = " ".join(line.split(" ", 1)[0] for line in evidence.split("\n\n")[:3])
+            out.append(BoardProposal("close-landed", b.id, "", p, shas))
+            closed.add(b.id)
+    if part_at is not None:
+        parent_of: dict[str, str] = {}
+        for pair, ans in sorted(tri.pairs, key=lambda item: -float(item[1]["part"]["p"])):
+            if same_at is not None and float(ans["same"]["p"]) >= same_at:
+                continue
+            part = ans["part"]
+            if part["pick"] not in ("first_in_second", "second_in_first") or float(part["p"]) < part_at:
+                continue
+            child, parent = (pair.a, pair.b) if part["pick"] == "first_in_second" else (pair.b, pair.a)
+            if "." in child.id or child.issue_type == "epic":
+                continue
+            if child.id in closed or parent.id in closed or child.id in parent_of:
+                continue
+            up, seen = parent.id, set()
+            while up in parent_of and up not in seen:   # would the new parent reach the child? a loop
+                seen.add(up)
+                up = parent_of[up]
+            if up == child.id:
+                continue
+            parent_of[child.id] = parent.id
+            out.append(BoardProposal("reparent", child.id, parent.id, float(part["p"]), parent.title))
+    return sorted(out, key=lambda p: (p.action, -p.p, p.bead))
+
+
+def board_flags(est: Estate, b: Bead, ans: dict, thresholds: dict[str, float]) -> list[str]:
+    """Advisory: none of these becomes a bd line. Whether a summary exists is
+    read in code; the waiting labels are human_labels and board_waiting_labels."""
+    flags = []
+    if est.meta.get("board_summary_heading") and not b.summary:
+        flags.append("no summary")
+    waiting = set(est.meta.get("human_labels") or HUMAN_LABELS) | set(board_list(est, "board_waiting_labels", []))
+    waits = bool(set(b.labels) & {str(x).strip().lower() for x in waiting})
+    acceptance_at, startable_at = thresholds.get("acceptance"), thresholds.get("startable")
+    if acceptance_at is not None and float(ans["acceptance"]["p"]) < acceptance_at:
+        flags.append("no stated finish line")
+    if startable_at is not None:
+        p = float(ans["startable"]["p"])
+        if p < startable_at and not waits and b.status != "blocked":
+            flags.append("reads as waiting on a person, but carries no waiting label")
+        if p >= max(startable_at, 1 - startable_at) and waits:
+            flags.append("reads as startable, but carries a waiting label")
+    if float(ans["size"]["value"]) >= BOARD_SPLIT_AT and b.issue_type != "epic":
+        flags.append("sized in weeks and not an epic: split")
+    return flags
+
+
+def board_thresholds(est: Estate, repo: str) -> tuple[dict[str, float], str]:
+    """The thresholds a person wrote after `calibrate`, and a line saying so.
+    None when they were measured on other words or another jev model: a
+    threshold belongs to one of each."""
+    path = board_home(est, repo) / "thresholds.json"
+    if not path.is_file():
+        return {}, "no thresholds.json: every question is uncalibrated, so nothing is proposed"
+    try:
+        payload = json.loads(path.read_text())
+    except ValueError:
+        die(f"board: {path} is not JSON")
+    if not isinstance(payload, dict):
+        die(f"board: {path} is not a JSON object")
+    model = str(est.meta.get("jev_model", JEV_MODEL))
+    if payload.get("questions_version") != BOARD_QUESTIONS:
+        return {}, (f"thresholds.json ignored: measured against questions {payload.get('questions_version')!r}, "
+                    f"and these are {BOARD_QUESTIONS!r}; run calibrate again")
+    if payload.get("jev_model") != model:
+        return {}, (f"thresholds.json ignored: measured against {payload.get('jev_model')!r}, and jev now asks "
+                    f"{model!r}; run calibrate again")
+    got = {}
+    for k, v in (payload.get("thresholds") or {}).items():
+        if k not in BOARD_THRESHOLDS:
+            continue
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 1:
+            die(f"board: thresholds.json {k} must be a number from 0 to 1, not {v!r}")
+        got[k] = float(v)
+    return got, "thresholds: " + (", ".join(f"{k} {v:g}" for k, v in got.items()) or "none named")
+
+
+def board_spend(est: Estate, since: dt.datetime, repo: str) -> float:
+    """What this command's calls cost, from brain/jev/calls.log."""
+    cost = 0.0
+    for line in read(est.dir / "brain" / "jev" / "calls.log").splitlines():
+        bits = line.split(" err=", 1)[0].split()
+        when = parse_iso(bits[0]) if bits else None
+        f = dict(b.split("=", 1) for b in bits[1:] if "=" in b)
+        if when and when >= since and f.get("why", "").startswith(f"board:{repo}:"):
+            try:
+                cost += float(f.get("cost", 0))
+            except ValueError:
+                pass
+    return cost
+
+
+def board_cell(text: str, width: int = 90) -> str:
+    flat = " ".join(text.split()).replace("|", "/")
+    return flat if len(flat) <= width else flat[:width - 3] + "..."
+
+
+def board_report(est: Estate, repo: str, tri: BoardTriage, thresholds: dict[str, float], asker: BoardAsker,
+                 source: str, notes: list[str], top: int = 40) -> str:
+    out = [f"# Board triage - {repo}, {now():%Y-%m-%d %H:%M}Z", "",
+           f"_Proposals only: nothing here ran bd or changed a bead. {tri.board} open bead(s), read from {source}; "
+           f"questions {BOARD_QUESTIONS}, judged by {asker.model}: {asker.requests} request(s), {asker.sent} item(s) "
+           f"answered, {asker.cached} from cache, ${board_spend(est, asker.started, repo):.4f}. Mark the rows of "
+           f"proposals.tsv you approve with y; `curia board emit --repo {repo}` prints their bd lines._", ""]
+    out += [f"- {n}" for n in [asker.screen.said, *notes]]
+    out += ["", "## Not sent", ""]
+    out += [f"- {n} bead(s) never asked about: {reason}" for reason, n in sorted(tri.excluded.items())]
+    out += [f"- {n} item(s): {reason}" for reason, n in sorted(asker.skipped.items())]
+    if not tri.excluded and not asker.skipped:
+        out.append("- nothing")
+    proposals = board_proposals(tri, thresholds)
+    out += ["", "## Proposals (questions with a threshold only)", ""]
+    if proposals:
+        out += ["| action | bead | target | p | note |", "|---|---|---|---|---|"]
+        out += [f"| {p.action} | {p.bead} | {p.target} | {p.p:.2f} | {board_cell(p.note)} |" for p in proposals]
+    else:
+        out.append("None. A question proposes only once thresholds.json names its threshold.")
+
+    def banner(q: str) -> str:
+        return f"threshold {thresholds[q]:.2f}" if q in thresholds else "UNCALIBRATED: ranking only"
+
+    out += ["", f"## Same work? ({banner('same')}; part of: {banner('part')})", "",
+            "| p same | part | sim | a | b |", "|---|---|---|---|---|"]
+    for pair, ans in sorted(tri.pairs, key=lambda item: -float(item[1]["same"]["p"]))[:top]:
+        out.append(f"| {float(ans['same']['p']):.2f} | {ans['part']['pick']} {float(ans['part']['p']):.2f} | "
+                   f"{pair.similarity:.2f} | {pair.a.id} {board_cell(pair.a.title, 60)} | "
+                   f"{pair.b.id} {board_cell(pair.b.title, 60)} |")
+    out += ["", f"## Already landed? ({banner('landed')})", "",
+            "| p landed | bead | title | newest commit naming it |", "|---|---|---|---|"]
+    for b, evidence, ans in sorted(tri.landed, key=lambda item: -float(item[2]["landed"]["p"]))[:top]:
+        out.append(f"| {float(ans['landed']['p']):.2f} | {b.id} | {board_cell(b.title, 60)} | "
+                   f"{board_cell(evidence.split(chr(10), 1)[0], 70)} |")
+    out += ["", f"## Per-bead flags (advisory; finish line: {banner('acceptance')}; startable: "
+                f"{banner('startable')})", "", "| bead | kind | size | flags | title |", "|---|---|---|---|---|"]
+    kinds: dict[str, int] = {}
+    for b, ans in tri.beads:
+        kinds[str(ans["kind"]["pick"])] = kinds.get(str(ans["kind"]["pick"]), 0) + 1
+        flags = board_flags(est, b, ans, thresholds)
+        if flags:
+            out.append(f"| {b.id} | {ans['kind']['pick']} | {float(ans['size']['value']):.1f} | {'; '.join(flags)} | "
+                       f"{board_cell(b.title, 60)} |")
+    out += ["", "Kinds across the board: " + (", ".join(f"{k} {n}" for k, n in
+                                                      sorted(kinds.items(), key=lambda kv: (-kv[1], kv[0])))
+                                              or "none judged")]
+    return "\n".join(out) + "\n"
+
+
+def board_emit(est: Estate, repo: str, sheet: Path, day: str) -> list[str]:
+    """bd lines for the rows a person marked y. The sheet is hand-edited, so
+    every cell that reaches a line is checked: ids must be the repo's bead ids
+    (repos.toml beads_prefix), a duplicate or a new parent names its target, a
+    landed close's note is the short shas propose wrote, and a bead is the
+    subject of one row and never both closed and another row's target. One bad
+    row and there are no lines at all."""
+    prefixes = [str(x) for x in est.repos[repo].get("beads_prefix") or []]
+    ids = re.compile(rf"(?:{'|'.join(map(re.escape, prefixes))})-[a-z0-9]+(?:\.\d+)*" if prefixes
+                     else r"[a-z][a-z0-9]*-[a-z0-9]+(?:\.\d+)*")
+    try:
+        text = sheet.read_text()
+    except OSError as e:
+        die(f"board emit: {sheet} did not read ({e})")
+    lines: list[str] = []
+    subjects: set[str] = set()
+    closed: set[str] = set()
+    targets: set[str] = set()
+    for row in csv.DictReader(text.splitlines(), delimiter="\t"):
+        if (row.get("approved") or "").strip().lower() not in ("y", "yes"):
+            continue
+        action, bead, target = ((row.get(k) or "").strip() for k in ("action", "bead", "target"))
+        if not ids.fullmatch(bead) or (target and not ids.fullmatch(target)):
+            die(f"board emit: refusing a row whose ids are not {repo} bead ids ({', '.join(prefixes) or 'any'}): "
+                f"{row}; nothing printed")
+        if bead in subjects:
+            die(f"board emit: refusing {bead} as the subject of two approved rows; nothing printed")
+        subjects.add(bead)
+        if action in ("duplicate", "reparent") and not target:
+            die(f"board emit: refusing a {action} row with no target: {row}; nothing printed")
+        if action == "duplicate":
+            lines.append(f"bd duplicate {bead} --of {target}")
+            closed.add(bead)
+            targets.add(target)
+        elif action == "reparent":
+            lines.append(f"bd update {bead} --parent {target}")
+            targets.add(target)
+        elif action == "close-landed":
+            note = (row.get("note") or "").strip()
+            if target or not BOARD_SHAS_RE.fullmatch(note):
+                die(f"board emit: refusing a close-landed row whose note is not the short shas propose wrote (or "
+                    f"which names a target): {row}; nothing printed")
+            lines.append(f"bd close {bead} --reason {shlex.quote(f'landed; board triage {day} ({note})')}")
+            closed.add(bead)
+        else:
+            die(f"board emit: unknown action {action!r} in {row}; nothing printed")
+    if closed & targets:
+        die(f"board emit: refusing: {', '.join(sorted(closed & targets))} would be closed and named as another "
+            "row's target; nothing printed")
+    return lines
+
+
+def board_sample(beads: list[Bead], subjects: list[str], stop: frozenset, pairs: int, landed: int) -> list[list[str]]:
+    """Pairs spread evenly down the similarity ranking, then beads with landed evidence."""
+    ranked = board_pairs(beads, stop, min_similarity=0.1, neighbours=8, max_pairs=10_000)
+    step = max(len(ranked) // max(pairs, 1), 1)
+    rows = [["same", p.a.id, p.b.id, f"{p.similarity:.2f}", p.a.title, p.b.title, ""]
+            for p in ranked[::step][:pairs]]
+    evidenced = [b for b in beads if board_evidence(b.id, subjects)]
+    step = max(len(evidenced) // max(landed, 1), 1)
+    return rows + [["landed", b.id, "", "", b.title, "", ""] for b in evidenced[::step][:landed]]
+
+
+def board_operating(scored: list[tuple[float, bool]]) -> list[tuple[float, int, float, float]]:
+    """(threshold, flagged, precision, recall) from 0.05 to 0.95."""
+    positives = sum(1 for _, truth in scored if truth)
+    table = []
+    for step in range(1, 20):
+        at = round(0.05 * step, 2)
+        flagged = [truth for p, truth in scored if p >= at]
+        hits = sum(flagged)
+        table.append((at, len(flagged), round(hits / len(flagged), 3) if flagged else 0.0,
+                      round(hits / positives, 3) if positives else 0.0))
+    return table
+
+
+def board_calibrate(est: Estate, repo: str, sheet: Path, beads: list[Bead], subjects: list[str],
+                    asker: BoardAsker) -> str:
+    """Score a labelled sheet. Every request names its beads, so the fences
+    apply here exactly as in propose; a person picks the thresholds."""
+    by_id = {b.id: b for b in beads}
+    asked: dict[str, list] = {"same": [], "landed": []}
+    unknown = 0
+    try:
+        text = sheet.read_text()
+    except OSError as e:
+        die(f"board calibrate: {sheet} did not read ({e})")
+    for row in csv.DictReader(text.splitlines()):
+        truth = (row.get("truth") or "").strip().lower()
+        if truth not in ("y", "yes", "n", "no"):
+            continue
+        a = by_id.get((row.get("a") or "").strip())
+        b = by_id.get((row.get("b") or "").strip())
+        if a is None or (row.get("question") == "same" and b is None):
+            unknown += 1
+        elif row.get("question") == "same":
+            asked["same"].append((([a, b], []), truth.startswith("y")))
+        else:
+            asked["landed"].append((([a], [board_evidence(a.id, subjects)]), truth.startswith("y")))
+    scored: dict[str, list[tuple[float, bool]]] = {}
+    for name, kind in (("same", "pairs"), ("landed", "landed")):
+        got = asker.ask(kind, [item for item, _ in asked[name]], why=f"board:{repo}:calibrate")
+        scored[name] = [(float(ans[name]["p"]), truth) for (_, truth), ans in zip(asked[name], got) if ans]
+    out = [f"Questions {BOARD_QUESTIONS}, jev model {asker.model}. Labelled rows not on the open board: {unknown}."]
+    out += [f"Not scored ({reason}): {n}." for reason, n in sorted(asker.skipped.items())]
+    for name, points in scored.items():
+        out += ["", f"## {name}: {len(points)} labelled, {sum(1 for _, t in points if t)} yes", "",
+                "| threshold | flagged | precision | recall |", "|---|---|---|---|"]
+        out += [f"| {at:.2f} | {n} | {pr:.3f} | {rc:.3f} |" for at, n, pr, rc in board_operating(points)]
+    example = {"questions_version": BOARD_QUESTIONS, "jev_model": asker.model,
+               "thresholds": {"same": "<picked>", "landed": "<picked>"}}
+    out += ["", f"A person picks the thresholds and writes {board_home(est, repo) / 'thresholds.json'} as "
+                f"{json.dumps(example)}; part, acceptance and startable may be named too. Nothing here picks one."]
+    return "\n".join(out)
+
+
+def board_check(est: Estate, repo: str, title: str, description: str, beads: list[Bead],
+                asker: BoardAsker) -> list[str]:
+    """The duplicate check at the door: a draft against the open board, before
+    a bead is filed. Advisory."""
+    draft = Bead("draft", title, description,
+                 summary=board_summary(description, str(est.meta.get("board_summary_heading") or "")))
+    reason = asker.screen.text(draft.text)
+    if reason:
+        return [f"draft not checked: its text is on the never-sent list ({reason})"]
+    sendable = [b for b in beads if not asker.screen.bead(b)]
+    pairs = [p for p in board_pairs([draft, *sendable], board_stop(est), min_similarity=0.15,
+                                    neighbours=len(sendable)) if "draft" in (p.a.id, p.b.id)][:BOARD_NEIGHBOURS]
+    if not pairs:
+        return ["no open bead reads like this draft"]
+    got = asker.ask("pairs", [([p.a, p.b], []) for p in pairs], why=f"board:{repo}:check")
+    out = []
+    for p, ans in zip(pairs, got):
+        other = p.b if p.a.id == "draft" else p.a
+        same = f"{float(ans['same']['p']):.2f}" if ans else "n/a"
+        out.append(f"p_same {same}  sim {p.similarity:.2f}  {other.id}  {board_cell(other.title, 80)}")
+    return out
+
+
+def cmd_board(a) -> None:
+    est = find_estate(a.estate)
+    repo = a.repo or est.repo_here()
+    if not repo:
+        die("board wants a repo: run it inside one, or name it with --repo")
+    repo, _ = est.repo(repo)
+    day = today()
+    if a.action == "emit":
+        sheet = Path(a.file).expanduser() if a.file else board_home(est, repo) / "proposals.tsv"
+        lines = board_emit(est, repo, sheet, day)
+        print(f"# {len(lines)} approved row(s) of {sheet}: run in {est.repo_path(repo)}, where bd reads {repo}'s board")
+        if lines:
+            print("\n".join(lines))
+        return
+    if a.action in ("propose", "calibrate", "check") and not jev_on(est):
+        die(f"board {a.action} needs jev (estate.toml names no jev_key, or CURIA_JEV=off); nothing was read or "
+            "asked. `board sample` and `board emit` need none; `curia help board`")
+    if a.file and a.action != "calibrate":
+        die(f"board {a.action} takes no file")
+    if a.action == "calibrate" and not a.file:
+        die("board calibrate wants the labelling sheet a person filled: `curia board calibrate <sheet>`")
+    if a.action == "check" and not a.title:
+        die("board check wants --title, and --description or --description-file")
+    passes = [x.strip() for x in a.passes.split(",") if x.strip()]
+    if a.action == "propose" and (not passes or set(passes) - {"pairs", "landed", "beads"}):
+        die(f"--passes takes pairs, landed and beads, comma-separated; not {a.passes!r}")
+    board_list(est, "board_waiting_labels", [])   # a bad value stops here, not after the asking
+    screen = board_screen(est, repo)
+    rows, src, ref, source = board_rows(est, repo)
+    beads = board_beads(est, rows)
+    home = board_home(est, repo, make=True)
+    if a.action == "sample":
+        subjects = board_subjects(src, ref) if a.landed > 0 else []
+        sendable = [b for b in beads if not screen.bead(b)]
+        sheet = home / f"labels-{day}.csv"
+        with open(sheet, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(BOARD_SHEET_COLUMNS)
+            w.writerows(board_sample(sendable, subjects, board_stop(est), a.pairs, a.landed))
+        print(f"labelling sheet: {sheet}\n  fill the truth column with y or n, then `curia board calibrate {sheet} "
+              f"--repo {repo}`\n  {screen.said}; {len(beads) - len(sendable)} fenced bead(s) left off")
+        return
+    asker = BoardAsker(est, repo, screen)
+    if a.action == "calibrate":
+        print(board_calibrate(est, repo, Path(a.file).expanduser(), beads, board_subjects(src, ref), asker))
+    elif a.action == "check":
+        try:
+            description = Path(a.description_file).expanduser().read_text() if a.description_file else a.description
+        except OSError as e:
+            die(f"board check: --description-file did not read ({e})")
+        print("\n".join(board_check(est, repo, a.title, description, beads, asker)))
+    else:
+        thresholds, said = board_thresholds(est, repo)
+        if "ignored" in said:
+            print(f"curia: {said}", file=sys.stderr)
+        tri = board_triage(est, asker, rows, board_subjects(src, ref) if "landed" in passes else [], passes,
+                           a.min_similarity, a.neighbours, a.max_pairs)
+        proposals = board_proposals(tri, thresholds)
+        report = home / f"{stamp()}-report.md"
+        report.write_text(board_report(est, repo, tri, thresholds, asker, source, [said]))
+        with open(home / "proposals.tsv", "w", newline="") as f:
+            w = csv.writer(f, delimiter="\t")
+            w.writerow(BOARD_PROPOSAL_COLUMNS)
+            w.writerows(["", p.action, p.bead, p.target, f"{p.p:.4f}", p.note] for p in proposals)
+        print(f"report: {report}\nproposals: {home / 'proposals.tsv'} ({len(proposals)}; mark the rows you approve "
+              f"with y, then `curia board emit --repo {repo}`)")
+    unanswered = {r: n for r, n in asker.skipped.items() if not r.startswith(("excluded", "empty"))}
+    if unanswered:
+        print("curia: jev unavailable for " + "; ".join(f"{n} item(s) ({r})" for r, n in unanswered.items()),
+              file=sys.stderr)
+
+
 # ------------------------------------------------------------------- fleet
 
 def git(args: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess:
@@ -4984,6 +5930,7 @@ Watching (crons watch, models act; gates neither)
 
 Judgment (off until estate.toml names jev_key; `help jev`)
   jev                       is it on, which model, the thresholds, what it has cost
+  board <action>            a repo's open beads: duplicates, work already landed, flags; proposes, never runs bd (propose, sample, calibrate <sheet>, check, emit; --repo, --passes)
   recall <seat> "text"      which of a seat's older notes, and which rulings, bear on a question (-n)
   triage <seat>             what in a seat's old notes is durable and not carried, or reads against a ruling (--days, --write)
   triage --notes --jev      the estate's notes: a folder, tags, duplicates, what `ingest` would file; moves nothing (--since, --within, --max)
@@ -5305,6 +6252,81 @@ Read-only: it moves, merges and rewrites no note. A seat's memory is still
 what the seat writes; this only chooses what is put in front of it. Needs
 jev (`curia help jev`); without it the command says so and stops. A recall
 is never cached, since the question changes every time.""",
+    "board": """\
+Judgment on a repo's open beads, as proposals a person approves. It reads
+the beads export committed on the repo's integration branch (origin's,
+after a fetch, where there is an origin; never the working tree) and, for
+the landed pass, the commit subjects there. It never runs bd and never
+acts on a probability: what it writes goes under brain/board/<repo>/, and
+`emit` prints bd lines for the rows a person marked approved, for that
+person or the seat that owns the board's writes to run. --repo names the
+repo; the default is the repo you are in.
+
+propose asks three passes (--passes pairs,landed,beads). pairs: code pairs
+each open bead with its nearest few unrelated ones by shared words
+(--min-similarity, --neighbours, --max-pairs; a parent and its child, or
+two beads a dependency ties, are never paired), and each pair is asked
+whether it is the same work and whether one is a part of the other.
+landed: an open bead a commit subject names is asked, against those lines,
+whether the work is finished and merged. beads: each bead is asked whether
+it states a finish line, whether it could start without waiting on a
+person, a size and a kind. It writes <stamp>-report.md and proposals.tsv.
+Only a question with a threshold in thresholds.json proposes: duplicates
+(one survivor per cluster, work in progress first, then the older; no bead
+closed twice, none closed and kept as another's survivor), a close as
+landed, and a new parent (never for a bead the list closes or onto one,
+never a second parent, never a loop, never for a child bead or an epic). A
+question with no threshold proposes nothing: its rows are listed by
+probability under UNCALIBRATED. Per-bead flags are advice and never
+become a bd line.
+
+sample writes labels-<date>.csv: pairs spread down the similarity ranking
+and beads with landed evidence, with an empty truth column for a person to
+fill with y or n. It needs no jev. calibrate <sheet> asks the same
+questions of the labelled rows and prints precision and recall at each
+threshold; a person picks and writes thresholds.json, in the shape it
+prints. Nothing here picks one. Thresholds and cached answers belong to
+the questions' wording and the jev model: when either moves, the cache
+misses and thresholds.json is ignored until calibrate runs again.
+
+check --title T (--description D or --description-file F) is the duplicate
+check at the door: a draft against the open board, before a bead is filed.
+It prints the nearest open beads and how likely each is the same work.
+Advice; it exits 0.
+
+emit [sheet] prints `bd duplicate`, `bd update --parent` and `bd close`
+lines for the rows marked y (default brain/board/<repo>/proposals.tsv).
+The sheet is hand-edited, so every cell is checked: ids must be the repo's
+bead ids (repos.toml beads_prefix), a duplicate or a new parent must name
+its target, a landed close's note must be the short shas propose wrote
+(and is shell-quoted all the same), and a bead may be the subject of one
+row and never both closed and another row's target. One bad row and no
+line is printed. It needs no jev.
+
+The fences stand in front of every request, on every action, whoever
+asks: a bead carrying a label in estate.toml board_exclude_labels (default:
+security), or whose title or description holds a word in
+board_sensitive_words (default: security, secret, credential, password;
+plurals match too), is never asked about, alone or in a pair, and commit
+lines get the same word screen. Where repos.toml names name_digests for
+the repo (a JSON file, path relative to the repo, whose "digests" are
+SHA-256 digests of names lower-cased, with every run of other characters
+one space), text in which a window of one to four words matches one is
+never sent either; named but missing or empty, every action but emit
+refuses before reading anything (the screen fails closed). Not named, the
+report says no name screen ran. Two more keys in estate.toml:
+board_summary_heading (the heading a bead's description puts its plain
+summary under, as it stands on its line: a bead without one is flagged,
+and the summary weighs in the pairing) and board_waiting_labels (labels
+besides human_labels that say a bead waits on someone, for the flags).
+
+propose, calibrate and check need jev (`curia help jev`). Every title,
+description and commit line asked about is sent to that service, several
+beads to a request, sized to fit one, and every call is a line in
+brain/jev/calls.log with why=board:<repo>:<pass>. Off, those three refuse
+and read nothing. On and failing, what was not answered is listed with
+the reason and proposes nothing, and a refused key stops the asking.
+brain/board/<repo>/ is gitignored but for thresholds.json.""",
     "prime": """\
 Print the system prompt the seat would wake with: charter, last handoff,
 journal, laurels, mail, colleagues, house rules, and its authority. This is
@@ -6015,6 +7037,18 @@ examples:
   curia recall <seat> "rotate the signing key" -n 5
   curia prime <seat> --for "rotate the signing key"
                                        the prime a launch with that word would carry""",
+    "board": """\
+examples:
+  curia board propose --repo <repo>    report and proposals under brain/board/<repo>/
+  cd <repo> && curia board propose --passes pairs
+                                       only the duplicate pass, on the repo you are in
+  curia board sample --repo <repo>     a labelling sheet: fill its truth column with y or n
+  curia board calibrate <sheet> --repo <repo>
+                                       precision and recall per threshold; you write thresholds.json
+  curia board check --title "..." --description-file <file>
+                                       before filing a bead: does an open one say this already?
+  curia board emit --repo <repo> > <file>
+                                       bd lines for the rows marked y; read them, then run them in the repo""",
     "rulings": """\
 examples:
   curia rulings                        every ruling, its status, what enforces it
@@ -6195,6 +7229,34 @@ def main() -> None:
     p.add_argument("query", help="what you are about to do, or want to know, quoted")
     p.add_argument("-n", type=int, default=3, help="how many to show at most (default 3)")
     p.set_defaults(fn=cmd_recall)
+
+    p = parser("board", "a repo's open beads: duplicates, work already landed, flags; proposes, never runs bd "
+                        "(propose, calibrate and check need jev)")
+    p.add_argument("action", choices=["propose", "sample", "calibrate", "check", "emit"],
+                   help="propose: a report and proposals.tsv; sample: a labelling sheet; calibrate: precision and "
+                        "recall per threshold from a filled sheet; check: a draft against the open board; emit: bd "
+                        "lines for the approved rows")
+    p.add_argument("file", nargs="?", help="calibrate: the labelling sheet a person filled; emit: the proposals "
+                   "sheet (default: brain/board/<repo>/proposals.tsv)")
+    p.add_argument("--repo", help="whose board (default: the repo you are in)")
+    p.add_argument("--passes", default="pairs,landed,beads",
+                   help="propose: which passes, comma-separated (default: pairs,landed,beads)")
+    p.add_argument("--min-similarity", dest="min_similarity", type=float, default=BOARD_MIN_SIMILARITY,
+                   help=f"propose: how alike by shared words two beads must be to be asked about (default "
+                        f"{BOARD_MIN_SIMILARITY:g})")
+    p.add_argument("--neighbours", type=int, default=BOARD_NEIGHBOURS,
+                   help=f"propose: each bead is paired with at most its nearest this many (default {BOARD_NEIGHBOURS})")
+    p.add_argument("--max-pairs", dest="max_pairs", type=int, default=BOARD_MAX_PAIRS,
+                   help=f"propose: at most this many pairs are asked about, nearest first (default {BOARD_MAX_PAIRS})")
+    p.add_argument("--pairs", type=int, default=40,
+                   help="sample: pairs on the sheet, spread down the similarity ranking (default 40)")
+    p.add_argument("--landed", type=int, default=30,
+                   help="sample: beads a commit subject names, on the sheet (default 30; 0 reads no history)")
+    p.add_argument("--title", help="check: the draft bead's title")
+    p.add_argument("--description", default="", help="check: the draft bead's description")
+    p.add_argument("--description-file", dest="description_file",
+                   help="check: read the draft bead's description from this file")
+    p.set_defaults(fn=cmd_board)
 
     p = parser("launch", "wake a seat interactively (crew or office)")
     p.add_argument("seat", help="a seat name from roster.toml (any case)")

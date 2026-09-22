@@ -21,6 +21,10 @@ Office reports: `censor/` (morning), `lictor/` (nudges), `portcullis/` (what
 landed, what was held and why), `triage/` (what `curia triage` found in a
 seat's old notes or the estate's notes; a report, never read into a prime).
 
+`board/<repo>/` is what `curia board` writes for a repo: reports, proposals,
+labelling sheets and cached answers, gitignored, and `thresholds.json`, the
+thresholds a person picked after `curia board calibrate`, which is committed.
+
 Where estate.toml names `jev_key`, `jev/calls.log` has a line for every
 question put to the judgment model (why, tokens, cost, cached, how long,
 any error) and `jev/cache/` holds its answers, a file each, gitignored.

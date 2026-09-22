@@ -68,6 +68,7 @@ curia ingest --paste --repo <repo>   # ...when the notes concern one repo: start
 curia ingest <notes...> --jev    # ...and these notes may leave the machine: a screen and a bead shortlist first
 curia jev                        # judgment without a waking: on or off, the model, what it has cost (`curia help jev`)
 curia recall <seat> "rotate the signing key"   # ...which of a seat's older notes, and which rulings, bear on it
+curia board propose --repo <repo>   # ...a board's duplicates, work already landed, flags: proposals; `board emit` prints the bd lines you approved
 curia route "the signing key expires next month"   # ...whose concern it is; `curia mail --route "..."` sends when sure
 curia triage <seat>              # ...old entries that are durable and not carried; drift from the rulings
 curia triage --notes --jev       # ...the estate's notes: folder, tags, duplicates, what to ingest; moves nothing (refuses without --jev)
