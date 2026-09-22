@@ -19,8 +19,8 @@
 [seats.example_crew]
 title = "Example Crew"
 kind = "crew"
-model = "claude-fable-5-1"
-# fallback_model = "claude-opus-5"   # tried on the same account when a headless run dies on a limit
+model = "claude-opus-5-5"
+# fallback_model = "claude-fable-5-1"   # tried on the same account when a headless run dies on a limit
 # tools = ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Agent"]
 # disallowed_tools = ["WebFetch"]
 account = "main"

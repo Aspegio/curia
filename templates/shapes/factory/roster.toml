@@ -25,7 +25,7 @@
 [seats.example_office]
 title = "Example Office"
 kind = "office"
-model = "claude-fable-5-1"
+model = "claude-opus-5-5"
 account = "main"
 home = "estate"
 pronouns = ""
@@ -35,7 +35,7 @@ summary = "Works the board at night: has the crew design what needs design, disp
 role = "censor"
 title = "Censor"
 kind = "office"
-model = "claude-fable-5-1"
+model = "claude-opus-5-5"
 account = "main"
 home = "estate"
 pronouns = ""
@@ -57,7 +57,7 @@ summary = "The nudger, read-only. `curia lictor` (launchd, hourly) wakes no mode
 role = "notarius"
 title = "Notarius"
 kind = "office"
-model = "claude-fable-5-1"
+model = "claude-opus-5-5"
 account = "main"
 home = "estate"
 pronouns = ""
@@ -68,8 +68,8 @@ summary = "Intake: `curia ingest` wakes it on meeting notes and transcripts; bea
 [seats.example_crew]
 title = "Example Crew"
 kind = "crew"
-model = "claude-fable-5-1"
-fallback_model = "claude-opus-5"   # tried on the same account when a headless run dies on a limit
+model = "claude-opus-5-5"
+fallback_model = "claude-fable-5-1"   # tried on the same account when a headless run dies on a limit
 account = "main"
 home = "estate"
 pronouns = ""
@@ -79,8 +79,8 @@ summary = "Designs and reviews within its jurisdiction; the fleet builds."
 [seats.example_record]
 title = "Example Record"
 kind = "crew"
-model = "claude-fable-5-1"
-fallback_model = "claude-opus-5"
+model = "claude-opus-5-5"
+fallback_model = "claude-fable-5-1"
 account = "main"
 home = "estate"
 pronouns = ""
@@ -93,8 +93,8 @@ summary = "Keeps the law: turns postmortems into rulings, curates the brain and 
 [seats.example_clerk]
 title = "Example Clerk"
 kind = "crew"
-model = "claude-fable-5-1"
-fallback_model = "claude-opus-5"
+model = "claude-opus-5-5"
+fallback_model = "claude-fable-5-1"
 account = "main"
 home = "estate"
 pronouns = ""
@@ -110,7 +110,7 @@ summary = "The principal's clerk: the seat for everything that is not building s
 [seats.example_worker_1]
 title = "Example Worker 1"
 kind = "fleet"
-model = "claude-opus-5"
+model = "claude-opus-5-5"
 account = "main"
 managed_by = "example_office"
 # active = false   # parked: dispatch passes it by until this is true again
@@ -119,7 +119,7 @@ summary = "Fleet worker: one home, one bead at a time, dispatched by its office.
 [seats.example_worker_2]
 title = "Example Worker 2"
 kind = "fleet"
-model = "claude-opus-5"
+model = "claude-opus-5-5"
 account = "main"
 managed_by = "example_office"
 summary = "Fleet worker: one home, one bead at a time, dispatched by its office."
