@@ -3530,15 +3530,23 @@ class BoardScreen:
     """The fences in front of every request: an excluded label, a sensitive word
     (or its plural), a window of one to four words whose digest is in the
     repo's name digests. `digests` None: the repo names none, and no name screen
-    runs; a named set that did not load never gets this far (board_screen)."""
+    runs; a named set that did not load never gets this far (board_screen). A
+    bead is screened whole and as its window, the text a request carries: a cut
+    inside a word can leave a word the whole text did not hold."""
 
     def __init__(self, labels: list[str], words: list[str], digests: frozenset | None, said: str):
         self.labels = {str(x).strip().lower() for x in labels}
         self.words = [w for w in (board_norm(str(x)) for x in words) if w]
         self.digests = digests
         self.said = said
+        self.seen: dict[str, str | None] = {}
 
     def text(self, text: str) -> str | None:
+        if text not in self.seen:
+            self.seen[text] = self.screened(text)
+        return self.seen[text]
+
+    def screened(self, text: str) -> str | None:
         norm = board_norm(text)
         found, padded = set(norm.split()), f" {norm} "
         for w in self.words:
@@ -3558,7 +3566,7 @@ class BoardScreen:
         for label in b.labels:
             if label in self.labels:
                 return f"label {label}"
-        return self.text(b.text)
+        return self.text(b.text) or self.text(b.window)
 
 
 def board_list(est: Estate, key: str, default: list[str]) -> list[str]:
@@ -3570,8 +3578,10 @@ def board_list(est: Estate, key: str, default: list[str]) -> list[str]:
 
 def board_screen(est: Estate, repo: str) -> BoardScreen:
     """The fences for a repo's board, from estate.toml and repos.toml. A
-    name_digests file repos.toml names that does not load, or holds no digest,
-    is a refusal: the name screen fails closed, before anything is read."""
+    name_digests file repos.toml names that does not load, holds no digest, or
+    holds an entry that is not a SHA-256 digest (a name written in plain, say,
+    which would screen nothing) is a refusal: the name screen fails closed,
+    before anything is read."""
     labels = board_list(est, "board_exclude_labels", BOARD_EXCLUDE_LABELS)
     words = board_list(est, "board_sensitive_words", BOARD_SENSITIVE_WORDS)
     rel = est.repos[repo].get("name_digests")
@@ -3584,7 +3594,12 @@ def board_screen(est: Estate, repo: str) -> BoardScreen:
         die(f"board: {repo}'s name_digests ({rel}) did not load ({e}); the name screen fails closed, so nothing "
             "was read or asked")
     got = payload.get("digests") if isinstance(payload, dict) else payload
-    digests = frozenset(str(d).strip().lower() for d in got if str(d).strip()) if isinstance(got, list) else frozenset()
+    entries = [str(d).strip().lower() for d in got if str(d).strip()] if isinstance(got, list) else []
+    bad = sum(1 for d in entries if not re.fullmatch(r"[0-9a-f]{64}", d))
+    if bad:
+        die(f"board: {repo}'s name_digests ({rel}) holds an entry that is not a SHA-256 digest ({bad} in all); the "
+            "name screen fails closed, so nothing was read or asked")
+    digests = frozenset(entries)
     if not digests:
         die(f"board: {repo}'s name_digests ({rel}) holds no digest; the name screen fails closed, so nothing was "
             "read or asked")
@@ -3798,6 +3813,14 @@ class BoardAsker:
     def skip(self, reason: str, n: int = 1) -> None:
         self.skipped[reason] = self.skipped.get(reason, 0) + n
 
+    def request(self, kind: str, batch: list[str], texts: dict[str, list[str]]) -> tuple[dict, dict, int]:
+        """A batch's state and questions, and the length of the body jev() sends."""
+        state = {"entries": {f"i{i}": board_entry(kind, texts[k]) for i, k in enumerate(batch)}}
+        questions: dict = {}
+        for i in range(len(batch)):
+            questions.update(board_questions(kind, i))
+        return state, questions, len(json.dumps({"model": self.model, "state": state, "questions": questions}))
+
     def ask(self, kind: str, items: list[tuple[list[Bead], list[str]]], why: str = "") -> list[dict | None]:
         """Each item's answers, in order: None where it was fenced, empty or unanswered."""
         out: list[dict | None] = [None] * len(items)
@@ -3822,24 +3845,21 @@ class BoardAsker:
             todo.setdefault(key, []).append(n)
             texts[key] = got
         batches: list[list[str]] = []
-        size = 0
-        for key in todo:
-            cost = len(json.dumps(board_entry(kind, texts[key]))) + len(json.dumps(board_questions(kind, 0))) + 16
-            if not batches or len(batches[-1]) >= BOARD_BATCH or size + cost > JEV_CHARS:
-                batches.append([])
-                size = 0
-            batches[-1].append(key)
-            size += cost
+        for key in todo:   # measured as jev() will send it, so no request passes JEV_CHARS
+            if batches and len(batches[-1]) < BOARD_BATCH and self.request(kind, batches[-1] + [key], texts)[2] \
+                    <= JEV_CHARS:
+                batches[-1].append(key)
+            elif self.request(kind, [key], texts)[2] <= JEV_CHARS:
+                batches.append([key])
+            else:
+                self.skip(f"too long for one request (over {JEV_CHARS} characters as sent)", len(todo[key]))
         for batch in batches:
             count = sum(len(todo[k]) for k in batch)
             if self.stopped:
                 self.skip(f"not asked: {self.stopped}", count)
                 continue
-            questions: dict = {}
-            for i in range(len(batch)):
-                questions.update(board_questions(kind, i))
-            ans = jev(self.est, {"entries": {f"i{i}": board_entry(kind, texts[k]) for i, k in enumerate(batch)}},
-                      questions, why=why or f"board:{self.repo}:{kind}", cache=False)
+            state, questions, _ = self.request(kind, batch, texts)
+            ans = jev(self.est, state, questions, why=why or f"board:{self.repo}:{kind}", cache=False)
             self.requests += 1
             if ans is None:
                 err = JEV_ERROR or "no reason given"
@@ -4302,7 +4322,7 @@ def cmd_board(a) -> None:
             w.writerows(["", p.action, p.bead, p.target, f"{p.p:.4f}", p.note] for p in proposals)
         print(f"report: {report}\nproposals: {home / 'proposals.tsv'} ({len(proposals)}; mark the rows you approve "
               f"with y, then `curia board emit --repo {repo}`)")
-    unanswered = {r: n for r, n in asker.skipped.items() if not r.startswith(("excluded", "empty"))}
+    unanswered = {r: n for r, n in asker.skipped.items() if not r.startswith(("excluded", "empty", "too long"))}
     if unanswered:
         print("curia: jev unavailable for " + "; ".join(f"{n} item(s) ({r})" for r, n in unanswered.items()),
               file=sys.stderr)
@@ -6303,8 +6323,8 @@ its target, a landed close's note must be the short shas propose wrote
 row and never both closed and another row's target. One bad row and no
 line is printed. It needs no jev.
 
-The fences stand in front of every request, on every action, whoever
-asks: a bead carrying a label in estate.toml board_exclude_labels (default:
+The fences stand in front of every request, on every action, whoever asks:
+a bead carrying a label in estate.toml board_exclude_labels (default:
 security), or whose title or description holds a word in
 board_sensitive_words (default: security, secret, credential, password;
 plurals match too), is never asked about, alone or in a pair, and commit
@@ -6312,20 +6332,23 @@ lines get the same word screen. Where repos.toml names name_digests for
 the repo (a JSON file, path relative to the repo, whose "digests" are
 SHA-256 digests of names lower-cased, with every run of other characters
 one space), text in which a window of one to four words matches one is
-never sent either; named but missing or empty, every action but emit
-refuses before reading anything (the screen fails closed). Not named, the
-report says no name screen ran. Two more keys in estate.toml:
-board_summary_heading (the heading a bead's description puts its plain
-summary under, as it stands on its line: a bead without one is flagged,
-and the summary weighs in the pairing) and board_waiting_labels (labels
-besides human_labels that say a bead waits on someone, for the flags).
+never sent either; named but missing, empty, or holding an entry that is
+not such a digest, every action but emit refuses before reading anything
+(the screen fails closed). Not named, the report says no name screen ran.
+A bead is screened whole and as the window a request carries. Two more
+keys in estate.toml: board_summary_heading (the heading a bead's
+description puts its plain summary under, as it stands on its line: a bead
+without one is flagged, and the summary weighs in the pairing) and
+board_waiting_labels (labels besides human_labels that say a bead waits on
+someone, for the flags).
 
 propose, calibrate and check need jev (`curia help jev`). Every title,
 description and commit line asked about is sent to that service, several
-beads to a request, sized to fit one, and every call is a line in
-brain/jev/calls.log with why=board:<repo>:<pass>. Off, those three refuse
-and read nothing. On and failing, what was not answered is listed with
-the reason and proposes nothing, and a refused key stops the asking.
+beads to a request, measured as sent to stay within one (an item too long
+for a request of its own is left out and listed), and every call is a line
+in brain/jev/calls.log with why=board:<repo>:<pass>. Off, those three
+refuse and read nothing. On and failing, what was not answered is listed
+with the reason and proposes nothing, and a refused key stops the asking.
 brain/board/<repo>/ is gitignored but for thresholds.json.""",
     "prime": """\
 Print the system prompt the seat would wake with: charter, last handoff,

@@ -250,7 +250,8 @@ def test_a_name_digest_hit_is_never_sent_and_a_named_set_that_does_not_load_fail
     assert "- 1 bead(s) never asked about: name digest" in report and "- name screen: names.json, 1 digest(s)" in report
     assert INVENTED_NAME not in json.dumps([c["state"] for c in calls]).lower()
     assert curia.BoardScreen([], [], frozenset(), "").text("a plain entry") is not None   # an empty set passes nothing
-    for payload in (None, {"digests": []}, {}):
+    # missing, empty, no digests key, and a name written in plain (it would screen nothing)
+    for payload in (None, {"digests": []}, {}, {"digests": [DIGESTS[0], INVENTED_NAME]}):
         (estate.root / "alpha" / "names.json").unlink(missing_ok=True)
         if payload is not None:
             (estate.root / "alpha" / "names.json").write_text(json.dumps(payload))
@@ -261,6 +262,29 @@ def test_a_name_digest_hit_is_never_sent_and_a_named_set_that_does_not_load_fail
             rc, _, err = cli(*E(estate), "board", *args, "--repo", "alpha")
             assert rc == 2 and "fails closed" in err, (payload, args)
         assert len(calls) == n and sorted((estate.dir / "brain" / "board" / "alpha").iterdir()) == before
+        rc, out, err = cli(*E(estate), "board", "emit", "--repo", "alpha")   # emit sends nothing: it still works
+        assert rc == 0 and out.startswith("# 0 approved row(s)"), err
+
+
+def test_the_name_screen_reads_commit_lines_words_split_by_punctuation_and_the_window_as_sent(curia, estate,
+                                                                                             monkeypatch):
+    name_digests(estate, digests=[*DIGESTS, hashlib.sha256(b"zorba ville").hexdigest()])
+    calls = board_jev(curia, estate, monkeypatch)
+    est = curia.Estate(estate.dir)   # repos.toml moved on disk
+    screen = curia.board_screen(est, "alpha")
+    asker = curia.BoardAsker(est, "alpha", screen)
+    tri = curia.board_triage(est, asker, BOARD, [f"abc1234 2026-09-10 al-ccc3 CLOSED for {INVENTED_NAME.upper()}-Works"],
+                             ["landed"])
+    assert tri.landed == [] and asker.skipped == {"excluded: name digest": 1}
+    plain, split = curia.board_beads(est, [row("al-p1", "Crane load table reads the wrong column"),
+                                           row("al-p2", "Load table for cranes at Zorba-Ville reads the wrong column")])
+    assert asker.ask("pairs", [([plain, split], [])]) == [None]
+    # a first paragraph over the window is cut inside a word: the whole title holds "<name>x", the window the name
+    title = "a-" * 1495 + INVENTED_NAME + "x more"
+    (cut,) = curia.board_beads(est, [row("al-cut1", title)])
+    assert cut.window.endswith(INVENTED_NAME) and screen.text(cut.text) is None
+    assert screen.bead(cut) == "name digest" and asker.ask("beads", [([cut], [])]) == [None]
+    assert calls == []
 
 
 # -------------------------------------------------------------------- the board
@@ -441,6 +465,11 @@ def test_a_jev_model_move_misses_the_cache_and_drops_the_thresholds(curia, cli, 
     assert "measured against questions 'older-words'" in err
 
 
+def sent_size(curia, call):
+    """The body jev() would send, as it measures it."""
+    return len(json.dumps({"model": curia.JEV_MODEL, "state": call["state"], "questions": call["questions"]}))
+
+
 def test_requests_are_batched_to_fit_one_judgment(curia, cli, estate, monkeypatch):
     many = [row(f"al-{n:03d}x", f"Entry number {n} about topic {n}", "word " * 560) for n in range(20)]
     commit_board(estate, many)
@@ -449,7 +478,20 @@ def test_requests_are_batched_to_fit_one_judgment(curia, cli, estate, monkeypatc
     assert sum(len(c["state"]["entries"]) for c in calls) == 20 and len(calls) < 20
     for c in calls:
         assert len(c["state"]["entries"]) <= curia.BOARD_BATCH
-        assert len(json.dumps(c["state"])) + len(json.dumps(c["questions"])) <= curia.JEV_CHARS
+        assert sent_size(curia, c) <= curia.JEV_CHARS
+
+
+def test_an_item_too_long_for_one_request_is_not_sent_and_says_so(curia, estate, monkeypatch):
+    """A window is cut in characters, and a character outside the basic plane is twelve once escaped:
+    a pair of such windows is past JEV_CHARS on its own, and is left out rather than sent."""
+    calls = board_jev(curia, estate, monkeypatch)
+    asker = curia.BoardAsker(estate, "alpha", curia.board_screen(estate, "alpha"))
+    wide = [curia.Bead(f"al-w{n}", f"Wide {n}", "\U0001F600" * 2990) for n in range(2)]
+    plain = curia.board_beads(estate, BOARD[:2])
+    got = asker.ask("pairs", [(wide, []), (plain, [])])
+    assert got[0] is None and got[1] is not None and len(calls) == 1
+    assert asker.skipped == {f"too long for one request (over {curia.JEV_CHARS} characters as sent)": 1}
+    assert all(sent_size(curia, c) <= curia.JEV_CHARS for c in calls)
 
 
 def test_the_repo_is_the_one_you_are_in_unless_named(curia, cli, estate, monkeypatch, tmp_path):
