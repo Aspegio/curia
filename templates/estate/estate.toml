@@ -92,3 +92,22 @@ context_at = 60
 # Labels that say a bead waits on a person. `launch --everything` leaves those
 # beads alone and stops when nothing else remains.
 human_labels = ["needs-principal", "needs-human", "blocked-by-human"]
+
+# What a seat session lists of the skills and plugins installed on its account,
+# passed with --settings like the hooks; nothing edits an account's settings.json.
+# Each skill in the listing costs context at every turn of every seat, whether or
+# not the seat ever calls it. A state is Claude Code's: on (listed with its
+# description), name-only (listed by name, still callable), user-invocable-only
+# (the principal can type it, the seat cannot see it), off. A pattern matches the
+# skills installed on the account a launch resolves to; Claude Code's bundled
+# skills and a repo's own are touched only when named exactly. A seat's roster
+# `skills` and `plugins` are read first. The mechanism's own skills (/handoff)
+# are listed in full whatever this says; a plugin's skills answer only to
+# [plugins]. Tables go last in this file: every key after a table header is
+# the table's. `curia help launch` has the rest; `launch --print-cmd` counts it.
+# [skills]
+# "<skill>-*" = "off"
+# "*" = "name-only"
+#
+# [plugins]
+# "<plugin>@<marketplace>" = false

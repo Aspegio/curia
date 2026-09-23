@@ -475,6 +475,112 @@ def test_status_shows_who_is_awake(curia, cli, estate):
     assert "no report written" in lines["lictor"]
 
 
+# ------------------------------------------------------------------ skill listing
+
+def install_skill(cfg, name, synced=""):
+    d = cfg / "skills" / ("synced/" + synced if synced else "") / name
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(f"---\nname: {name}\n---\n")
+
+
+def settings_of(cmd):
+    return json.loads(cmd[cmd.index("--settings") + 1])
+
+
+def record_claude(curia, monkeypatch):
+    seen = {}
+
+    def fake(cmd, cwd, env, timeout=None, capture=False, watch=None):
+        seen["cmd"] = cmd
+        return completed(cmd, 0, result_json("ok")) if capture else 0
+    monkeypatch.setattr(curia, "invoke_claude", fake)
+    return seen
+
+
+LISTING = '''
+[skills]
+"scrape-*" = "off"
+"*" = "name-only"
+"handoff" = "off"
+"bundled-helper" = "name-only"
+
+[plugins]
+"shop@market" = false
+"tool@market" = false
+'''
+
+
+def with_listing(estate):
+    (estate.dir / "estate.toml").write_text((estate.dir / "estate.toml").read_text() + LISTING)
+    roster = (estate.dir / "roster.toml").read_text().replace(
+        'jurisdiction = ["the one concern"]',
+        'jurisdiction = ["the one concern"]\nskills = { "scrape-web" = "on", "deck" = "on" }\n'
+        'plugins = { "tool@market" = true }')
+    (estate.dir / "roster.toml").write_text(roster)
+
+
+def test_no_listing_in_the_estate_leaves_the_settings_as_they_were(curia, cli, estate, monkeypatch, tmp_path):
+    install_skill(tmp_path / "acct-a", "scrape-web")
+    seen = record_claude(curia, monkeypatch)
+    assert cli(*E(estate), "launch", "muse")[0] == 0
+    assert set(settings_of(seen["cmd"])) == {"hooks", "statusLine"}
+    (estate.dir / "prompts" / "b.md").write_text("do\n")
+    assert cli(*E(estate), "run", "muse", "--prompt", "b.md")[0] == 0
+    assert set(settings_of(seen["cmd"])) == {"hooks"}
+    rc, out, _ = cli(*E(estate), "launch", "muse", "--print-cmd")
+    assert rc == 0 and "; skills" not in out and "; plugins" not in out
+
+
+def test_the_listing_expands_on_the_account_the_launch_resolved(curia, cli, estate, monkeypatch, tmp_path):
+    a = tmp_path / "acct-a"
+    for n in ("scrape-web", "scrape-pdf", "deck"):
+        install_skill(a, n)
+    install_skill(a, "sheet", synced="set-1")
+    (a / "skills" / "synced" / "set-1" / "manifest.json").write_text("{}")
+    with_listing(estate)
+    seen = record_claude(curia, monkeypatch)
+    assert cli(*E(estate), "launch", "muse")[0] == 0
+    s = settings_of(seen["cmd"])
+    # the seat's exact names first, then the estate's longest pattern; a name given exactly passes as given
+    assert s["skillOverrides"] == {"bundled-helper": "name-only", "deck": "on", "scrape-pdf": "off",
+                                   "scrape-web": "on", "sheet": "name-only", "handoff": "on"}
+    assert s["enabledPlugins"] == {"shop@market": False, "tool@market": True}
+    assert "PreCompact" in s["hooks"] and "statusLine" in s
+    # a seat with no table of its own takes the estate's; headless the same, on the run's account
+    (estate.dir / "prompts" / "b.md").write_text("do\n")
+    assert cli(*E(estate), "run", "warden", "--prompt", "b.md")[0] == 0
+    s = settings_of(seen["cmd"])
+    assert s["skillOverrides"]["scrape-web"] == "off" and s["skillOverrides"]["deck"] == "name-only"
+    assert s["skillOverrides"]["handoff"] == "on" and s["enabledPlugins"] == {"shop@market": False, "tool@market": False}
+    # another account has other skills: the patterns match what is installed there
+    assert cli(*E(estate), "launch", "muse", "--account", "b")[0] == 0
+    assert settings_of(seen["cmd"])["skillOverrides"] == {"bundled-helper": "name-only", "deck": "on",
+                                                          "scrape-web": "on", "handoff": "on"}
+    rc, out, _ = cli(*E(estate), "launch", "muse", "--print-cmd")
+    assert rc == 0 and "; skills 3 on, 2 name-only, 1 off; plugins shop@market off, tool@market on>" in out
+    rc, out, _ = cli(*E(estate), "run", "warden", "--prompt", "b.md", "--print-cmd")
+    assert rc == 0 and "; skills 1 on, 3 name-only, 2 off;" in out
+
+
+def test_a_listing_claude_code_would_not_read_is_refused(curia, cli, estate, monkeypatch, tmp_path):
+    install_skill(tmp_path / "acct-a", "scrape-web")
+    (estate.dir / "estate.toml").write_text((estate.dir / "estate.toml").read_text()
+                                            + '\n[skills]\n"*" = "hidden"\n"nothing-*" = "off"\n"handoff" = "off"\n')
+    seen = record_claude(curia, monkeypatch)
+    rc, _, err = cli(*E(estate), "launch", "muse")
+    assert rc != 0 and "'*' = 'hidden' is not a state Claude Code takes" in err and "cmd" not in seen
+    rc, out, _ = cli(*E(estate), "check")
+    assert rc == 1 and "! estate.toml: skills '*' = 'hidden'" in out
+    assert "estate.toml: skills pattern 'nothing-*' matches no skill installed on any account" in out
+    assert "estate.toml: skills names 'handoff', the mechanism's own" in out
+    roster = (estate.dir / "roster.toml").read_text().replace(
+        'jurisdiction = ["the one concern"]', 'jurisdiction = ["the one concern"]\nplugins = { "shop" = "no" }')
+    (estate.dir / "roster.toml").write_text(roster)
+    rc, out, _ = cli(*E(estate), "check")
+    assert "! seat muse: plugins 'shop' = 'no' must be true or false" in out
+    assert "! seat muse: plugins 'shop' is not <plugin>@<marketplace>" in out
+
+
 # ------------------------------------------------------------------ rename
 
 def test_rename_keeps_the_seat_memory(curia, cli, estate):

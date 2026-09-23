@@ -16,6 +16,9 @@
 # (headless: this list or the default; interactive: only when listed).
 # effort = "low" | "medium" | "high" | "xhigh" | "max" is passed to Claude Code
 # as --effort: a reviewer pool can run low and an office high.
+# skills = { "<skill>" = "on" } and plugins = { "<plugin>@<marketplace>" = true }
+# are this seat's listing over estate.toml's [skills] and [plugins]: a seat
+# takes back in full what the estate lists by name only or hides.
 # active = false parks a seat: launch, run, dispatch and a broadcast mail pass
 # it by, status marks it, its memory stays. Each seat costs its wakings; a
 # roster shrinks by parking before it shrinks by deleting.

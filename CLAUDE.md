@@ -195,6 +195,12 @@ weaken it to get green.
   resolved to - so linking into one config dir by hand leaves every seat on
   every other account without them (which is how `/handoff` went missing for a
   whole account's seats). Launch is the moment the account is known; link there.
+  What a session LISTS is the estate's to say, and is decided there too:
+  estate.toml `[skills]`/`[plugins]` and a seat's own, carried in `--settings`
+  as Claude Code's `skillOverrides`/`enabledPlugins`, patterns matched against
+  the resolved account, never written into it. The mechanism's skills are
+  always listed in full. Judgment does not choose the listing; if it ever
+  does, its floor is name-only (still callable), never off.
 - A shape is where an estate starts, not what it is. `init --shape` lays
   down a roster, a charter per seat and the prompts and units that roster
   needs, and no more; afterwards the roster is the truth, and `check` asks

@@ -1034,6 +1034,7 @@ def cmd_check(a) -> None:
         if v.get("effort") and str(v["effort"]) not in EFFORT_LEVELS:
             problems.append(f"seat {k}: effort '{v['effort']}' is not one Claude Code takes "
                             f"({', '.join(EFFORT_LEVELS)})")
+        problems += listing_faults(f"seat {k}", v.get("skills"), v.get("plugins"))
         if not v.get("active", True):
             notes.append(f"seat {k}: parked (active = false); nothing wakes it and its memory stays")
         size = len(build_prime(est, k).encode())
@@ -1081,6 +1082,19 @@ def cmd_check(a) -> None:
         v = est.meta.get(key)
         if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
             problems.append(f"estate.toml {key} must be a number, not {v!r}")
+    problems += listing_faults("estate.toml", est.meta.get("skills"), est.meta.get("plugins"))
+    installed = set().union(*(account_skills(account_dir(est, k)) for k in est.accounts))
+    own = mechanism_skills()
+    for where, t in [("estate.toml", est.meta.get("skills"))] + [(f"seat {k}", v.get("skills"))
+                                                                  for k, v in est.roster.items()]:
+        if not isinstance(t, dict):
+            continue
+        for key, state in t.items():
+            if is_pattern(key) and not any(fnmatch.fnmatchcase(n, key) for n in installed):
+                notes.append(f"{where}: skills pattern '{key}' matches no skill installed on any account")
+            if key in own and state != "on":
+                notes.append(f"{where}: skills names '{key}', the mechanism's own; every seat lists it in full "
+                             "whatever the table says")
     for r in rulings(est):
         if not r["status"]:
             problems.append(f"ruling {r['slug']}: no `status:` line (one of {', '.join(RULING_STATUSES)})")
@@ -1107,9 +1121,7 @@ def cmd_check(a) -> None:
             problems.append(f"repo {k}: path {p} missing")
         elif not (p / ".beads" / "issues.jsonl").exists():
             problems.append(f"repo {k}: no .beads/issues.jsonl export (lictor is blind here)")
-    wanted = {d.name for d in (MECHANISM_DIR / "skills").iterdir()
-              if d.is_dir() and not d.name.startswith(".")} \
-        if (MECHANISM_DIR / "skills").is_dir() else set()
+    wanted = mechanism_skills()
     for k in est.accounts:
         cfg = account_dir(est, k)
         if not cfg.exists():
@@ -1209,15 +1221,118 @@ def hooks_summary(est: Estate, headless: bool = False) -> str:
             + (f" + {n} estate hook(s) from hooks.json" if n else ""))
 
 
-def seat_settings(est: Estate | None = None, headless: bool = False) -> str:
+# What a session lists of the skills on its account, in Claude Code's own words: a
+# skillOverrides state per skill. name-only keeps a skill callable by name without its
+# description; off hides it from the seat altogether.
+SKILL_STATES = ("on", "name-only", "user-invocable-only", "off")
+
+
+def mechanism_skills() -> set[str]:
+    """The skills every seat gets from here (skills/), linked in at launch."""
+    home = MECHANISM_DIR / "skills"
+    return {d.name for d in home.iterdir() if d.is_dir() and not d.name.startswith(".")} if home.is_dir() else set()
+
+
+def account_skills(cfg: Path) -> set[str]:
+    """The skills installed on an account, by the names Claude Code lists them
+    under: each in $CLAUDE_CONFIG_DIR/skills, and each synced from claude.ai
+    (skills/synced/<set>/<name>/). A pattern in a listing matches these. Claude
+    Code's bundled skills and a repo's own are not on the account, so only a
+    name given exactly reaches them."""
+    root = cfg / "skills"
+    names: set[str] = set()
+    if not root.is_dir():
+        return names
+    for d in root.iterdir():
+        if d.name.startswith("."):
+            continue
+        if d.name == "synced" and d.is_dir():
+            names |= {x.name for s in d.iterdir() if s.is_dir() for x in s.iterdir() if (x / "SKILL.md").is_file()}
+        elif (d / "SKILL.md").is_file():
+            names.add(d.name)
+    return names
+
+
+def is_pattern(key: str) -> bool:
+    return any(c in key for c in "*?[")
+
+
+def listing_faults(where: str, skills, plugins) -> list[str]:
+    """What is wrong with one `skills` and one `plugins` table - estate.toml's,
+    or a seat's in the roster - in words `check` and a launch both print."""
+    out = []
+    if skills is not None and not isinstance(skills, dict):
+        out.append(f"{where}: skills must be a table of skill name or pattern = state, not {skills!r}")
+    elif skills:
+        out += [f"{where}: skills '{k}' = {v!r} is not a state Claude Code takes ({', '.join(SKILL_STATES)})"
+                for k, v in skills.items() if v not in SKILL_STATES]
+    if plugins is not None and not isinstance(plugins, dict):
+        out.append(f'{where}: plugins must be a table of "<plugin>@<marketplace>" = true or false, not {plugins!r}')
+    elif plugins:
+        out += [f"{where}: plugins '{k}' = {v!r} must be true or false" for k, v in plugins.items()
+                if not isinstance(v, bool)]
+        out += [f"{where}: plugins '{k}' is not <plugin>@<marketplace>, the only name Claude Code reads"
+                for k in plugins if "@" not in k]
+    return out
+
+
+def skill_state(name: str, tables: list[dict]) -> str | None:
+    """The state the first table to say anything gives a skill: its exact name,
+    else the longest pattern that matches. The seat's table comes before the
+    estate's, so a seat can take back what the estate turns off."""
+    for t in tables:
+        if name in t:
+            return t[name]
+        hits = [p for p in t if is_pattern(p) and fnmatch.fnmatchcase(name, p)]
+        if hits:
+            return t[max(hits, key=len)]
+    return None
+
+
+def skill_listing(est: Estate, seat: str, cfg: Path) -> tuple[dict[str, str], dict[str, bool]]:
+    """What a seat's session lists, as Claude Code's skillOverrides and
+    enabledPlugins: the roster's `skills` and `plugins` for the seat over
+    estate.toml's [skills] and [plugins]. Patterns expand against the account
+    the launch resolved; an exact name passes as given. The mechanism's own
+    skills are always listed in full, since a seat that cannot see /handoff
+    cannot end well. Neither table set means neither key: the settings are
+    what they were. A plugin's skills answer only to the plugin being off;
+    Claude Code does not read skillOverrides for them."""
+    name, s = est.seat(seat)
+    faults = (listing_faults("estate.toml", est.meta.get("skills"), est.meta.get("plugins"))
+              + listing_faults(f"seat {name}", s.get("skills"), s.get("plugins")))
+    if faults:
+        die("; ".join(faults))
+    tables = [t for t in (s.get("skills"), est.meta.get("skills")) if t]
+    overrides: dict[str, str] = {}
+    if tables:
+        for n in sorted(account_skills(cfg) | {k for t in tables for k in t if not is_pattern(k)}):
+            state = skill_state(n, tables)
+            if state:
+                overrides[n] = state
+        overrides.update({m: "on" for m in sorted(mechanism_skills())})
+    return overrides, {**(est.meta.get("plugins") or {}), **(s.get("plugins") or {})}
+
+
+def listing_summary(est: Estate, seat: str, cfg: Path) -> str:
+    """The listing a --print-cmd shows, counted: empty when the estate sets none."""
+    skills, plugins = skill_listing(est, seat, cfg)
+    counts = [f"{n} {state}" for state in SKILL_STATES if (n := sum(1 for v in skills.values() if v == state))]
+    return (("; skills " + ", ".join(counts) if counts else "")
+            + ("; plugins " + ", ".join(f"{k} {'on' if v else 'off'}" for k, v in plugins.items()) if plugins else ""))
+
+
+def seat_settings(est: Estate | None = None, headless: bool = False, seat: str | None = None,
+                  cfg: Path | None = None) -> str:
     """Settings a seat session carries, passed with --settings so no account's
     settings.json is edited. The mechanism's hooks: PreCompact turns a manual
     /compact into a reminder to hand off; Stop says when the shift is over;
     StopFailure on a rate limit marks the account and tells the launcher.
     Then whatever fences the estate declares in hooks.json. Interactively, a
-    status line that records what Claude Code measures. Auto-compaction is
-    not blocked, and nothing fires on a context threshold; no such hook
-    exists."""
+    status line that records what Claude Code measures. Where the estate sets
+    one, the skill listing for the seat on the account it resolved to
+    (skill_listing). Auto-compaction is not blocked, and nothing fires on a
+    context threshold; no such hook exists."""
     me = shlex.quote(str(Path(__file__).resolve()))
     hooks: dict = {
         "PreCompact": [{"matcher": "manual", "hooks": [{"type": "command", "command": f"{me} hook precompact"}]}],
@@ -1229,6 +1344,12 @@ def seat_settings(est: Estate | None = None, headless: bool = False) -> str:
     settings: dict = {"hooks": hooks}
     if not headless:
         settings["statusLine"] = {"type": "command", "command": f"{me} hook usage", "refreshInterval": 60}
+    if est and seat and cfg:
+        skills, plugins = skill_listing(est, seat, cfg)
+        if skills:
+            settings["skillOverrides"] = skills
+        if plugins:
+            settings["enabledPlugins"] = plugins
     return json.dumps(settings)
 
 
@@ -1641,7 +1762,8 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
               + " cwd=" + str(home))
         print("claude --name " + shlex.quote(title) + " --model " + s.get("model", "?") +
               " --session-id <new uuid> --append-system-prompt-file <prime:" +
-              str(len(build_prime(est, name))) + " chars> --settings <" + hooks_summary(est) + ">" +
+              str(len(build_prime(est, name))) + " chars> --settings <" + hooks_summary(est)
+              + listing_summary(est, name, cfg) + ">" +
               "".join(" " + x for x in envelope_args(s)) + " " + (shlex.quote(say) if say else ""))
         if len(repos) > 1:
             print("boards, in order: " + ", ".join(repos))
@@ -1817,7 +1939,8 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
         if loop or everything:
             env["CURIA_LOOP"] = "1"   # the shift hook may promise a relaunch only when there is one
         prime = prime_file(est, name, recalled=recall_for(est, name, recall_query(est, name, say)))
-        cmd = ["claude", "--name", title, "--append-system-prompt-file", str(prime), "--settings", seat_settings(est)]
+        cmd = ["claude", "--name", title, "--append-system-prompt-file", str(prime),
+               "--settings", seat_settings(est, seat=name, cfg=cfg)]
         sid = str(uuid.uuid4())
         cmd += ["--session-id", sid]
         if s.get("model"):
@@ -1936,7 +2059,7 @@ def cmd_run(a) -> None:
               (f" (fallback {s['fallback_model']} on a limit)" if s.get("fallback_model") else "") +
               (" --dangerously-skip-permissions" if a.skip_permissions else "") +
               "".join(" " + x for x in envelope_args(s, headless=True, skip_permissions=a.skip_permissions)) +
-              " --settings <" + hooks_summary(est, headless=True) + ">")
+              " --settings <" + hooks_summary(est, headless=True) + listing_summary(est, name, cfg) + ">")
         return
     beads = [b for x in (a.bead or []) for b in x.split(",") if b.strip()]
     if not beads and subs.get("bead"):
@@ -2093,7 +2216,7 @@ def run_headless(est: Estate, name: str, s: dict, prompt: str, cwd: Path,
                                        if seconded else "")
         cmd = ["claude", "-p", prompt + orders, "--session-id", sid,
                "--output-format", "json", "--append-system-prompt-file", str(prime),
-               "--settings", seat_settings(est, headless=True)]
+               "--settings", seat_settings(est, headless=True, seat=name, cfg=cfg)]
         if model_now:
             cmd += ["--model", model_now]
         if skip_permissions:
@@ -6064,7 +6187,10 @@ four still carries template text; hooks.json, if present,
 is a settings-shaped {"hooks": {...}}; every ruling in brain/rulings/ has a
 status from the lifecycle (proposed, advisory, enacted, enforced, retired)
 and one marked enforced names what enforces it; a roster `effort` is one
-Claude Code takes (low, medium, high, xhigh, max); the rotation thresholds
+Claude Code takes (low, medium, high, xhigh, max); a `skills` table
+(estate.toml's or a seat's) gives each entry a state Claude Code takes
+(on, name-only, user-invocable-only, off) and a `plugins` table maps
+"<plugin>@<marketplace>" to true or false; the rotation thresholds
 in estate.toml are numbers; claude and gh are on PATH. Prints what is
 wrong (marked !) and exits 1; fixes nothing.
 
@@ -6079,7 +6205,10 @@ pooled account: the principal's own are, and a client's dedicated one must
 never be), an enacted ruling that nothing enforces yet, an account
 currently marked limited, a seat still named example_* from the template,
 template text left in estate.toml or roster.toml, a parked seat (active =
-false: nothing wakes it, its memory stays), hooks.json declaring more
+false: nothing wakes it, its memory stays), a `skills` pattern that
+matches no skill installed on any account (a typo, or a skill since
+removed), a `skills` table naming one of the mechanism's own skills
+(listed in full whatever it says), hooks.json declaring more
 fences than fences_max (estate.toml; default 20: fences are distrust
 written down, and past a point no work is legal; `curia lictor` says
 which are idle and which are busy), and a seat whose prime (charter,
@@ -6454,8 +6583,8 @@ command rather than guess; --estate, CURIA_ESTATE, or a naming family of
 the estate's own settles it. The session carries CURIA_ESTATE and
 CURIA_SEAT, so every curia command the seat runs inside it - dispatch,
 mail, handoff - binds to its estate whatever directory it has moved to.
---print-cmd shows the estate, the account, the seat and the directory a
-launch would use, and launches nothing.
+--print-cmd shows the estate, the account, the seat, the directory and
+the skill listing a launch would use, and launches nothing.
 
 Fleet seats and parked seats refuse to launch; fleet is dispatched by its
 office, and a parked seat (active = false in the roster) is kept with its
@@ -6575,6 +6704,24 @@ account's settings.json is edited: the mechanism's, which refuses a manual
 the principal allows one), then whatever fences the estate declares in
 curia/hooks.json. Auto-compaction is not blocked.
 
+The same settings carry the skill listing, where the estate sets one, in
+Claude Code's own terms. estate.toml [skills] maps a skill name or a
+pattern (<prefix>-*, or * for all) to a state: on (listed with its
+description), name-only (listed by name and still callable, its
+description left out), user-invocable-only (the principal can type it;
+the seat cannot see it) or off. A seat's roster `skills` table is read
+first and can take back what the estate turns off; an exact name beats a
+pattern, and the longest pattern wins. Patterns match the skills
+installed on the account the launch resolved to (its skills/ directory,
+synced skills included); Claude Code's bundled skills and a repo's own
+skills are touched only when named exactly. [plugins] maps
+"<plugin>@<marketplace>" to true or false, per seat too, and is the only
+way to hide a plugin's skills: Claude Code does not apply [skills] to
+them. The mechanism's own skills (/handoff) are always listed in full.
+With neither table set nothing is passed, and the account lists what it
+always did. --print-cmd counts the listing. Nothing here edits an
+account's settings.json or moves a skill.
+
 The authority envelope comes from the roster: `disallowed_tools` are
 refused for the whole session, in every session, and that is the fence;
 `tools`, when the roster names a list, are allowed without asking.
@@ -6615,7 +6762,7 @@ model left it, and the journal entry opens with `seconded: <model>` so the
 next waking knows whose notes it reads; the start line in sessions.log
 says `seconded` too. A roster `effort` rides along as --effort. A parked
 seat (active = false) is not run. --print-cmd shows the resolved account,
-model, cwd and prompt size and runs nothing.
+model, cwd, prompt size and skill listing, and runs nothing.
 
 The run is a process of its own. The mechanism forks it free of the shell
 that asked for it - a new session, reparented to init, stdout and stderr to
@@ -6644,8 +6791,10 @@ passed to claude, so the start line carries it too (with the launcher's
 pid), and `status` can total the spend by account and seat. Only the seat's
 answer is printed. The exit status is non-zero when the run failed.
 
-The run carries the same hooks and authority envelope as a launch: the
-mechanism's hooks, the estate's hooks.json, `--allowedTools` from the
+The run carries the same hooks, skill listing and authority envelope as a
+launch: the mechanism's hooks, the estate's hooks.json, the [skills] and
+[plugins] listing for the account the run resolved to (`curia help
+launch`), `--allowedTools` from the
 roster's `tools` (or the default list) and `--disallowedTools` from
 `disallowed_tools`. Print mode has no status line, and the run sets
 CURIA_HEADLESS, so the shift hook says nothing; the limited hook still
@@ -7025,7 +7174,7 @@ examples:
   curia launch <seat> --loop           the overnight shape: relaunch on /handoff, and after a mid-session limit
   cd <repo> && curia launch <seat>     the seat starts in the repo you are in
   curia launch <seat> --repo <repo>    name the repo from anywhere
-  curia launch <seat> --print-cmd      show account, cwd and prompt without launching
+  curia launch <seat> --print-cmd      show account, cwd, prompt and skill listing without launching
   curia --estate <path> launch <seat>  the seat's name is on two estates and you are outside both
   curia launch <seat> --account <acct> start on a named account, not the seat's usual
   curia launch <seat> --loop --say "..."  wake it with orders and relaunch on /handoff
@@ -7038,7 +7187,7 @@ examples:
   curia run <seat> --prompt <name>.md --repo <repo>
   curia run <seat> --prompt /tmp/oneoff.md --set date=2026-01-01
   curia run <crew> --prompt /abs/brief.md --repo <repo>   an office waking a crew seat on the crew seat's account
-  curia run <seat> --prompt <name>.md --print-cmd   show account, model and cwd; run nothing
+  curia run <seat> --prompt <name>.md --print-cmd   show account, model, cwd and skill listing; run nothing
   curia run <crew> --prompt /abs/brief.md --model <model>   this run on another model (say why in the handoff)
   curia run <crew> --prompt /abs/brief.md --repo <repo> --detach   back at once; read brain/<crew>/ when sessions.log ends""",
     "limit": """\
@@ -7354,7 +7503,7 @@ def main() -> None:
     p.add_argument("--budget", help="end the night when recorded spend reaches this USD amount; "
                    "requires --loop or --everything")
     p.add_argument("--print-cmd", dest="print_cmd", action="store_true",
-                   help="show the estate, account, cwd and command that would run, without launching")
+                   help="show the estate, account, cwd, command and skill listing that would run, without launching")
     p.set_defaults(fn=cmd_launch)
 
     p = parser("run", "headless run of a seat with a prompt file; how an office wakes a crew seat")
@@ -7373,7 +7522,7 @@ def main() -> None:
     p.add_argument("--detach", action="store_true",
                    help="return at once with the pid and the log path; the run (its own process either way) "
                         "finishes its record without you. Default: wait and print the answer when it ends")
-    p.add_argument("--print-cmd", dest="print_cmd", action="store_true", help="show account, model, cwd and prompt size without running")
+    p.add_argument("--print-cmd", dest="print_cmd", action="store_true", help="show account, model, cwd, prompt size and skill listing without running")
     p.set_defaults(fn=cmd_run)
 
     p = parser("dispatch", "give a fleet worker a worktree of its own and a job there; --review adds a reviewer")
