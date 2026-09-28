@@ -36,6 +36,13 @@ weaken it to get green.
 - `templates/handoff.md` - the note shape a seat writes at sleep
 - `templates/ruling.md` - the shape of a ruling: `status:` and `enforced by:` lines the
   mechanism reads, then what, why, what enforces it
+- `docs/` - the public landing page at curia.build: `index.html`, one
+  self-contained file, and `media/`, the film's web encode and posters.
+  `deploy.sh` ships it as a Cloudflare Worker with static assets
+  (`worker.js` only answers range requests for `media/`), writing the
+  `/github` redirect from the git remote into the upload, so the org is never
+  named here. Run wrangler from outside the repo: its `.wrangler/` cache
+  holds the account owner's name, and the fence reads it like any other file
 - `tests/test_jev.py` - the judgment seam and everything built on it, all faked
 - `tests/` - the fence, plus `conftest.py`, which builds a scratch estate from
   the template with a fake `claude`, and `test_cli.py` on top of it
@@ -219,6 +226,18 @@ weaken it to get green.
   repo, and `ingest` treats the estate root as plain home, not a repo hint.
   Discovery still needs no particular directory; this is about where a seat
   starts, not whether it can.
+- Claude Code is the only harness today, and not forever. The direction is
+  an estate that runs with no Claude Code at all (Codex, OpenCode, Pi,
+  Grok Build): crew, offices and nights alike, on one harness. The work is
+  deferred and taken up as needed; `specs/2026-09-04-harness-seam.html`
+  maps it. Until then, do not deepen the coupling: keep Claude-specific
+  reaches inside `seat_settings`, `invoke_claude`, `headless_result`,
+  `ensure_skills` and `resolve_account`, not spread through commands.
+  Where a commitment above names a Claude Code mechanism (`--settings`, the
+  status line, StopFailure), the principle is what binds and the mechanism
+  is today's way of keeping it; another harness keeps it its own way or
+  says in help that it cannot. An unset harness will mean Claude Code, so
+  existing estates and printed commands do not move.
 
 ## State that lives outside this repo
 

@@ -1,12 +1,68 @@
-# curia
+<p align="center">
+  <a href="https://curia.build/#film"><img src="docs/media/curia-poster.jpg" alt="Curia: From Factory to Society. Watch the film (4:37)" width="760"></a>
+</p>
 
-The mechanism for a seat-based agent estate. Mechanism, not law.
+<h1 align="center">CVRIA</h1>
 
-An **estate** is one client's workspace. Its `curia/` directory holds the
+<p align="center"><b>The mechanism for a software society.</b><br>
+Persistent seats for your Claude Code agents: memory they write themselves,
+offices that keep order, account fallback that survives the night, and law with teeth.</p>
+
+<p align="center">
+  <a href="https://curia.build">curia.build</a> ·
+  <a href="https://curia.build/#film">the film</a> ·
+  <a href="#install">install</a> ·
+  <a href="#vocabulary">vocabulary</a> ·
+  <a href="LICENSE">MIT</a>
+</p>
+
+<p align="center"><sub>one Python file · standard library only · your estate holds the rest</sub></p>
+
+---
+
+Run a software factory long enough and its hardest problems stop being about
+code. They are older than software, and each has an answer here:
+
+| The factory's trouble | Curia's remedy |
+|---|---|
+| **Forgetting.** Every session starts from nothing, and compaction swaps what it knew for a summary. | **Seats.** A named role that outlives every session. It wakes primed with its charter, its authority, its last handoff and its mail, and hands off in its own words before its context fills. |
+| **Want.** At two in the morning the account runs dry, and every agent on it stops. | **The chain.** Each launch takes the first account with headroom, read from what Claude Code itself measures. A seat cut off mid-task restarts on the next, told what happened. |
+| **Delay.** Agents idle on a build, and every message between them goes through you. | **Offices.** The Lictor watches every board and changes nothing, the Censor wakes a model only where a branch is failing, the Portcullis lands what is reviewed and green. Seats leave each other mail. |
+| **Custom.** The rules live in someone's head, so a new agent breaks them in good faith. | **Law.** Rulings say whether they are in force and name what enforces them. Fences are programs that refuse what the law forbids, in every seat session, and every refusal is counted. |
+
+> “Humanity has only one mature technology for coordinating mortal,
+> replaceable strangers via text — namely, law.”
+> — Steve Yegge, *Fences, not Sandboxes* (2026)
+
+Rome's senate met in a house called the Curia. Curia builds that house for your agents.
+
+### What a seat wakes up with
+
+```text
+$ curia launch praetor
+
+## Your charter      You hold the api backlog: its data layer, its migrations.
+## Your authority    May merge through the gate. Refused: push to release.
+## Your last handoff Orders table migrated. Next: read the retry ruling.
+## Mail (unread)     quaestor: the brief is in PR 412; start there.
+## Laurels           "The new import finally makes sense."
+```
+
+A seat looks its authority up instead of probing for it. Give an office the
+board with `--everything` and go to bed: it works the backlog waking after
+waking, and stops only on mechanical conditions (the board clear, the board
+unmoved for two wakings, `--until`, `--budget`). By morning its handoffs are
+waiting for you.
+
+## Mechanism, not law
+
+A city's law can't be downloaded, so Curia ships only the machinery. An
+**estate** is one client's workspace. Its `curia/` directory holds the
 roster (who the seats are), the manifest (which repos), the accounts (whose
 tokens), the seats' memory (charter, handoff, laurels) and the brain (rulings
 that span repos). That is the law, and it is bespoke: it names products,
-people and numbers. This repo holds only what every estate shares:
+people and numbers. Keep one estate per client, and they never mix. This repo
+holds only what every estate shares:
 
 - `bin/curia` - launch seats with their memory primed, run offices headless,
   the read-only Lictor report, the Censor sweep, account fallback, handoffs.
@@ -19,6 +75,11 @@ people and numbers. This repo holds only what every estate shares:
   products or its principal. The denylist is read from the estates
   registered in `~/.config/curia/estates.toml`, so the mechanism never has to
   know the names it is forbidden to know.
+
+Start with one seat and grow: `curia init <dir> --shape seat` (one seat you
+talk to), `crew` (seats with jurisdictions, watched and gated by the offices)
+or `factory` (an office dispatching a fleet, each worker in its own worktree).
+A shape is where an estate starts, not what it is.
 
 ## Vocabulary
 
@@ -42,7 +103,10 @@ people and numbers. This repo holds only what every estate shares:
 
 ## Install
 
+Needs Python 3.11+, [Claude Code](https://claude.com/claude-code) and git.
+
 ```sh
+git clone https://curia.build/github.git curia && cd curia
 ln -s "$PWD/bin/curia" ~/.local/bin/curia
 ln -s "$PWD/skills/handoff" ~/.claude/skills/handoff     # user-level skill
 ```
@@ -138,3 +202,8 @@ pool, which such estates share. Seats never roam between estates.
 - The night does not die on a limit: a seat's Stop hook says "hand off now" past a threshold, a shift length or a context depth (`context_at`), while it still has tokens to write the note; its StopFailure hook marks the account when a turn dies on the limit, and the looping launcher ends that session and relaunches on the fallback, telling the seat what happened and where the transcript is.
 - Fallback, not failure: an account at its limit hands its seats down the chain; a headless run marks the limit itself and retries, a looped seat waits it out.
 - The record is dated when it happens: the clock is read per event, never cached at start.
+
+## License
+
+[MIT](LICENSE). Quotations are from Steve Yegge's essays at yegge.ai (2026).
+Curia is an independent project, not affiliated with Anthropic.

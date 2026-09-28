@@ -1,0 +1,1385 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Curia · the mechanism for a software society</title>
+<meta name="description" content="Curia gives your Claude Code agents seats: named roles with memory they write themselves, offices that keep order, account fallback that survives the night, and law with teeth. One Python file, standard library only.">
+<!-- The public repository. curia.build/github redirects to it (deploy.sh writes the rule from the git
+     remote, so this repo never names the org). Left empty, it is read from a *.github.io address. -->
+<meta name="curia:repo" content="https://curia.build/github">
+<link rel="canonical" href="https://curia.build/">
+<meta property="og:url" content="https://curia.build/">
+<meta property="og:title" content="Curia · the mechanism for a software society">
+<meta property="og:description" content="Persistent seats for your Claude Code agents: memory, offices, account fallback and law. Open source.">
+<meta property="og:image" content="https://curia.build/media/curia-og.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://curia.build/media/curia-og.jpg">
+<meta name="theme-color" content="#110c0a">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 300 260'%3E%3Crect width='300' height='260' rx='40' fill='%23110c0a'/%3E%3Cg fill='none' stroke='%23d4af6a' stroke-width='16' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M40,64 H260 V76 H40 Z'/%3E%3Cpath d='M70,76 C70,150 230,160 232,232'/%3E%3Cpath d='M230,76 C230,150 70,160 68,232'/%3E%3Cpath d='M40,236 H98 M202,236 H260'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600;700&family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script>document.documentElement.classList.add('js')</script>
+<style>
+:root {
+  --stone: #110c0a;
+  --stone-lift: #1c1511;
+  --panel: rgba(24, 18, 14, 0.9);
+  --marble: #ede5d6;
+  --marble-dim: #b9ad99;
+  --muted: #8d806d;
+  --gold: #d4af6a;
+  --gold-light: #f2ddaa;
+  --gold-deep: #9c7738;
+  --hairline: rgba(212, 175, 106, 0.35);
+  --hairline-soft: rgba(212, 175, 106, 0.16);
+  --red: #c4523b;
+  --red-deep: #8e2f22;
+  --verdigris: #7fb49a;
+  --night: #0b1020;
+  --parchment: #ece0c2;
+  --ink: #3b2a17;
+
+  --serif: "Cormorant Garamond", "Iowan Old Style", Georgia, serif;
+  --caps: "Cinzel", "Trajan Pro", Georgia, serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --settle: cubic-bezier(0.16, 1, 0.3, 1);
+  --gentle: cubic-bezier(0.45, 0, 0.2, 1);
+  --gutter: 24px;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html { background: var(--stone); -webkit-text-size-adjust: 100%; }
+@media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
+body {
+  margin: 0;
+  color: var(--marble-dim);
+  font-family: var(--serif);
+  font-weight: 500;
+  font-size: 1.3rem;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden;
+}
+img, video, svg { display: block; max-width: 100%; }
+a { color: var(--gold-light); text-decoration-color: var(--hairline); text-underline-offset: 3px; }
+a:hover { text-decoration-color: var(--gold); }
+:focus-visible { outline: 1px solid var(--gold); outline-offset: 4px; }
+::selection { background: rgba(212, 175, 106, 0.35); color: var(--marble); }
+code, kbd { font-family: var(--mono); font-size: 0.78em; }
+p code, li code, dd code { font-size: 0.66em; vertical-align: 0.08em; color: var(--gold-light); background: rgba(212,175,106,0.08); border: 1px solid var(--hairline-soft); padding: 0.08em 0.4em; border-radius: 3px; white-space: nowrap; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+/* ── The hall: warm stone, marble veining, light from high windows, dust ── */
+.hall { position: fixed; inset: 0; z-index: -1; pointer-events: none; overflow: hidden; background: var(--stone); }
+.hall > * { position: absolute; inset: 0; }
+.hall .base { background: radial-gradient(ellipse 70% 60% at 50% 38%, #2b2019 0%, #19120e 55%, #0c0806 100%); }
+.hall .cool { opacity: 0; transition: opacity 1.6s var(--gentle); background: radial-gradient(ellipse 80% 70% at 50% 30%, #1a2342 0%, #0d1326 55%, #05070f 100%); }
+.hall .veins { width: 100%; height: 100%; opacity: 0.075; transition: opacity 1.6s var(--gentle); }
+.hall .beams { inset: auto; left: 0; top: 0; width: 100%; height: 100%; transition: opacity 1.6s var(--gentle); }
+.hall .beam { position: absolute; top: -30vh; height: 170vh; rotate: -28deg; filter: blur(28px);
+  background: linear-gradient(180deg, rgba(255,226,170,0.9) 0%, rgba(255,210,140,0.25) 55%, rgba(255,210,140,0) 100%); }
+.hall .beam:nth-child(1) { left: 9vw; width: 150px; opacity: 0.07; animation: breathe 9s var(--gentle) infinite alternate; }
+.hall .beam:nth-child(2) { left: 26vw; width: 180px; opacity: 0.055; animation: breathe 11s var(--gentle) -3s infinite alternate; }
+.hall .beam:nth-child(3) { left: 43vw; width: 210px; opacity: 0.04; animation: breathe 13s var(--gentle) -6s infinite alternate; }
+@keyframes breathe { to { opacity: 0.02; } }
+.hall canvas { width: 100%; height: 100%; }
+.hall .vignette { background: radial-gradient(ellipse 85% 80% at 50% 45%, rgba(0,0,0,0) 55%, rgba(0,0,0,0.72) 100%); }
+body.is-night .hall .cool { opacity: 1; }
+body.is-night .hall .veins { opacity: 0.03; }
+body.is-night .hall .beams { opacity: 0.15; }
+
+/* ── Layout ── */
+main, footer { overflow-x: clip; }
+.wrap { width: 100%; max-width: 1180px; margin: 0 auto; padding: 0 var(--gutter); }
+.narrow { max-width: 860px; }
+section { position: relative; padding: clamp(88px, 12vw, 150px) 0; scroll-margin-top: 40px; }
+@media (max-width: 600px) { :root { --gutter: 16px; } body { font-size: 1.22rem; } .hero .btns { flex-direction: column; align-items: center; } .hero .btn { width: min(100%, 320px); justify-content: center; } }
+
+/* ── Type ── */
+.chapter { display: flex; align-items: center; gap: 16px; font-family: var(--caps); font-size: 0.74rem; font-weight: 600; letter-spacing: 0.32em; color: var(--muted); text-transform: uppercase; margin: 0; }
+.chapter .num { color: var(--gold); font-weight: 700; letter-spacing: 0.12em; min-width: 1.5em; }
+.chapter .rule { width: 56px; height: 1px; background: var(--hairline); flex: none; }
+.h2 { font-family: var(--serif); font-weight: 500; font-size: clamp(2.3rem, 5vw, 4rem); line-height: 1.04; letter-spacing: -0.01em; color: var(--marble); margin: 0.45em 0 0.45em; text-wrap: balance; }
+.h2 em { font-style: italic; color: var(--gold-light); }
+.lede { font-size: clamp(1.28rem, 1.9vw, 1.5rem); line-height: 1.5; color: var(--marble-dim); max-width: 34em; margin: 0 0 1em; text-wrap: pretty; }
+.copy p { max-width: 32em; text-wrap: pretty; }
+.copy p + p { margin-top: -0.2em; }
+.gild { background: linear-gradient(180deg, var(--gold-light) 0%, var(--gold) 45%, var(--gold-deep) 100%); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.label { font-family: var(--caps); font-size: 0.72rem; font-weight: 600; letter-spacing: 0.3em; text-transform: uppercase; color: var(--gold); }
+.gloss { font-style: italic; color: var(--marble-dim); }
+.kicker { font-family: var(--caps); letter-spacing: 0.2em; font-size: 0.86rem; color: var(--gold-light); text-transform: uppercase; }
+.cmd-line { display: inline-flex; align-items: center; gap: 10px; font-family: var(--mono); font-size: 0.86rem; color: var(--gold-light); background: rgba(10,7,5,0.55); border: 1px solid var(--hairline-soft); border-radius: 4px; padding: 9px 14px; margin-top: 8px; max-width: 100%; overflow-x: auto; white-space: nowrap; }
+.cmd-line::before { content: "$"; color: var(--muted); }
+
+/* ── Buttons ── */
+.btns { display: flex; flex-wrap: wrap; gap: 14px; justify-content: center; }
+.btn { display: inline-flex; align-items: center; gap: 12px; font-family: var(--caps); font-size: 0.76rem; font-weight: 700; letter-spacing: 0.26em; text-transform: uppercase; text-decoration: none; padding: 17px 28px; border: 1px solid var(--hairline); color: var(--gold-light); background: rgba(17,12,10,0.4); cursor: pointer; transition: transform 0.5s var(--settle), box-shadow 0.5s var(--settle), border-color 0.3s, background 0.3s; }
+.btn:hover { border-color: var(--gold); background: rgba(212,175,106,0.08); transform: translateY(-2px); }
+.btn.primary { color: #1a120b; border-color: transparent; background: linear-gradient(180deg, #f0d79c 0%, #d4af6a 50%, #aa8443 100%); box-shadow: 0 0 0 1px rgba(242,221,170,0.3) inset, 0 10px 40px rgba(212,175,106,0.22); }
+.btn.primary:hover { box-shadow: 0 0 0 1px rgba(242,221,170,0.5) inset, 0 14px 60px rgba(212,175,106,0.38); }
+.btn svg { width: 14px; height: 14px; flex: none; }
+.btn .dur { font-family: var(--mono); font-weight: 500; letter-spacing: 0.04em; opacity: 0.7; }
+
+/* ── Nav ── */
+.nav { position: fixed; top: 0; left: 0; right: 0; z-index: 40; height: 64px; display: flex; align-items: center; transition: background 0.5s var(--gentle), border-color 0.5s, backdrop-filter 0.5s; border-bottom: 1px solid transparent; }
+.nav .wrap { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+.nav.solid { background: rgba(14, 10, 8, 0.74); -webkit-backdrop-filter: blur(14px) saturate(1.2); backdrop-filter: blur(14px) saturate(1.2); border-color: var(--hairline-soft); }
+.brand { display: flex; align-items: center; gap: 12px; text-decoration: none; opacity: 0; transform: translateY(-6px); transition: opacity 0.6s var(--settle), transform 0.6s var(--settle); }
+.nav.solid .brand { opacity: 1; transform: none; }
+.brand .mini { width: 34px; height: 34px; position: relative; }
+.brand .mini .laurel { position: absolute; inset: 0; width: 100%; height: 100%; }
+.brand .mini .ico { position: absolute; left: 9px; top: 9px; width: 16px; height: 14px; }
+.brand span { font-family: var(--caps); font-weight: 700; font-size: 1.05rem; letter-spacing: 0.28em; }
+.nav ul { display: flex; align-items: center; gap: 28px; list-style: none; margin: 0; padding: 0; }
+.nav ul a { font-family: var(--caps); font-size: 0.68rem; font-weight: 600; letter-spacing: 0.26em; text-transform: uppercase; color: var(--marble-dim); text-decoration: none; transition: color 0.3s; padding: 8px 0; position: relative; }
+.nav ul a::after { content: ""; position: absolute; left: 0; right: 0; bottom: 2px; height: 1px; background: var(--gold); transform: scaleX(0); transition: transform 0.5s var(--settle); }
+.nav ul a:hover, .nav ul a.on { color: var(--gold-light); }
+.nav ul a.on::after { transform: scaleX(1); }
+.nav .gh { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--hairline); padding: 8px 14px; color: var(--gold-light); }
+.nav .gh svg { width: 15px; height: 15px; }
+.nav .gh::after { display: none; }
+@media (max-width: 960px) { .nav ul li.opt { display: none; } }
+
+/* ── Hero ── */
+.hero { min-height: 100vh; min-height: 100svh; display: grid; place-items: center; text-align: center; padding: 100px 0 90px; }
+.mark { display: flex; flex-direction: column; align-items: center; }
+.wreath { position: relative; width: clamp(150px, min(26vw, 30vh), 290px); aspect-ratio: 1; }
+.wreath .laurel { position: absolute; inset: 0; width: 100%; height: 100%; }
+.wreath .sella { position: absolute; left: 50%; top: 47%; width: 42%; translate: -50% -50%; }
+.laurel .leaf { fill: var(--gold); }
+.laurel .stem, .laurel .ribbon { fill: none; stroke: var(--gold); stroke-width: 4; stroke-linecap: round; opacity: 0.9; }
+.sella g { fill: none; stroke: var(--gold); stroke-linecap: round; stroke-linejoin: round; }
+.cvria { display: flex; justify-content: center; margin: clamp(10px, 2vw, 22px) 0 0; padding-left: 0.22em; font-family: var(--caps); font-weight: 700; font-size: clamp(3.3rem, min(15.5vw, 17vh), 10.5rem); line-height: 1; letter-spacing: 0.22em; }
+.cvria span { display: inline-block; background: linear-gradient(180deg, var(--gold-light) 0%, var(--gold) 45%, var(--gold-deep) 100%); -webkit-background-clip: text; background-clip: text; color: transparent; filter: drop-shadow(0 0 14px rgba(242,221,170,0.3)); }
+.meander { display: block; margin: clamp(14px, 2.2vw, 26px) auto 0; width: min(560px, 78vw); height: 18px; opacity: 0.7; }
+.tagline { font-style: italic; font-size: clamp(1.55rem, 3.3vw, 2.5rem); color: var(--marble); margin: clamp(18px, 2.6vw, 30px) 0 10px; line-height: 1.2; }
+.for { font-family: var(--caps); font-weight: 600; font-size: clamp(0.7rem, 1.2vw, 0.9rem); letter-spacing: 0.34em; color: var(--gold); margin: 0 0 clamp(30px, 4vw, 46px); }
+.hero .fine { margin: 26px auto 0; font-family: var(--mono); font-size: 0.74rem; letter-spacing: 0.04em; color: var(--muted); }
+.scroll-cue { position: absolute; left: 50%; bottom: 26px; translate: -50% 0; display: flex; flex-direction: column; align-items: center; gap: 10px; font-family: var(--caps); font-size: 0.6rem; letter-spacing: 0.4em; color: var(--muted); text-decoration: none; }
+.scroll-cue i { width: 1px; height: 44px; background: linear-gradient(var(--gold), transparent); animation: drip 2.6s var(--gentle) infinite; transform-origin: top; }
+@media (max-height: 1000px) { .scroll-cue { display: none; } }
+@keyframes drip { 0% { transform: scaleY(0); opacity: 1; } 60% { transform: scaleY(1); opacity: 1; } 100% { transform: scaleY(1); opacity: 0; } }
+
+/* Hero entrance: the wreath grows, the seat draws, the letters are carved */
+.js .hero .laurel .leaf { animation: leaf 0.7s var(--settle) calc(0.2s + var(--i) * 55ms) both; }
+.js .hero .laurel .stem { stroke-dasharray: 1 1; animation: draw 1.1s var(--settle) 0.2s both; }
+.js .hero .laurel .ribbon { animation: fade 0.8s var(--settle) 0.25s both; }
+.js .hero .sella path, .js .hero .sella circle { stroke-dasharray: 1 1; animation: draw 1.7s var(--settle) 0.55s both; }
+.js .hero .cvria span { animation: carve 1.1s var(--settle) calc(1.05s + var(--i) * 0.1s) both; }
+.js .hero .meander { animation: fade 1.2s var(--settle) 1.7s both; }
+.js .hero .tagline { animation: rise 1.2s var(--settle) 1.95s both; }
+.js .hero .for { animation: rise 1.2s var(--settle) 2.15s both; }
+.js .hero .btns, .js .hero .fine { animation: rise 1.2s var(--settle) 2.35s both; }
+.js .hero .scroll-cue { animation: fade 1.2s var(--settle) 3s both; }
+@keyframes leaf { from { transform: scale(0); opacity: 0; } }
+@keyframes draw { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+@keyframes fade { from { opacity: 0; } }
+@keyframes rise { from { opacity: 0; transform: translateY(16px); filter: blur(4px); } }
+@keyframes carve { from { opacity: 0; filter: blur(9px) drop-shadow(0 0 0 rgba(242,221,170,0)); transform: translateY(6px); } 55% { opacity: 1; filter: blur(0) drop-shadow(0 0 30px rgba(242,221,170,0.45)); } to { opacity: 1; transform: none; filter: blur(0) drop-shadow(0 0 14px rgba(242,221,170,0.3)); } }
+
+/* ── Reveal on scroll ── */
+.js .rv { opacity: 0; transform: translateY(26px); filter: blur(6px); transition: opacity 1.1s var(--settle) var(--d, 0s), transform 1.1s var(--settle) var(--d, 0s), filter 1.1s var(--settle) var(--d, 0s); }
+.js .rv.in { opacity: 1; transform: none; filter: none; }
+
+/* ── Chapter heads and seals ── */
+.sec-head { display: flex; align-items: center; justify-content: space-between; gap: 18px; min-height: 76px; }
+.seal-tag { display: flex; align-items: center; gap: 16px; text-align: right; flex: none; }
+.seal-tag .label { display: block; }
+.seal-tag .gloss { font-size: 1.1rem; line-height: 1.1; }
+.seal-tag.malum .label { color: var(--red); }
+.seal { width: 76px; height: 76px; flex: none; filter: drop-shadow(0 6px 14px rgba(0,0,0,0.5)); }
+.seal text { font-family: var(--caps); }
+.js .seal { opacity: 0; transform: scale(1.7) rotate(-24deg); }
+.js .in .seal, .js .seal.in { animation: stamp 0.75s var(--settle) var(--sd, 0.15s) forwards; }
+@keyframes stamp { 0% { opacity: 0; transform: scale(1.7) rotate(-24deg); } 55% { opacity: 1; transform: scale(0.94) rotate(2deg); } 100% { opacity: 1; transform: scale(1) rotate(0); } }
+@media (max-width: 560px) { .seal-tag .words { display: none; } .seal { width: 60px; height: 60px; } }
+
+/* ── Film ── */
+.film-intro { text-align: center; margin: 0 auto 44px; }
+.film-intro .chapter { justify-content: center; }
+.film-intro .lede { margin: 0 auto; }
+.film { position: relative; margin: 0 auto; max-width: 1100px; }
+.frame { position: relative; padding: 10px; border: 1px solid var(--hairline); background: rgba(10, 7, 5, 0.6); box-shadow: 0 40px 120px rgba(0,0,0,0.65), 0 0 90px rgba(212,175,106,0.07); }
+.frame::before, .frame::after, .frame .c3, .frame .c4 { content: ""; position: absolute; width: 22px; height: 22px; border: 2px solid var(--gold); pointer-events: none; }
+.frame::before { top: -6px; left: -6px; border-right: 0; border-bottom: 0; }
+.frame::after { top: -6px; right: -6px; border-left: 0; border-bottom: 0; }
+.frame .c3 { bottom: -6px; left: -6px; border-right: 0; border-top: 0; }
+.frame .c4 { bottom: -6px; right: -6px; border-left: 0; border-top: 0; }
+.screen { position: relative; aspect-ratio: 16 / 9; background: #0c0806; overflow: hidden; }
+.screen video { width: 100%; height: 100%; object-fit: cover; }
+.play { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; border: 0; background: radial-gradient(ellipse 42% 46% at 50% 50%, rgba(8,5,3,0.72) 0%, rgba(8,5,3,0.35) 60%, rgba(8,5,3,0.08) 100%); color: var(--gold-light); cursor: pointer; transition: opacity 0.6s var(--settle), background 0.6s; }
+.play:hover { background: radial-gradient(ellipse 42% 46% at 50% 50%, rgba(8,5,3,0.6) 0%, rgba(8,5,3,0.25) 60%, rgba(8,5,3,0) 100%); }
+.play .disc { width: clamp(64px, 8vw, 92px); aspect-ratio: 1; border-radius: 50%; display: grid; place-items: center; background: radial-gradient(circle at 38% 32%, #f0d79c, #b88f4a 70%); box-shadow: 0 0 0 1px rgba(242,221,170,0.4) inset, 0 0 0 10px rgba(212,175,106,0.12), 0 0 60px rgba(212,175,106,0.35); transition: transform 0.6s var(--settle), box-shadow 0.6s var(--settle); }
+.play .disc svg { width: 32%; margin-left: 8%; fill: #1a120b; }
+.play:hover .disc { transform: scale(1.07); box-shadow: 0 0 0 1px rgba(242,221,170,0.6) inset, 0 0 0 16px rgba(212,175,106,0.14), 0 0 90px rgba(212,175,106,0.5); }
+.play .cap { font-family: var(--caps); font-size: clamp(0.6rem, 1.1vw, 0.76rem); font-weight: 700; letter-spacing: 0.3em; padding: 8px 16px; background: rgba(10,7,5,0.82); border: 1px solid var(--hairline); }
+.play .cap b { font-family: var(--mono); font-weight: 500; letter-spacing: 0.04em; opacity: 0.75; margin-left: 10px; }
+.film.playing .play { opacity: 0; pointer-events: none; }
+@media (max-width: 600px) { .play .cap { display: none; } .play .disc { width: 56px; } .frame { padding: 6px; } }
+.film figcaption { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px 24px; margin-top: 22px; font-size: 1.05rem; font-style: italic; color: var(--muted); }
+.film figcaption .label { font-style: normal; color: var(--gold); }
+
+/* ── I. The factory: the ills ── */
+.mala { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin-top: 52px; }
+.malum { display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 24px; align-items: start; padding: 30px 30px 32px; border: 1px solid rgba(196, 82, 59, 0.22); background: linear-gradient(160deg, rgba(40, 20, 14, 0.6), rgba(18, 12, 9, 0.6)); position: relative; overflow: hidden; }
+.malum::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 2px; background: linear-gradient(var(--red), transparent); opacity: 0.6; }
+.malum .seal { width: 84px; height: 84px; }
+.malum h3 { font-family: var(--serif); font-weight: 600; font-size: 1.62rem; line-height: 1.12; color: var(--marble); margin: 6px 0 10px; }
+.malum p { margin: 0; font-size: 1.16rem; }
+.malum .label { color: var(--red); }
+.malum .label .gloss { font-family: var(--serif); letter-spacing: 0; text-transform: none; font-size: 1.05rem; font-weight: 500; margin-left: 6px; }
+@media (max-width: 800px) { .mala { grid-template-columns: 1fr; } }
+@media (max-width: 460px) { .malum { grid-template-columns: 1fr; gap: 14px; padding: 24px 20px; } .malum .seal { width: 64px; height: 64px; } }
+
+/* ── II. Two roads ── */
+.roads { text-align: center; }
+.roads .chapter { justify-content: center; }
+.roads .pre { max-width: 36em; margin: 30px auto 50px; font-size: clamp(1.25rem, 1.8vw, 1.42rem); text-wrap: balance; }
+blockquote.q { margin: 0 auto; max-width: 1000px; font-style: italic; font-size: clamp(1.9rem, 4.2vw, 3.3rem); line-height: 1.2; color: var(--marble); text-wrap: balance; }
+blockquote.q .mk { color: var(--gold); }
+blockquote.q .hi { transition: color 1.2s var(--gentle), text-shadow 1.2s var(--gentle); }
+.in blockquote.q .hi { color: var(--gold-light); text-shadow: 0 0 22px rgba(242,221,170,0.3); }
+.in blockquote.q .hi:nth-of-type(2) { transition-delay: 0.6s; }
+.in blockquote.q .hi:nth-of-type(3) { transition-delay: 1.2s; }
+.cite { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 8px 18px; margin: 30px 0 0; font-family: var(--caps); font-size: 0.8rem; font-weight: 700; letter-spacing: 0.22em; color: var(--gold); }
+.cite .src { font-family: var(--serif); font-style: italic; font-weight: 500; font-size: 1.12rem; letter-spacing: 0; color: var(--marble-dim); }
+.cite .rule { width: 50px; height: 1px; background: var(--hairline); }
+.lex { position: relative; margin: clamp(40px, 6vw, 70px) auto 0; font-family: var(--caps); font-weight: 700; font-size: clamp(5rem, 16vw, 11rem); line-height: 1; letter-spacing: 0.3em; padding-left: 0.3em; }
+.lex span { display: inline-block; background: linear-gradient(180deg, var(--gold-light) 0%, var(--gold) 45%, var(--gold-deep) 100%); -webkit-background-clip: text; background-clip: text; color: transparent; filter: drop-shadow(0 0 14px rgba(242,221,170,0.3)); }
+.js .lex span { opacity: 0; }
+.js .in .lex span { animation: carve 1.2s var(--settle) calc(1.6s + var(--i) * 0.14s) forwards; }
+.lex::before { content: ""; position: absolute; left: 50%; top: 50%; width: 120%; height: 160%; translate: -50% -50%; background: radial-gradient(ellipse at center, rgba(255,214,150,0.35), rgba(214,160,90,0.08) 45%, transparent 70%); mix-blend-mode: screen; opacity: 0; pointer-events: none; }
+.js .in .lex::before { animation: burst 2.4s var(--gentle) 1.7s; }
+@keyframes burst { 0% { opacity: 0; } 25% { opacity: 1; } 100% { opacity: 0; } }
+
+/* ── III. Fabrica → Societas ── */
+.versus { display: grid; grid-template-columns: minmax(0, 1fr) 70px minmax(0, 1fr); align-items: center; row-gap: 20px; margin: 56px auto 0; max-width: 900px; }
+.versus .col-h { font-family: var(--caps); font-weight: 700; font-size: clamp(1.3rem, 2.8vw, 2.1rem); letter-spacing: 0.2em; color: var(--gold-light); }
+.versus .col-h small { display: block; font-family: var(--serif); font-style: italic; font-weight: 500; font-size: 1.05rem; letter-spacing: 0; color: var(--muted); margin-top: 4px; }
+.versus .l { text-align: right; color: var(--muted); font-size: clamp(1.1rem, 1.9vw, 1.4rem); position: relative; justify-self: end; }
+.versus .l::after { content: ""; position: absolute; left: -4px; right: -4px; top: 55%; height: 1px; background: var(--red); opacity: 0.75; transform: scaleX(0); transform-origin: left; transition: transform 0.9s var(--settle) calc(var(--d, 0s) + 0.5s); }
+.versus .in.l::after, .versus .l.in::after { transform: scaleX(1); }
+.versus .ar { text-align: center; color: var(--gold); font-size: 1.5rem; }
+.versus .r { display: flex; align-items: center; gap: 14px; color: var(--marble); font-size: clamp(1.1rem, 1.9vw, 1.4rem); }
+.versus .r svg { width: 26px; height: 26px; flex: none; color: var(--gold); }
+.versus .col-h.l { font-size: clamp(1.3rem, 2.8vw, 2.1rem); color: var(--muted); }
+.versus .col-h.l::after { display: none; }
+@media (max-width: 640px) {
+  .versus { grid-template-columns: 1fr; row-gap: 4px; text-align: center; }
+  .versus .l, .versus .col-h { text-align: center; justify-self: center; }
+  .versus .ar { transform: rotate(90deg); font-size: 1.1rem; line-height: 1; margin: 2px 0; }
+  .versus .r { justify-content: center; margin-bottom: 18px; }
+  .versus .hide-sm { display: none; }
+}
+.house { text-align: center; margin-top: clamp(90px, 12vw, 150px); }
+.house .wreath { width: 120px; margin: 0 auto 26px; }
+.house p { margin: 0; font-size: clamp(1.5rem, 3vw, 2.3rem); line-height: 1.25; color: var(--marble); font-style: italic; text-wrap: balance; }
+.house p + p { margin-top: 10px; }
+
+/* ── Split layouts for the remedies ── */
+.split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.12fr); gap: clamp(36px, 6vw, 90px); align-items: center; margin-top: 18px; }
+.split.flip > .copy { order: 2; }
+@media (max-width: 920px) { .split { grid-template-columns: minmax(0, 1fr); } .split.flip > .copy { order: 0; } }
+.inscription { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 16px; margin: 4px 0 26px; }
+.inscription .label { font-size: 0.78rem; }
+.inscription .label + .label { color: var(--gold-light); }
+.inscription .label + .label::before { content: "·"; color: var(--muted); margin-right: 16px; }
+.inscription .by { font-style: italic; font-size: 1rem; color: var(--muted); width: 100%; }
+
+/* Panels */
+.tablet { position: relative; background: var(--panel); border: 1px solid var(--hairline); border-radius: 6px; box-shadow: 0 34px 90px rgba(0,0,0,0.55), inset 0 1px 0 rgba(242,221,170,0.06); overflow: hidden; }
+.tablet-head { display: flex; align-items: center; gap: 12px; padding: 11px 16px; border-bottom: 1px solid var(--hairline-soft); font-family: var(--mono); font-size: 0.72rem; color: var(--muted); }
+.tablet-head .dots { display: flex; gap: 6px; }
+.tablet-head .dots i { width: 9px; height: 9px; border-radius: 50%; border: 1px solid var(--hairline); }
+.tablet-head .right { margin-left: auto; }
+.replay { font-family: var(--mono); font-size: 0.7rem; color: var(--muted); background: none; border: 1px solid var(--hairline-soft); border-radius: 3px; padding: 3px 9px; cursor: pointer; transition: color 0.3s, border-color 0.3s; }
+.replay:hover { color: var(--gold-light); border-color: var(--hairline); }
+.term { padding: 18px 20px 20px; font-family: var(--mono); font-size: 0.8rem; line-height: 1.75; color: var(--marble-dim); }
+.term .g { color: var(--gold-light); } .term .v { color: var(--verdigris); } .term .r { color: #e07a62; } .term .m { color: var(--muted); }
+.term .ln { display: block; white-space: pre-wrap; word-break: break-word; }
+.js .term .step { opacity: 0; transform: translateY(6px); transition: opacity 0.5s var(--settle), transform 0.5s var(--settle); }
+.js .term .step.on { opacity: 1; transform: none; }
+.caret { display: inline-block; width: 0.55em; height: 1.1em; vertical-align: -0.2em; background: var(--gold); margin-left: 2px; animation: blink 1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+
+/* IV. The prime */
+.prime .term { padding-top: 8px; }
+.prime .sect { padding: 12px 0 10px; border-bottom: 1px dashed rgba(212,175,106,0.14); }
+.prime .sect:last-child { border-bottom: 0; }
+.prime .sect b { display: block; font-weight: 500; color: var(--gold-light); }
+.prime .sect .laurel-q { font-family: var(--serif); font-style: italic; font-size: 1.12rem; color: var(--marble); }
+.js .prime .sect { opacity: 0; transform: translateX(-10px); transition: opacity 0.7s var(--settle) var(--d), transform 0.7s var(--settle) var(--d); }
+.js .prime.in .sect { opacity: 1; transform: none; }
+.prime .glow { position: absolute; inset: 0; pointer-events: none; background: radial-gradient(ellipse 60% 50% at 30% 0%, rgba(255,214,150,0.14), transparent 70%); }
+
+/* V. The handoff */
+.handoff-stage { position: relative; }
+.handoff-stage .term { padding-bottom: 48px; }
+.gauge { display: flex; align-items: center; gap: 12px; margin: 6px 0; }
+.gauge .bar { position: relative; flex: 1; max-width: 220px; height: 6px; background: rgba(212,175,106,0.12); border-radius: 3px; overflow: visible; }
+.gauge .bar i { position: absolute; inset: 0 auto 0 0; width: 0; border-radius: 3px; background: linear-gradient(90deg, var(--verdigris), var(--gold)); }
+.gauge .bar .at { position: absolute; left: 60%; top: -5px; bottom: -5px; width: 1px; background: var(--gold-light); opacity: 0.7; }
+.gauge.hot .bar i { background: linear-gradient(90deg, var(--gold), var(--red)); }
+.note { position: relative; margin: -26px 0 0 auto; width: min(420px, 92%); padding: 22px 26px 24px; color: var(--ink); background: linear-gradient(165deg, #f1e7cc 0%, #e6d6b0 100%); border-radius: 3px; box-shadow: 0 30px 70px rgba(0,0,0,0.55), inset 0 0 40px rgba(156,119,56,0.18); rotate: 1.2deg; z-index: 2; }
+.note .path { font-family: var(--mono); font-size: 0.68rem; color: #7a6040; border-bottom: 1px solid rgba(90,60,30,0.2); padding-bottom: 8px; margin-bottom: 12px; }
+.note p { margin: 0 0 6px; font-style: italic; font-size: 1.14rem; line-height: 1.4; }
+.note p b { font-style: normal; font-family: var(--caps); font-size: 0.7rem; letter-spacing: 0.18em; color: #6e4f22; margin-right: 6px; }
+.note .sig { text-align: right; margin-top: 12px; font-size: 1rem; color: #6e5634; }
+.js .note { opacity: 0; transform: translate(30px, 30px) rotate(4deg); transition: opacity 0.9s var(--settle), transform 0.9s var(--settle); }
+.js .note.on { opacity: 1; transform: none; }
+.js .note p, .js .note .sig { opacity: 0; transition: opacity 0.6s var(--settle); }
+.js .note .on { opacity: 1; }
+
+/* VI. The chain */
+.chain-body { position: relative; padding: 70px 20px 22px; }
+.chain-clock { position: absolute; top: 16px; left: 20px; font-family: var(--mono); font-size: 1.35rem; color: var(--marble); }
+.chain-clock small { display: block; font-family: var(--caps); font-size: 0.56rem; letter-spacing: 0.3em; color: var(--muted); }
+.accts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.acct { position: relative; padding: 12px 12px 10px; border: 1px solid var(--hairline-soft); border-radius: 4px; background: rgba(10,7,5,0.5); font-family: var(--mono); font-size: 0.7rem; transition: border-color 0.5s, box-shadow 0.5s, background 0.5s; }
+.acct .an { color: var(--marble); margin-bottom: 9px; white-space: nowrap; }
+.acct .meter { height: 5px; border-radius: 3px; background: rgba(212,175,106,0.12); overflow: hidden; }
+.acct .meter i { display: block; height: 100%; width: var(--v, 0%); background: var(--verdigris); border-radius: 3px; transition: background 0.4s; }
+.acct .af { display: flex; justify-content: space-between; gap: 6px; margin-top: 7px; color: var(--muted); font-size: 0.64rem; letter-spacing: 0.04em; }
+.acct[data-s="full"] .meter i { background: var(--gold); }
+.acct[data-s="full"] .st { color: var(--gold); }
+.acct[data-s="limited"] { border-color: rgba(196,82,59,0.45); }
+.acct[data-s="limited"] .meter i { background: var(--red); }
+.acct[data-s="limited"] .st { color: #e07a62; }
+.acct[data-s="active"] { border-color: var(--gold); box-shadow: 0 0 0 1px rgba(212,175,106,0.25), 0 0 30px rgba(212,175,106,0.15); }
+.acct[data-s="active"] .st { color: var(--verdigris); }
+.acct .probe { position: absolute; top: -9px; right: -7px; width: 18px; height: 18px; border-radius: 50%; display: grid; place-items: center; font-size: 0.66rem; font-weight: 500; opacity: 0; transform: scale(0.4); transition: opacity 0.3s, transform 0.4s var(--settle); }
+.acct .probe.no { opacity: 1; transform: none; background: var(--red-deep); color: #f6d8cf; }
+.acct .probe.yes { opacity: 1; transform: none; background: var(--verdigris); color: #0c1a13; }
+.seat-mark { position: absolute; left: 0; top: 0; width: 38px; color: var(--gold-light); transition: transform 0.9s var(--settle); filter: drop-shadow(0 0 10px rgba(242,221,170,0.45)); }
+.chain-log { margin-top: 18px; min-height: 3.6em; font-family: var(--mono); font-size: 0.72rem; line-height: 1.8; }
+.chain-log .ln { display: block; }
+@media (max-width: 560px) { .accts { grid-template-columns: repeat(2, minmax(0, 1fr)); row-gap: 54px; } .chain-body { padding-top: 76px; } }
+
+/* VII. Offices */
+.offices { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: clamp(20px, 3vw, 40px); margin-top: 60px; text-align: center; }
+.office .medal { width: min(220px, 100%); margin: 0 auto 22px; filter: drop-shadow(0 20px 40px rgba(0,0,0,0.55)); transition: transform 0.8s var(--settle), filter 0.8s var(--settle); }
+.office:hover .medal { transform: translateY(-4px) rotate(-2deg); filter: drop-shadow(0 26px 50px rgba(0,0,0,0.6)) drop-shadow(0 0 26px rgba(212,175,106,0.18)); }
+.office h3 { margin: 0 0 8px; font-family: var(--caps); font-weight: 700; font-size: clamp(1.1rem, 1.8vw, 1.4rem); letter-spacing: 0.22em; color: var(--gold-light); }
+.office p { margin: 0 auto 14px; max-width: 18em; font-size: 1.14rem; }
+.office .cmd-line { font-size: 0.78rem; }
+.medal text { font-family: var(--caps); }
+.medal .grille { transform: translateY(-120px); transition: transform 1.4s cubic-bezier(0.5, 0, 0.3, 1.25) 0.5s; }
+.in .medal .grille, .no-motion .medal .grille { transform: none; }
+.medal .beam { transform-origin: 100px 56px; transform: rotate(-12deg); transition: transform 2.2s cubic-bezier(0.3, 1.6, 0.4, 1) 0.4s; }
+.medal .pan-l { transform-origin: 34px 56px; transform: rotate(12deg); transition: transform 2.2s cubic-bezier(0.3, 1.6, 0.4, 1) 0.4s; }
+.medal .pan-r { transform-origin: 166px 56px; transform: rotate(12deg); transition: transform 2.2s cubic-bezier(0.3, 1.6, 0.4, 1) 0.4s; }
+.in .medal .beam, .in .medal .pan-l, .in .medal .pan-r, .no-motion .medal .beam, .no-motion .medal .pan-l, .no-motion .medal .pan-r { transform: none; }
+.mailrow { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 22px; margin-top: 56px; padding: 22px 26px; border: 1px solid var(--hairline-soft); background: rgba(17,12,10,0.5); }
+.mailrow svg { width: 44px; height: 44px; color: var(--gold); }
+.mailrow p { margin: 0; }
+.mailrow p strong { font-family: var(--caps); font-weight: 700; letter-spacing: 0.2em; font-size: 0.9rem; color: var(--gold-light); margin-right: 8px; }
+.mailrow .cmd-line { margin: 0; }
+@media (max-width: 860px) { .offices { grid-template-columns: 1fr; gap: 56px; } .mailrow { grid-template-columns: 1fr; text-align: center; justify-items: center; } }
+
+/* VIII. Law */
+.law-stage { display: grid; gap: 18px; }
+.ruling-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 18px; align-items: center; }
+.ruling { padding: 20px 24px 22px; color: var(--ink); background: linear-gradient(165deg, #f1e7cc 0%, #e4d3ab 100%); border-radius: 3px; box-shadow: 0 30px 70px rgba(0,0,0,0.5), inset 0 0 40px rgba(156,119,56,0.18); font-family: var(--mono); font-size: 0.78rem; line-height: 1.8; }
+.ruling .path { font-size: 0.66rem; color: #7a6040; border-bottom: 1px solid rgba(90,60,30,0.2); padding-bottom: 8px; margin-bottom: 10px; }
+.ruling .k { color: #7a6040; }
+.ruling .st { color: #2f6b4f; font-weight: 500; }
+.ruling .hk { color: #8e2f22; font-weight: 500; }
+.ruling .why { font-family: var(--serif); font-style: italic; font-size: 1.1rem; line-height: 1.4; margin-top: 10px; color: var(--ink); }
+.ladder { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; font-family: var(--mono); font-size: 0.7rem; }
+.ladder li { padding: 5px 12px; border: 1px solid var(--hairline-soft); border-radius: 20px; color: var(--muted); text-align: center; transition: color 0.4s var(--settle) var(--d), border-color 0.4s var(--settle) var(--d), background 0.4s var(--settle) var(--d), box-shadow 0.4s var(--settle) var(--d); }
+.in .ladder li.past { color: var(--marble-dim); border-color: var(--hairline); }
+.in .ladder li.now { color: #0c1a13; background: var(--verdigris); border-color: var(--verdigris); box-shadow: 0 0 20px rgba(127,180,154,0.35); }
+.no-motion .ladder li.now { color: #0c1a13; background: var(--verdigris); border-color: var(--verdigris); }
+.law-stage .term .step { transition-delay: var(--d, 0s); }
+.in .term .step { opacity: 1; transform: none; }
+@media (max-width: 520px) { .ruling-row { grid-template-columns: 1fr; } .ladder { grid-template-columns: repeat(5, auto); overflow-x: auto; } .ladder li { padding: 5px 9px; } }
+
+/* IX. The night */
+.night-demo .cmd { padding: 18px 20px 6px; font-family: var(--mono); font-size: 0.8rem; line-height: 1.6; color: var(--marble); min-height: 3.6em; }
+.night-demo .cmd .p { color: var(--muted); margin-right: 8px; }
+.nd-grid { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 26px; padding: 18px 22px 10px; }
+.nd-stat { text-align: center; min-width: 88px; }
+.nd-stat .big { font-family: var(--mono); font-size: 1.7rem; color: var(--marble); line-height: 1.1; font-variant-numeric: tabular-nums; }
+.nd-stat .lbl { font-family: var(--caps); font-size: 0.56rem; letter-spacing: 0.3em; color: var(--muted); margin-top: 4px; }
+.nd-stat .sub { font-family: var(--mono); font-size: 0.68rem; color: var(--muted); margin-top: 12px; }
+.beads { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 8px; }
+.beads i { aspect-ratio: 1; border-radius: 50%; border: 1px solid rgba(127,180,154,0.4); background: rgba(127,180,154,0.06); transition: background 0.5s var(--settle), box-shadow 0.5s var(--settle), transform 0.5s var(--settle); }
+.beads i.done { background: radial-gradient(circle at 38% 32%, #a9d6bf, #5e9a7e); border-color: transparent; box-shadow: 0 0 12px rgba(127,180,154,0.35); }
+.beads i.wait { border: 1.5px dashed rgba(237,229,214,0.55); background: transparent; }
+.beads i.wait.lit { border-color: var(--gold-light); box-shadow: 0 0 14px rgba(242,221,170,0.35); }
+.chips { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px 22px 6px; font-family: var(--mono); font-size: 0.68rem; }
+.chips .lbl { font-family: var(--caps); letter-spacing: 0.3em; font-size: 0.56rem; color: var(--muted); margin-right: 6px; }
+.chip { padding: 4px 10px; border: 1px solid rgba(223,230,255,0.2); border-radius: 20px; color: #9aa3bf; transition: all 0.5s var(--settle); }
+.chip.lit { color: #0b1020; background: var(--gold-light); border-color: var(--gold-light); box-shadow: 0 0 22px rgba(242,221,170,0.45); }
+.nd-log { padding: 10px 22px 20px; min-height: 4.4em; font-family: var(--mono); font-size: 0.72rem; line-height: 1.8; }
+.nd-log .ln { display: block; }
+.night-demo { background: rgba(10, 14, 30, 0.82); border-color: rgba(160, 175, 230, 0.28); }
+.night-demo .tablet-head { border-color: rgba(160, 175, 230, 0.15); }
+@media (max-width: 640px) { .nd-grid { grid-template-columns: 1fr 1fr; gap: 18px; } .beads { grid-column: 1 / -1; order: 3; grid-template-columns: repeat(9, minmax(0, 1fr)); } }
+.stops { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 50px 0 0; padding: 0; list-style: none; }
+.stops li { padding: 18px 18px 20px; border-top: 1px solid rgba(160,175,230,0.3); }
+.stops b { display: block; font-family: var(--caps); font-size: 0.72rem; letter-spacing: 0.24em; color: #dfe6ff; font-weight: 700; margin-bottom: 6px; }
+.stops span { font-size: 1.06rem; }
+@media (max-width: 860px) { .stops { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+/* X. Mechanism, not law */
+.ml { display: grid; grid-template-columns: minmax(0, 1fr) 1px minmax(0, 1fr); gap: clamp(28px, 5vw, 70px); margin-top: 60px; }
+.ml .div { background: linear-gradient(transparent, var(--hairline), transparent); }
+.ml h3 { margin: 0; font-family: var(--caps); font-weight: 700; font-size: clamp(1.8rem, 3.6vw, 2.8rem); letter-spacing: 0.2em; }
+.ml .who { font-style: italic; color: var(--muted); margin: 4px 0 22px; font-size: 1.1rem; }
+.ml ul { list-style: none; margin: 0; padding: 0; }
+.ml li { display: grid; grid-template-columns: minmax(0, 8.5em) minmax(0, 1fr); gap: 16px; padding: 12px 0; border-top: 1px solid var(--hairline-soft); font-size: 1.14rem; }
+.ml li > code { font-family: var(--mono); font-size: 0.78rem; color: var(--gold-light); background: none; border: 0; padding: 0.35em 0 0; vertical-align: baseline; }
+@media (max-width: 800px) { .ml { grid-template-columns: 1fr; } .ml .div { height: 1px; background: linear-gradient(90deg, transparent, var(--hairline), transparent); } }
+@media (max-width: 460px) { .ml li { grid-template-columns: 1fr; gap: 2px; } }
+.fence-note { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 22px; align-items: start; margin-top: 56px; padding: 26px 28px; border: 1px solid var(--hairline); background: linear-gradient(160deg, rgba(40, 30, 18, 0.55), rgba(17,12,10,0.55)); }
+.fence-note svg { width: 54px; height: 54px; color: var(--gold); }
+.fence-note p { margin: 0; }
+.fence-note .label { display: block; margin-bottom: 6px; }
+@media (max-width: 520px) { .fence-note { grid-template-columns: 1fr; } }
+
+/* XI. Shapes */
+.shapes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; margin-top: 56px; }
+.shape { display: flex; flex-direction: column; border: 1px solid var(--hairline-soft); background: rgba(17,12,10,0.55); transition: border-color 0.5s, transform 0.7s var(--settle), box-shadow 0.7s var(--settle); }
+.shape:hover { border-color: var(--hairline); transform: translateY(-4px); box-shadow: 0 30px 60px rgba(0,0,0,0.4); }
+.shape .top { padding: 12px 16px; border-bottom: 1px solid var(--hairline-soft); font-family: var(--mono); font-size: 0.72rem; color: var(--gold-light); white-space: nowrap; overflow-x: auto; }
+.shape .top span { color: var(--muted); }
+.shape .pic { height: 150px; display: grid; place-items: center; color: var(--gold); }
+.shape .pic svg { height: 96px; width: auto; }
+.shape .body { padding: 0 22px 24px; }
+.shape h3 { margin: 0 0 6px; font-family: var(--caps); font-weight: 700; letter-spacing: 0.22em; font-size: 1.05rem; color: var(--gold-light); }
+.shape p { margin: 0; font-size: 1.1rem; }
+@media (max-width: 860px) { .shapes { grid-template-columns: 1fr; } }
+
+/* XII. Take a seat */
+.install { text-align: center; }
+.install .chapter { justify-content: center; }
+.take { font-family: var(--caps); font-weight: 700; font-size: clamp(3rem, 9vw, 6.6rem); letter-spacing: 0.08em; line-height: 1; margin: 22px 0 16px; }
+.install .lede { margin: 0 auto 50px; }
+.codes { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 18px; text-align: left; }
+.code .term { font-size: 0.78rem; overflow-x: auto; }
+.code .ln { white-space: pre; }
+.code .ln.cmd::before { content: "$ "; color: var(--muted); }
+.code .c { color: var(--muted); }
+.copy-btn { margin-left: auto; font-family: var(--mono); font-size: 0.68rem; color: var(--muted); background: none; border: 1px solid var(--hairline-soft); border-radius: 3px; padding: 3px 9px; cursor: pointer; transition: color 0.3s, border-color 0.3s; }
+.copy-btn:hover { color: var(--gold-light); border-color: var(--hairline); }
+.reqs { display: flex; justify-content: center; flex-wrap: wrap; gap: 10px 26px; margin: 30px 0 40px; font-family: var(--caps); font-size: 0.7rem; letter-spacing: 0.26em; color: var(--muted); }
+.reqs b { color: var(--gold); font-weight: 700; }
+@media (max-width: 860px) { .codes { grid-template-columns: 1fr; } }
+
+/* Lexicon */
+.lexicon dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0 34px; margin: 46px 0 0; }
+.lexicon dl > div { padding: 16px 0 18px; border-top: 1px solid var(--hairline-soft); }
+.lexicon dt { font-family: var(--caps); font-weight: 700; font-size: 0.86rem; letter-spacing: 0.22em; color: var(--gold-light); text-transform: uppercase; margin-bottom: 4px; }
+.lexicon dd { margin: 0; font-size: 1.08rem; line-height: 1.45; }
+@media (max-width: 900px) { .lexicon dl { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 560px) { .lexicon dl { grid-template-columns: 1fr; } }
+
+/* Footer */
+footer { padding: 90px 0 60px; text-align: center; border-top: 1px solid var(--hairline-soft); }
+footer .wreath { width: 92px; margin: 0 auto 12px; }
+footer .fcvria { font-family: var(--caps); font-weight: 700; font-size: 1.6rem; letter-spacing: 0.3em; margin: 0 0 8px; padding-left: 0.3em; }
+footer .ft { font-style: italic; color: var(--marble-dim); margin: 0 0 22px; }
+footer nav { display: flex; justify-content: center; flex-wrap: wrap; gap: 10px 28px; margin-bottom: 30px; }
+footer nav a { font-family: var(--caps); font-size: 0.68rem; font-weight: 600; letter-spacing: 0.26em; text-transform: uppercase; color: var(--gold); text-decoration: none; }
+footer nav a:hover { color: var(--gold-light); }
+footer .credit { font-size: 0.98rem; font-style: italic; color: var(--muted); max-width: 40em; margin: 0 auto; }
+
+/* Reduced motion: every state is its final one */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.001s !important; animation-delay: 0s !important; transition-duration: 0.001s !important; transition-delay: 0s !important; }
+  .js .rv, .js .seal, .js .lex span, .js .prime .sect, .js .term .step, .js .note, .js .note p, .js .note .sig { opacity: 1; transform: none; filter: none; }
+  .scroll-cue i { animation: none; }
+}
+</style>
+</head>
+<body>
+
+<!-- The hall -->
+<div class="hall" aria-hidden="true">
+  <div class="base"></div>
+  <div class="cool"></div>
+  <svg class="veins" preserveAspectRatio="none">
+    <filter id="veins"><feTurbulence type="fractalNoise" baseFrequency="0.0035 0.011" numOctaves="5" seed="7"/><feColorMatrix type="matrix" values="0 0 0 0 0.93  0 0 0 0 0.86  0 0 0 0 0.74  0 0 0 -2.2 1.35"/></filter>
+    <rect width="100%" height="100%" filter="url(#veins)"/>
+  </svg>
+  <div class="beams"><div class="beam"></div><div class="beam"></div><div class="beam"></div></div>
+  <canvas id="motes"></canvas>
+  <div class="vignette"></div>
+</div>
+
+<!-- Line art, in gold leaf -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-sella" viewBox="0 0 300 260">
+    <g fill="none" stroke="currentColor" stroke-width="12" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M44,56 Q150,44 256,56"/><path d="M40,64 H260 V76 H40 Z"/>
+      <path d="M70,76 C70,150 230,160 232,232"/><path d="M230,76 C230,150 70,160 68,232"/>
+      <circle cx="150" cy="146" r="9"/><path d="M40,236 H98 M202,236 H260"/>
+      <circle cx="46" cy="228" r="7"/><circle cx="254" cy="228" r="7"/>
+    </g>
+  </symbol>
+  <symbol id="i-scroll" viewBox="0 0 48 48">
+    <g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 8h22a4 4 0 0 1 4 4v26a4 4 0 0 1-4 4H14"/><path d="M12 8a4 4 0 0 0-4 4v4h8v-4a4 4 0 0 0-4-4z"/><path d="M14 42a4 4 0 0 1-4-4V16"/><path d="M20 18h12M20 25h12M20 32h8"/>
+    </g>
+  </symbol>
+  <symbol id="i-tablet" viewBox="0 0 48 48">
+    <g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M10 6h28v36H10z"/><path d="M16 14h16M16 21h16M16 28h10"/><circle cx="31" cy="34" r="3"/>
+    </g>
+  </symbol>
+  <symbol id="i-fasces" viewBox="0 0 200 200">
+    <g fill="none" stroke="currentColor" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"><path d="M76,34 V176"/><path d="M88,34 V176"/><path d="M100,34 V176"/><path d="M112,34 V176"/><path d="M124,34 V176"/><path d="M68,62 Q100,72 132,62"/><path d="M68,112 Q100,122 132,112"/><path d="M68,160 Q100,170 132,160"/><path d="M76,40 C44,26 26,44 28,62 C30,80 50,90 76,78"/><path d="M76,40 V78"/></g>
+  </symbol>
+  <symbol id="i-scales" viewBox="0 0 200 200">
+    <g fill="none" stroke="currentColor" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"><path d="M100,36 V172 M68,172 H132"/><path d="M34,56 H166"/><path d="M34,56 L16,116 M34,56 L52,116 M10,116 Q34,138 58,116 Z"/><path d="M166,56 L148,116 M166,56 L184,116 M142,116 Q166,138 190,116 Z"/></g>
+  </symbol>
+  <symbol id="i-gate" viewBox="0 0 200 200">
+    <g fill="none" stroke="currentColor" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"><path d="M40,178 V88 A60,60 0 0 1 160,88 V178"/><path d="M56,62 V160"/><path d="M78,62 V160"/><path d="M100,62 V160"/><path d="M122,62 V160"/><path d="M144,62 V160"/><path d="M40,104 H160"/><path d="M40,138 H160"/><path d="M24,178 H176"/></g>
+  </symbol>
+  <symbol id="i-fence" viewBox="0 0 48 48">
+    <g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 42V14l4-6 4 6v28M21 42V14l4-6 4 6v28M33 42V14l4-6 4 6v28"/><path d="M5 20h38M5 34h38"/></g>
+  </symbol>
+  <symbol id="i-play" viewBox="0 0 20 20"><path d="M5 3.5v13l11-6.5z" fill="currentColor"/></symbol>
+  <symbol id="i-gh" viewBox="0 0 16 16"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></symbol>
+</svg>
+
+<nav class="nav" id="nav" aria-label="Primary">
+  <div class="wrap">
+    <a class="brand" href="#top" aria-label="Curia, back to top">
+      <span class="mini"><span class="laurel-slot" data-still></span><svg class="ico" viewBox="0 0 300 260" style="color:var(--gold)"><use href="#i-sella"/></svg></span>
+      <span class="gild">CVRIA</span>
+    </a>
+    <ul>
+      <li class="opt"><a href="#film">Film</a></li>
+      <li class="opt"><a href="#seat">Seats</a></li>
+      <li class="opt"><a href="#offices">Offices</a></li>
+      <li class="opt"><a href="#law">Law</a></li>
+      <li class="opt"><a href="#night">Night</a></li>
+      <li><a href="#install">Install</a></li>
+      <li><a class="gh" data-repo="" href="#install"><svg><use href="#i-gh"/></svg>GitHub</a></li>
+    </ul>
+  </div>
+</nav>
+
+<main id="top">
+
+<!-- ═══ Hero ═══ -->
+<header class="hero">
+  <div class="wrap">
+    <div class="mark">
+      <div class="wreath">
+        <span class="laurel-slot"></span>
+        <svg class="sella" viewBox="0 0 300 260" aria-hidden="true" style="overflow:visible">
+          <g stroke-width="7">
+            <path pathLength="1" d="M44,56 Q150,44 256,56"/>
+            <path pathLength="1" d="M40,64 H260 V76 H40 Z"/>
+            <path pathLength="1" d="M70,76 C70,150 230,160 232,232"/>
+            <path pathLength="1" d="M230,76 C230,150 70,160 68,232"/>
+            <path pathLength="1" d="M86,76 C88,140 214,150 218,232" opacity="0.45"/>
+            <path pathLength="1" d="M214,76 C212,140 86,150 82,232" opacity="0.45"/>
+            <circle pathLength="1" cx="150" cy="146" r="9"/>
+            <path pathLength="1" d="M40,236 H98 M202,236 H260"/>
+            <circle pathLength="1" cx="46" cy="228" r="7"/>
+            <circle pathLength="1" cx="254" cy="228" r="7"/>
+          </g>
+        </svg>
+      </div>
+      <h1 class="cvria" aria-label="Curia"><span style="--i:0" aria-hidden="true">C</span><span style="--i:1" aria-hidden="true">V</span><span style="--i:2" aria-hidden="true">R</span><span style="--i:3" aria-hidden="true">I</span><span style="--i:4" aria-hidden="true">A</span></h1>
+      <svg class="meander" data-meander aria-hidden="true"></svg>
+      <p class="tagline">The mechanism for a software society</p>
+      <p class="for">OPEN SOURCE · FOR CLAUDE CODE</p>
+      <div class="btns">
+        <button class="btn primary" data-watch><svg><use href="#i-play"/></svg>Watch the film <span class="dur">4:37</span></button>
+        <a class="btn" href="#install">Take a seat</a>
+      </div>
+      <p class="fine">one Python file · standard library only · your estate holds the rest</p>
+    </div>
+  </div>
+  <a class="scroll-cue" href="#film" aria-label="Scroll to the film">ENTER<i></i></a>
+</header>
+
+<!-- ═══ Prologue: the film ═══ -->
+<section id="film" aria-labelledby="film-h">
+  <div class="wrap">
+    <div class="film-intro rv">
+      <p class="chapter"><span class="rule"></span>Prologus<span class="rule"></span></p>
+      <h2 class="h2" id="film-h">From factory <em>to society</em></h2>
+      <p class="lede">What a fleet of agents runs into once the code is the easy part, and how seats, offices and law answer each problem.</p>
+    </div>
+    <figure class="film rv" style="--d:.15s" id="film-fig">
+      <div class="frame">
+        <span class="c3"></span><span class="c4"></span>
+        <div class="screen">
+          <video id="film-video" preload="metadata" playsinline poster="media/curia-poster.jpg">
+            <source src="media/curia-society.mp4" type="video/mp4">
+            Your browser can't play this film. <a href="media/curia-society.mp4">Download it</a> instead.
+          </video>
+          <button class="play" data-play aria-label="Play the film, 4 minutes 37 seconds">
+            <span class="disc"><svg viewBox="0 0 20 20"><path d="M5 3.5v13l11-6.5z"/></svg></span>
+            <span class="cap">Watch the film <b>4:37</b></span>
+          </button>
+        </div>
+      </div>
+      <figcaption><span><span class="label">Curia</span> · From Factory to Society</span><span>Sound on. Captions are in the picture.</span></figcaption>
+    </figure>
+  </div>
+</section>
+
+<!-- ═══ I. The factory ═══ -->
+<section id="factory" aria-labelledby="factory-h">
+  <div class="wrap">
+    <p class="chapter rv"><span class="num">I</span><span class="rule"></span>The factory</p>
+    <h2 class="h2 rv" id="factory-h" style="--d:.08s">Run a software factory long enough, and its hardest problems <em>stop being about code.</em></h2>
+    <p class="lede rv" style="--d:.16s">First, one agent in one terminal. Then fifty, pulling work from a shared backlog. What goes wrong next is older than software.</p>
+
+    <div class="mala">
+      <article class="malum rv" style="--d:0s">
+        <span class="seal-slot" data-word="OBLIVIO" data-kind="malum"></span>
+        <div>
+          <span class="label">Malum <span class="gloss">forgetting</span></span>
+          <h3>Every session starts from nothing.</h3>
+          <p>It re-reads the same files and relearns the same conventions. As its context fills it loses the thread, and compaction swaps what it knew for a summary.</p>
+        </div>
+      </article>
+      <article class="malum rv" style="--d:.1s">
+        <span class="seal-slot" data-word="INOPIA" data-kind="malum"></span>
+        <div>
+          <span class="label">Malum <span class="gloss">want</span></span>
+          <h3>At two in the morning, the account runs dry.</h3>
+          <p>Every agent on it stops mid-task, and stays stopped until somebody wakes up to notice.</p>
+        </div>
+      </article>
+      <article class="malum rv" style="--d:0s">
+        <span class="seal-slot" data-word="MORA" data-kind="malum"></span>
+        <div>
+          <span class="label">Malum <span class="gloss">delay</span></span>
+          <h3>Agents wait, and you relay.</h3>
+          <p>An agent sits idle for an hour watching a build finish, and every message between agents has to go through you.</p>
+        </div>
+      </article>
+      <article class="malum rv" style="--d:.1s">
+        <span class="seal-slot" data-word="MOS" data-kind="malum"></span>
+        <div>
+          <span class="label">Malum <span class="gloss">custom</span></span>
+          <h3>The rules live in someone's head.</h3>
+          <p>A new agent can't know them, so it breaks them, in good faith, again and again.</p>
+        </div>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ II. Two roads ═══ -->
+<section id="roads" class="roads" aria-labelledby="roads-h">
+  <div class="wrap">
+    <p class="chapter rv"><span class="num">II</span><span class="rule"></span>Two roads<span class="rule"></span></p>
+    <h2 class="sr" id="roads-h">Chaos, or a city</h2>
+    <p class="pre rv" style="--d:.1s">Steve Yegge runs around fifty agents building a single game. Systems that run agents like his, he argues, go one of two ways: they devolve into chaos, or they evolve into cities. What decides it is the oldest coordination technology we have.</p>
+    <div class="rv" style="--d:.2s">
+      <blockquote class="q"><span class="mk">“</span>Humanity has only <span class="hi">one mature technology</span> for coordinating <span class="hi">mortal, replaceable strangers</span> via text — namely, <span class="hi">law</span>.<span class="mk">”</span></blockquote>
+      <p class="cite"><span class="rule"></span>STEVE YEGGE<span class="src">Fences, not Sandboxes · August 2026</span><span class="rule"></span></p>
+      <div class="lex" aria-hidden="true"><span style="--i:0">L</span><span style="--i:1">E</span><span style="--i:2">X</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ III. The society ═══ -->
+<section id="society" aria-labelledby="society-h">
+  <div class="wrap">
+    <p class="chapter rv"><span class="num">III</span><span class="rule"></span>The society</p>
+    <h2 class="h2 rv" id="society-h" style="--d:.08s">The step beyond the factory is <em>a software society.</em></h2>
+
+    <div class="versus" role="table" aria-label="From factory to society">
+      <div class="col-h l rv" role="columnheader">FABRICA<small>the software factory</small></div>
+      <div class="ar hide-sm" aria-hidden="true"></div>
+      <div class="col-h rv hide-sm" role="columnheader" style="--d:.1s">SOCIETAS<small>the software society</small></div>
+
+      <div class="l rv" style="--d:.1s">interchangeable workers</div><div class="ar rv" style="--d:.2s" aria-hidden="true">→</div>
+      <div class="r rv" style="--d:.9s"><svg><use href="#i-sella"/></svg>seats that outlive their sessions</div>
+
+      <div class="l rv" style="--d:.2s">sessions that forget</div><div class="ar rv" style="--d:.3s" aria-hidden="true">→</div>
+      <div class="r rv" style="--d:1s"><svg><use href="#i-scroll"/></svg>memory they write themselves</div>
+
+      <div class="l rv" style="--d:.3s">you, the go-between</div><div class="ar rv" style="--d:.4s" aria-hidden="true">→</div>
+      <div class="r rv" style="--d:1.1s"><svg><use href="#i-fasces"/></svg>offices that keep order</div>
+
+      <div class="l rv" style="--d:.4s">rules in someone's head</div><div class="ar rv" style="--d:.5s" aria-hidden="true">→</div>
+      <div class="r rv" style="--d:1.2s"><svg><use href="#i-tablet"/></svg>law with teeth</div>
+    </div>
+
+    <div class="house rv">
+      <div class="wreath"><span class="laurel-slot" data-still></span><svg class="sella" viewBox="0 0 300 260" style="color:var(--gold);width:40%"><use href="#i-sella"/></svg></div>
+      <p>Rome's senate met in a house called the Curia.</p>
+      <p class="gild">Curia builds that house for your agents.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ IV. The seat ═══ -->
+<section id="seat" aria-labelledby="seat-h">
+  <div class="wrap">
+    <div class="sec-head rv">
+      <p class="chapter"><span class="num">IV</span><span class="rule"></span>The seat</p>
+      <div class="seal-tag"><div class="words"><span class="label">Remedium</span><span class="gloss">forgetting</span></div><span class="seal-slot" data-word="OBLIVIO" data-kind="remedium"></span></div>
+    </div>
+    <div class="split">
+      <div class="copy">
+        <h2 class="h2 rv" id="seat-h">A seat is a named role that <em>outlives every session.</em></h2>
+        <div class="inscription rv" style="--d:.08s"><span class="label">Sessions are days</span><span class="label">Seats are people</span><span class="by">— Steve Yegge, Model Welfare for Agentic Engineers</span></div>
+        <p class="rv" style="--d:.14s">Each time a seat wakes, the launcher hands it a prime: its charter, what it may do without asking and what is refused, the note it left itself, its mail, and any laurels it has earned.</p>
+        <p class="rv" style="--d:.2s">A seat looks its authority up instead of probing for it. It survives sessions, accounts and model upgrades, and its memory is files it writes itself.</p>
+        <div class="rv" style="--d:.26s"><span class="cmd-line">curia launch praetor</span></div>
+      </div>
+      <div class="tablet prime rv" style="--d:.2s" id="prime">
+        <div class="glow"></div>
+        <div class="tablet-head"><span class="dots"><i></i><i></i><i></i></span>what praetor wakes up with</div>
+        <div class="term">
+          <div class="sect" style="--d:.5s"><b>## Your charter</b>You hold the api backlog: its data layer, its migrations.</div>
+          <div class="sect" style="--d:.85s"><b>## Your authority</b>May merge through the gate. Refused: push to release.</div>
+          <div class="sect" style="--d:1.2s"><b>## Your last handoff</b>Orders table migrated. Next: read the retry ruling.</div>
+          <div class="sect" style="--d:1.55s"><b>## Mail (unread)</b>quaestor: the brief is in PR 412; start there.</div>
+          <div class="sect" style="--d:1.9s"><b>## Laurels</b><span class="laurel-q">“The new import finally makes sense.”</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ V. The handoff ═══ -->
+<section id="handoff" aria-labelledby="handoff-h">
+  <div class="wrap">
+    <div class="sec-head rv">
+      <p class="chapter"><span class="num">V</span><span class="rule"></span>The handoff</p>
+      <div class="seal-tag"><div class="words"><span class="label">Remedium</span><span class="gloss">forgetting</span></div><span class="seal-slot" data-word="OBLIVIO" data-kind="remedium"></span></div>
+    </div>
+    <div class="split flip">
+      <div class="copy">
+        <h2 class="h2 rv" id="handoff-h">Hand off, <em>don't exit.</em></h2>
+        <p class="rv" style="--d:.1s">Before the context window fills, a hook tells the seat to wrap up while it is still sharp. It writes a handoff in its own words, and its next session reads that note first.</p>
+        <p class="rv" style="--d:.16s">No compaction, and no summary written by something else. A seat that works unattended keeps a journal instead: one entry per waking, and the prime reads the last few.</p>
+        <div class="rv" style="--d:.22s"><span class="cmd-line">/handoff</span></div>
+      </div>
+      <div class="handoff-stage rv" style="--d:.15s" id="handoff-demo">
+        <div class="tablet">
+          <div class="tablet-head"><span class="dots"><i></i><i></i><i></i></span>praetor · session 41<button class="replay right" type="button">replay</button></div>
+          <div class="term">
+            <span class="ln step" data-s="1"><span class="g">●</span> Migrating the orders table…</span>
+            <span class="ln step" data-s="2"><span class="v">✓</span> 14 of 31 tables · tests green</span>
+            <span class="ln"><span class="gauge" id="ctx"><span class="m">context</span><span class="bar"><i></i><span class="at" title="context_at"></span></span><span class="pct m">0%</span></span></span>
+            <span class="ln step g" data-s="3">Stop hook: context past context_at. Hand off now.</span>
+            <span class="ln step" data-s="4"><span class="m">&gt;</span> <span class="typed"></span></span>
+          </div>
+        </div>
+        <div class="note" id="note">
+          <div class="path">seats/praetor/handoff.md</div>
+          <p><b>Done</b>14 of 31 tables, tests green.</p>
+          <p><b>Next</b>the retry ruling, before the orders cut-over.</p>
+          <p><b>Watch</b>the nightly import holds a lock past midnight.</p>
+          <div class="sig">— praetor, session 41</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ VI. The chain ═══ -->
+<section id="chain" aria-labelledby="chain-h">
+  <div class="wrap">
+    <div class="sec-head rv">
+      <p class="chapter"><span class="num">VI</span><span class="rule"></span>The chain</p>
+      <div class="seal-tag"><div class="words"><span class="label">Remedium</span><span class="gloss">want</span></div><span class="seal-slot" data-word="INOPIA" data-kind="remedium"></span></div>
+    </div>
+    <div class="split">
+      <div class="copy">
+        <h2 class="h2 rv" id="chain-h">Fallback, <em>not failure.</em></h2>
+        <p class="rv" style="--d:.1s">Your accounts form a chain: a Team plan, a client's own account, an API key. Each launch takes the first with headroom, read from what Claude Code itself measures.</p>
+        <p class="rv" style="--d:.16s">If an account runs dry mid-task, the launcher ends the session and restarts the seat on the next, telling it what happened and where it left off. A looping launcher waits out a spent chain instead of dying overnight.</p>
+        <p class="kicker rv" style="--d:.22s">More work? Add accounts.</p>
+      </div>
+      <div class="tablet rv" style="--d:.15s" id="chain-demo">
+        <div class="tablet-head"><span class="dots"><i></i><i></i><i></i></span>curia launch praetor --loop<button class="replay right" type="button">replay</button></div>
+        <div class="chain-body">
+          <div class="chain-clock"><span class="t">02:11</span><small>HORA</small></div>
+          <div class="accts">
+            <div class="acct" data-k="alpha"><span class="probe"></span><div class="an">acct · alpha</div><div class="meter"><i></i></div><div class="af"><span class="st"></span><span class="pc"></span></div></div>
+            <div class="acct" data-k="beta"><span class="probe"></span><div class="an">acct · beta</div><div class="meter"><i></i></div><div class="af"><span class="st"></span><span class="pc"></span></div></div>
+            <div class="acct" data-k="gamma"><span class="probe"></span><div class="an">acct · gamma</div><div class="meter"><i></i></div><div class="af"><span class="st"></span><span class="pc"></span></div></div>
+            <div class="acct" data-k="delta"><span class="probe"></span><div class="an">acct · delta</div><div class="meter"><i></i></div><div class="af"><span class="st"></span><span class="pc"></span></div></div>
+          </div>
+          <svg class="seat-mark" viewBox="0 0 300 260" aria-hidden="true"><use href="#i-sella"/></svg>
+          <div class="chain-log term" style="padding:0"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ VII. The offices ═══ -->
+<section id="offices" aria-labelledby="offices-h">
+  <div class="wrap">
+    <div class="sec-head rv">
+      <p class="chapter"><span class="num">VII</span><span class="rule"></span>The offices</p>
+      <div class="seal-tag"><div class="words"><span class="label">Remedium</span><span class="gloss">delay</span></div><span class="seal-slot" data-word="MORA" data-kind="remedium"></span></div>
+    </div>
+    <h2 class="h2 rv" id="offices-h">Offices <em>keep order.</em></h2>
+    <p class="lede rv" style="--d:.1s">Crons watch; models act only when something needs them. No seat idles on a pull request, and you are not the relay.</p>
+
+    <div class="offices">
+      <div class="office rv" style="--d:0s">
+        <span class="medal-slot" data-medal="lictor" data-legend="LICTOR · REPORTS · NEVER WRITES"></span>
+        <h3>LICTOR</h3>
+        <p>Watches every board and reports what it finds. Changes nothing.</p>
+        <span class="cmd-line">curia lictor</span>
+      </div>
+      <div class="office rv" style="--d:.12s">
+        <span class="medal-slot" data-medal="censor" data-legend="CENSOR · WAKES ONLY WHEN RED"></span>
+        <h3>CENSOR</h3>
+        <p>Checks the integration branches, and wakes a model only where one is failing.</p>
+        <span class="cmd-line">curia censor</span>
+      </div>
+      <div class="office rv" style="--d:.24s">
+        <span class="medal-slot" data-medal="portcullis" data-legend="PORTCULLIS · A GATE · NO MODEL"></span>
+        <h3>PORTCULLIS</h3>
+        <p>A gate with no model behind it. Lands what is reviewed and green, and closes its bead.</p>
+        <span class="cmd-line">curia portcullis</span>
+      </div>
+    </div>
+
+    <div class="mailrow rv">
+      <svg viewBox="0 0 48 48" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"><path d="M6 12h36v24H6z"/><path d="M6 12l18 14 18-14"/><circle cx="36" cy="34" r="6" fill="var(--red-deep)" stroke="var(--red)"/></g></svg>
+      <p><strong>MAIL</strong>Seats leave each other notes, read at the next waking and archived by the reader, so you are not the go-between.</p>
+      <span class="cmd-line">curia mail quaestor "the brief is in the bead"</span>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ VIII. The law ═══ -->
+<section id="law" aria-labelledby="law-h">
+  <div class="wrap">
+    <div class="sec-head rv">
+      <p class="chapter"><span class="num">VIII</span><span class="rule"></span>The law</p>
+      <div class="seal-tag"><div class="words"><span class="label">Remedium</span><span class="gloss">custom</span></div><span class="seal-slot" data-word="MOS" data-kind="remedium"></span></div>
+    </div>
+    <div class="split flip">
+      <div class="copy">
+        <h2 class="h2 rv" id="law-h">Law is written down, <em>and it has teeth.</em></h2>
+        <p class="rv" style="--d:.1s">A ruling spans repos. It says whether it is in force and names what enforces it. Fences are programs the estate declares in <code>hooks.json</code>, and they refuse what the law forbids in every seat session.</p>
+        <p class="rv" style="--d:.16s">Every refusal is a line in the log. The Lictor reports which fences are idle and which are busy, because fences are distrust written down: past a point, no work is legal. What stays is the principal's call.</p>
+      </div>
+      <div class="law-stage rv" style="--d:.15s">
+        <div class="ruling-row">
+          <div class="ruling">
+            <div class="path">brain/rulings/release-branch.md</div>
+            <div># Ruling · release-branch</div>
+            <div><span class="k">status:</span> <span class="st">enforced</span></div>
+            <div><span class="k">enforced by:</span> <span class="hk">hook release-guard</span></div>
+            <div class="why">A seat never pushes to release. Releases are cut by a person.</div>
+          </div>
+          <ol class="ladder" aria-label="Ruling status">
+            <li class="past" style="--d:.5s">proposed</li>
+            <li class="past" style="--d:.75s">advisory</li>
+            <li class="past" style="--d:1s">enacted</li>
+            <li class="now" style="--d:1.25s">enforced</li>
+            <li style="--d:1.5s">retired</li>
+          </ol>
+        </div>
+        <div class="tablet">
+          <div class="tablet-head"><span class="dots"><i></i><i></i><i></i></span>praetor · a fence at work</div>
+          <div class="term">
+            <span class="ln step" style="--d:.9s"><span class="m">$</span> git push origin release</span>
+            <span class="ln step r" style="--d:1.5s">House rules: a seat never pushes to `release`, the release branch of api. Open a PR against `main` and let the gate land it; a release is the principal's to cut.</span>
+            <span class="ln step m" style="--d:2.1s">brain/fences.log  +1  seat=praetor fence=release-guard</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ IX. The night ═══ -->
+<section id="night" aria-labelledby="night-h">
+  <div class="wrap">
+    <div class="sec-head rv">
+      <p class="chapter"><span class="num">IX</span><span class="rule"></span>The night</p>
+    </div>
+    <div class="split">
+      <div class="copy">
+        <h2 class="h2 rv" id="night-h">Give an office the board, <em>and go to bed.</em></h2>
+        <p class="rv" style="--d:.1s">It works the backlog waking after waking, reading the board fresh each time and naming what is ready and what waits on a human. Given several repos, it works their boards in order.</p>
+        <p class="rv" style="--d:.16s">By morning, its handoffs are waiting for you.</p>
+      </div>
+      <div class="tablet night-demo rv" style="--d:.15s" id="night-demo">
+        <div class="tablet-head"><span class="dots"><i></i><i></i><i></i></span>the office's night<button class="replay right" type="button">replay</button></div>
+        <div class="cmd"><span class="p">$</span> <span class="typed"></span><span class="caret"></span></div>
+        <div class="nd-grid">
+          <div class="nd-stat"><div class="big" data-clock>22:00</div><div class="lbl">HORA</div><div class="sub" data-wake>waking 1</div></div>
+          <div class="beads" aria-hidden="true"></div>
+          <div class="nd-stat"><div class="big" data-spent>$0</div><div class="lbl">SPENT</div><div class="sub">of $200</div></div>
+        </div>
+        <div class="chips"><span class="lbl">Until</span><span class="chip" data-chip="clear">board clear</span><span class="chip">no progress</span><span class="chip">--until 06:30</span><span class="chip">--budget 200</span></div>
+        <div class="nd-log term" style="padding-top:6px"></div>
+      </div>
+    </div>
+    <ul class="stops">
+      <li class="rv"><b>Board clear</b><span>Nothing left but what waits on a human.</span></li>
+      <li class="rv" style="--d:.08s"><b>No progress</b><span>The board unmoved for two wakings.</span></li>
+      <li class="rv" style="--d:.16s"><b>Deadline</b><span><code>--until 06:30</code>, told to wrap up before it.</span></li>
+      <li class="rv" style="--d:.24s"><b>Budget</b><span><code>--budget 200</code> dollars of recorded spend.</span></li>
+    </ul>
+    <p class="rv" style="margin-top:26px;font-style:italic;color:var(--muted)">Every stop is mechanical. None of them needs judgment; that is the seat's, in its handoff.</p>
+  </div>
+</section>
+
+<!-- ═══ X. Mechanism, not law ═══ -->
+<section id="mechanism" aria-labelledby="mech-h">
+  <div class="wrap">
+    <p class="chapter rv"><span class="num">X</span><span class="rule"></span>Mechanism, not law</p>
+    <h2 class="h2 rv" id="mech-h" style="--d:.08s">A city's law can't be downloaded. <em>Curia ships only the machinery.</em></h2>
+    <p class="lede rv" style="--d:.16s">Your roles, your rules and your agents' memory live in a folder of your own, called an estate. Keep one per client, and they never mix.</p>
+
+    <div class="ml">
+      <div class="rv">
+        <h3 class="gild">MECHANISM</h3>
+        <p class="who">curia · shared by every estate</p>
+        <ul>
+          <li><code>bin/curia</code><span>the whole CLI, one Python file</span></li>
+          <li><code>stdlib only</code><span>Python 3.11+, nothing to install</span></li>
+          <li><code>skills/handoff</code><span>the skill every seat gets</span></li>
+          <li><code>templates/</code><span>what <code>curia init</code> lays down: shapes, charters, the fences</span></li>
+        </ul>
+      </div>
+      <div class="div" aria-hidden="true"></div>
+      <div class="rv" style="--d:.12s">
+        <h3 class="gild">LAW</h3>
+        <p class="who">your estate · yours alone</p>
+        <ul>
+          <li><code>roster.toml</code><span>who the seats are, and what each may do</span></li>
+          <li><code>repos.toml</code><span>the repos, their branches and gates</span></li>
+          <li><code>brain/</code><span>rulings, and the fences that enforce them</span></li>
+          <li><code>seats/</code><span>every seat's own charter, handoffs and journal</span></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="fence-note rv">
+      <svg aria-hidden="true"><use href="#i-fence"/></svg>
+      <div>
+        <span class="label">The mechanism fences itself</span>
+        <p>A test fails if the mechanism ever names an estate registered on the machine. It reads that denylist from the estates at test time, so the mechanism never has to contain the words it is forbidden to contain.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ XI. How it grows ═══ -->
+<section id="grow" aria-labelledby="grow-h">
+  <div class="wrap">
+    <p class="chapter rv"><span class="num">XI</span><span class="rule"></span>How it grows</p>
+    <h2 class="h2 rv" id="grow-h" style="--d:.08s">Start with one seat. <em>Grow into a society.</em></h2>
+    <p class="lede rv" style="--d:.16s">A shape is where an estate starts, not what it is. Each new seat is one entry in the roster, so the society grows with the work.</p>
+    <div class="shapes">
+      <article class="shape rv">
+        <div class="top">curia init &lt;dir&gt; <span>--shape</span> seat</div>
+        <div class="pic"><svg viewBox="0 0 300 260" style="height:78px"><use href="#i-sella"/></svg></div>
+        <div class="body"><h3>SEAT</h3><p>One seat you talk to, primed with its memory. Nothing runs unattended.</p></div>
+      </article>
+      <article class="shape rv" style="--d:.1s">
+        <div class="top">curia init &lt;dir&gt; <span>--shape</span> crew</div>
+        <div class="pic">
+          <svg viewBox="0 0 320 200" aria-hidden="true">
+            <use href="#i-sella" x="30" y="0" width="110" height="95"/><use href="#i-sella" x="180" y="0" width="110" height="95"/>
+            <use href="#i-fasces" x="62" y="116" width="62" height="62"/><use href="#i-scales" x="129" y="116" width="62" height="62"/><use href="#i-gate" x="196" y="116" width="62" height="62"/>
+          </svg>
+        </div>
+        <div class="body"><h3>CREW</h3><p>Crew seats with jurisdictions, and the Lictor, Censor and Portcullis to watch them and land their work.</p></div>
+      </article>
+      <article class="shape rv" style="--d:.2s">
+        <div class="top">curia init &lt;dir&gt; <span>--shape</span> factory</div>
+        <div class="pic">
+          <svg viewBox="0 0 320 200" aria-hidden="true">
+            <use href="#i-sella" x="115" y="0" width="90" height="78"/>
+            <g fill="none" stroke="currentColor" stroke-width="2.4" opacity=".85">
+              <rect x="40" y="112" width="44" height="30" rx="3"/><rect x="100" y="112" width="44" height="30" rx="3"/><rect x="160" y="112" width="44" height="30" rx="3"/><rect x="220" y="112" width="44" height="30" rx="3"/>
+              <rect x="70" y="156" width="44" height="30" rx="3"/><rect x="130" y="156" width="44" height="30" rx="3"/><rect x="190" y="156" width="44" height="30" rx="3"/>
+              <path d="M160 86v14M62 100h198M62 100v12M122 100v12M182 100v12M242 100v12" opacity=".6"/>
+            </g>
+          </svg>
+        </div>
+        <div class="body"><h3>FACTORY</h3><p>An office that dispatches a fleet, each worker in a worktree of its own, reaped once its branch has landed.</p></div>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ XII. Take a seat ═══ -->
+<section id="install" class="install" aria-labelledby="install-h">
+  <div class="wrap">
+    <p class="chapter rv"><span class="rule"></span><span class="num">XII</span><span class="rule"></span></p>
+    <h2 class="take gild rv" id="install-h" style="--d:.08s">Take a seat.</h2>
+    <p class="lede rv" style="--d:.16s">Clone the mechanism, put it on your path, and lay down an estate. <code>curia check</code> tells you what is left to fill in.</p>
+    <div class="reqs rv" style="--d:.2s"><span><b>Python</b> 3.11+</span><span><b>Claude Code</b></span><span><b>git</b></span></div>
+    <div class="codes">
+      <div class="tablet code rv">
+        <div class="tablet-head"><span class="dots"><i></i><i></i><i></i></span>install<button class="copy-btn" type="button" data-copy="install-code">copy</button></div>
+        <div class="term" id="install-code"><span class="ln cmd" data-clone>git clone https://curia.build/github.git curia &amp;&amp; cd curia</span>
+<span class="ln cmd">ln -s "$PWD/bin/curia" ~/.local/bin/curia</span>
+<span class="ln cmd">ln -s "$PWD/skills/handoff" ~/.claude/skills/handoff</span>
+<span class="ln c"># an estate for a new client, starting with one seat</span>
+<span class="ln cmd">curia init ~/Workspace/NewClient --name "NewClient" \</span>
+<span class="ln">    --principal "Your Name" --shape seat</span>
+<span class="ln cmd">curia check</span>
+<span class="ln cmd">curia launch &lt;seat&gt;</span></div>
+      </div>
+      <div class="tablet code rv" style="--d:.1s">
+        <div class="tablet-head"><span class="dots"><i></i><i></i><i></i></span>the daily rhythm</div>
+        <div class="term"><span class="ln cmd">curia status        <span class="c"># who is awake, whose memory is how old</span></span>
+<span class="ln cmd">curia launch &lt;seat&gt; <span class="c"># wake a seat, primed with its handoff</span></span>
+<span class="ln cmd">curia lictor        <span class="c"># the read-only report</span></span>
+<span class="ln cmd">curia portcullis    <span class="c"># land what is reviewed and green</span></span>
+<span class="ln cmd">curia reap          <span class="c"># take back worktrees that landed</span></span>
+<span class="ln cmd">curia help          <span class="c"># the vocabulary and the rhythm</span></span></div>
+      </div>
+    </div>
+    <div class="btns rv" style="margin-top:46px">
+      <a class="btn primary" data-repo="" href="#install"><svg><use href="#i-gh"/></svg>View on GitHub</a>
+      <a class="btn" data-repo="/blob/main/README.md" href="#lexicon">Read the README</a>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ Lexicon ═══ -->
+<section id="lexicon" class="lexicon" aria-labelledby="lex-h" style="padding-top:40px">
+  <div class="wrap">
+    <p class="chapter rv"><span class="rule"></span>Lexicon</p>
+    <h2 class="h2 rv" id="lex-h" style="--d:.08s">The words, <em>and what they mean.</em></h2>
+    <dl>
+      <div class="rv"><dt>Estate</dt><dd>One client's workspace: the roster, the repos, the accounts, the seats' memory and the brain. The law.</dd></div>
+      <div class="rv" style="--d:.05s"><dt>Seat</dt><dd>A named, persistent role with memory. Survives sessions and model upgrades.</dd></div>
+      <div class="rv" style="--d:.1s"><dt>Session</dt><dd>One waking of a seat.</dd></div>
+      <div class="rv"><dt>Prime</dt><dd>What a seat wakes up with: identity, colleagues, charter, last handoff, laurels, house rules.</dd></div>
+      <div class="rv" style="--d:.05s"><dt>Handoff</dt><dd>The note a seat writes on its way to sleep. The next session reads it first.</dd></div>
+      <div class="rv" style="--d:.1s"><dt>Office</dt><dd>A standing seat with a function, scheduled or on demand.</dd></div>
+      <div class="rv"><dt>Crew</dt><dd>A seat with a jurisdiction: concerns, not repos. The principal talks to it.</dd></div>
+      <div class="rv" style="--d:.05s"><dt>Fleet</dt><dd>Seats an office dispatches, each with its own worktree. Never launched directly.</dd></div>
+      <div class="rv" style="--d:.1s"><dt>Gate</dt><dd>A mechanical yes or no. The Portcullis lands what passes, and no model wakes for it.</dd></div>
+      <div class="rv"><dt>Ruling</dt><dd>Law that spans repos, with a status and what enforces it.</dd></div>
+      <div class="rv" style="--d:.05s"><dt>Fence</dt><dd>A program that refuses what the law forbids, declared in <code>hooks.json</code>.</dd></div>
+      <div class="rv" style="--d:.1s"><dt>Laurel</dt><dd>Praise for a seat's work, recorded so the seat sees it on waking.</dd></div>
+      <div class="rv"><dt>Mail</dt><dd>A note one seat leaves another, read at waking and archived by the reader.</dd></div>
+      <div class="rv" style="--d:.05s"><dt>Parked</dt><dd>A seat kept on the roster that nothing wakes. Its memory stays.</dd></div>
+      <div class="rv" style="--d:.1s"><dt>Secondment</dt><dd>A waking on a model not the seat's own. The prime says so, and the journal entry is marked.</dd></div>
+    </dl>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="wreath"><span class="laurel-slot" data-still></span><svg class="sella" viewBox="0 0 300 260" style="color:var(--gold);width:40%"><use href="#i-sella"/></svg></div>
+    <div class="fcvria gild">CVRIA</div>
+    <p class="ft">The mechanism for a software society</p>
+    <nav aria-label="Footer">
+      <a href="#film">The film</a>
+      <a href="#install">Install</a>
+      <a data-repo="" href="#install">GitHub</a>
+      <a data-repo="/blob/main/README.md" href="#lexicon">README</a>
+    </nav>
+    <p class="credit">Open source, for Claude Code. Quotations from Steve Yegge's essays at yegge.ai (2026). Curia is an independent project.</p>
+  </div>
+</footer>
+
+<script>
+(() => {
+  const $ = (s, r = document) => r.querySelector(s);
+  const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (reduce) document.documentElement.classList.add('no-motion');
+
+  // A seeded random, so a seal's rough edge is the same on every visit.
+  const rng = seed => {
+    let h = 1779033703 ^ seed.length;
+    for (const ch of seed) { h = Math.imul(h ^ ch.charCodeAt(0), 3432918353); h = (h << 13) | (h >>> 19); }
+    return () => { h = Math.imul(h ^ (h >>> 16), 2246822507); h = Math.imul(h ^ (h >>> 13), 3266489909); h ^= h >>> 16; return (h >>> 0) / 4294967296; };
+  };
+  let uid = 0;
+
+  // ── The laurel: fifteen pairs of leaves a side, grown from the base up ──
+  function laurel(R = 200) {
+    const N = 15; let s = '';
+    for (const side of [-1, 1]) {
+      for (let i = 0; i < N; i++) {
+        const t = i / (N - 1), phi = (18 + t * 128) * Math.PI / 180;
+        const x = side * -R * Math.sin(phi), y = R * Math.cos(phi);
+        const tan = Math.atan2(-Math.sin(phi), side * -Math.cos(phi));
+        for (const out of [1, -1]) {
+          const ang = tan + side * out * 0.62, L = 46 - t * 16, w = L * 0.3;
+          s += `<g transform="translate(${x.toFixed(1)},${y.toFixed(1)}) rotate(${(ang * 180 / Math.PI).toFixed(1)})"><path class="leaf" style="--i:${i}" opacity="${out === 1 ? 0.95 : 0.7}" d="M0,0 Q${L / 2},${-w} ${L},0 Q${L / 2},${w} 0,0 Z"/></g>`;
+        }
+      }
+      const a0 = 0.31, end = 146 * Math.PI / 180;
+      s += `<path class="stem" pathLength="1" d="M${(side * -R * Math.sin(a0)).toFixed(1)},${(R * Math.cos(a0)).toFixed(1)} A${R},${R} 0 0 ${side === -1 ? 0 : 1} ${(side * -R * Math.sin(end)).toFixed(1)},${(R * Math.cos(end)).toFixed(1)}"/>`;
+    }
+    s += `<path class="ribbon" d="M-18,${R + 6} Q0,${R + 22} 18,${R + 6} M-10,${R + 12} L-26,${R + 40} M10,${R + 12} L26,${R + 40}"/>`;
+    return `<svg class="laurel" viewBox="${-R - 60} ${-R - 60} ${2 * R + 120} ${2 * R + 120}" aria-hidden="true" style="overflow:visible">${s}</svg>`;
+  }
+  $$('.laurel-slot').forEach(el => { el.outerHTML = laurel(); });
+
+  // ── A running meander ──
+  $$('[data-meander]').forEach(svg => {
+    const unit = 20, n = 28, u = unit;
+    let d = `M0,${u} H${n * u} M0,0 H${n * u}`;
+    for (let i = 0; i < n; i++) { const x = i * u; d += ` M${x + u * 0.12},${u} V${u * 0.22} H${x + u * 0.84} V${u * 0.78} H${x + u * 0.38} V${u * 0.48} H${x + u * 0.6}`; }
+    svg.setAttribute('viewBox', `-2 -2 ${n * u + 4} ${u + 4}`);
+    svg.setAttribute('preserveAspectRatio', 'none');
+    svg.innerHTML = `<path d="${d}" fill="none" stroke="#d4af6a" stroke-width="2" stroke-linecap="square" vector-effect="non-scaling-stroke"/>`;
+  });
+
+  // ── A wax seal: red for an ill, gold once it is answered ──
+  function seal(word, kind) {
+    const r = rng('seal-' + word), R = 62; let d = '';
+    for (let i = 0; i < 48; i++) { const a = i / 48 * Math.PI * 2, rr = R + (r() - 0.5) * 7; d += (i ? 'L' : 'M') + (rr * Math.cos(a)).toFixed(1) + ',' + (rr * Math.sin(a)).toFixed(1); }
+    const id = 'wax' + (++uid);
+    const [face, wax] = kind === 'malum' ? ['#c4523b', '#8e2f22'] : ['#d4af6a', '#9c7738'];
+    return `<svg class="seal" viewBox="-70 -70 140 140" role="img" aria-label="${kind} seal: ${word}"><defs><radialGradient id="${id}" cx="38%" cy="32%" r="80%"><stop offset="0%" stop-color="${face}"/><stop offset="100%" stop-color="${wax}"/></radialGradient></defs><path d="${d}Z" fill="url(#${id})" opacity=".96"/><circle r="46" fill="none" stroke="rgba(0,0,0,.35)" stroke-width="3"/><circle r="42" fill="none" stroke="rgba(255,230,200,.25)" stroke-width="1.5"/><text x="1" text-anchor="middle" dominant-baseline="central" font-size="${word.length > 5 ? 16 : 21}" font-weight="700" letter-spacing="2" fill="rgba(20,8,4,.78)">${word}</text></svg>`;
+  }
+  $$('.seal-slot').forEach(el => { el.outerHTML = seal(el.dataset.word, el.dataset.kind); });
+
+  // ── Medallions for the offices: a coin, a legend round the rim, an emblem ──
+  const EMBLEM = {
+    lictor: `<g fill="none" stroke="#d4af6a" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">${[-24, -12, 0, 12, 24].map(dx => `<path d="M${100 + dx},34 V176" opacity="${dx ? 0.8 : 1}"/>`).join('')}${[62, 112, 160].map(y => `<path d="M68,${y} Q100,${y + 10} 132,${y}"/>`).join('')}<path d="M76,40 C44,26 26,44 28,62 C30,80 50,90 76,78"/><path d="M76,40 V78"/></g>`,
+    censor: `<g fill="none" stroke="#d4af6a" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"><path d="M100,36 V172 M68,172 H132 M84,172 Q100,160 116,172"/><circle cx="100" cy="32" r="6"/><g class="beam"><path d="M34,56 H166"/><g class="pan-l"><path d="M34,56 L16,116 M34,56 L52,116 M10,116 Q34,138 58,116 Z"/></g><g class="pan-r"><path d="M166,56 L148,116 M166,56 L184,116 M142,116 Q166,138 190,116 Z"/></g></g></g>`,
+    portcullis: id => `<defs><clipPath id="arch${id}"><path d="M40,178 V88 A60,60 0 0 1 160,88 V178 Z"/></clipPath></defs><g fill="none" stroke="#d4af6a" stroke-linecap="round" stroke-linejoin="round"><g clip-path="url(#arch${id})" stroke-width="4.5"><g class="grille">${[56, 78, 100, 122, 144].map(x => `<path d="M${x},20 V160 L${x - 5},150 M${x},160 L${x + 5},150"/>`).join('')}${[70, 104, 138].map(y => `<path d="M40,${y} H160"/>`).join('')}</g></g><path d="M40,178 V88 A60,60 0 0 1 160,88 V178" stroke-width="5"/><path d="M24,178 H176 M28,190 H172" stroke-width="5"/></g>`,
+  };
+  function medallion(kind, legend) {
+    const id = ++uid;
+    const dots = Array.from({ length: 72 }, (_, i) => `<circle r="2" cx="${(181 * Math.cos(i / 72 * Math.PI * 2)).toFixed(1)}" cy="${(181 * Math.sin(i / 72 * Math.PI * 2)).toFixed(1)}" fill="#9c7738"/>`).join('');
+    const em = typeof EMBLEM[kind] === 'function' ? EMBLEM[kind](id) : EMBLEM[kind];
+    return `<svg class="medal" viewBox="-200 -200 400 400" aria-hidden="true"><defs><radialGradient id="face${id}" cx="40%" cy="35%" r="75%"><stop offset="0%" stop-color="#3a2b1c"/><stop offset="100%" stop-color="#15100b"/></radialGradient><path id="rim${id}" d="M0,154 A154,154 0 1 1 0.01,154"/></defs><circle r="186" fill="url(#face${id})"/><circle r="186" fill="none" stroke="#d4af6a" stroke-width="5"/><circle r="176" fill="none" stroke="#9c7738" stroke-width="1.5"/><circle r="128" fill="none" stroke="#d4af6a" stroke-width="2.5"/>${dots}<text fill="#d4af6a" font-size="23" letter-spacing="5"><textPath href="#rim${id}" startOffset="50%" text-anchor="middle">${legend}</textPath></text><g transform="translate(-84,-88) scale(.84)">${em}</g></svg>`;
+  }
+  $$('.medal-slot').forEach(el => { el.outerHTML = medallion(el.dataset.medal, el.dataset.legend); });
+
+  // ── Where the repo lives: the meta tag, else a *.github.io address ──
+  let repo = ($('meta[name="curia:repo"]').content || '').trim().replace(/\/+$/, '');
+  if (!repo && location.hostname.endsWith('.github.io')) {
+    const owner = location.hostname.split('.')[0];
+    const name = location.pathname.split('/').filter(Boolean)[0] || 'curia';
+    repo = `https://github.com/${owner}/${name}`;
+  }
+  if (repo) {
+    $$('[data-repo]').forEach(a => { a.href = repo + a.dataset.repo; });
+    const clone = $('[data-clone]');
+    if (clone) clone.textContent = `git clone ${repo}.git curia && cd curia`;
+  } else {
+    // No known home yet (a local preview): say nothing rather than link nowhere.
+    $$('a[data-repo]').forEach(a => { a.closest('li') ? a.closest('li').remove() : a.remove(); });
+    $$('.install .btns').forEach(b => { if (!b.children.length) b.remove(); });
+  }
+
+  // ── The motes: dust in the light, cooling to starlight at night ──
+  const cv = $('#motes'), ctx = cv.getContext('2d');
+  let W = 0, H = 0, motes = [], night = 0, nightTarget = 0;
+  function sizeCanvas() {
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    W = innerWidth; H = innerHeight;
+    cv.width = W * dpr; cv.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const n = Math.round(Math.min(110, Math.max(36, W * H / 16000)));
+    motes = Array.from({ length: n }, () => ({ x: Math.random() * W, y: Math.random() * H, r: 0.6 + Math.random() * 1.9, s: 0.1 + Math.random() * 0.3, dr: (Math.random() - 0.5) * 0.25, p: Math.random() * 6.283 }));
+  }
+  function drawMotes(t) {
+    ctx.clearRect(0, 0, W, H);
+    night += (nightTarget - night) * 0.03;
+    const f = t / 16.67;
+    const rC = Math.round(242 + (223 - 242) * night), gC = Math.round(221 + (230 - 221) * night), bC = Math.round(170 + (255 - 170) * night);
+    ctx.fillStyle = `rgb(${rC},${gC},${bC})`;
+    for (const m of motes) {
+      if (!reduce) { m.y -= m.s; m.x += m.dr; if (m.y < -6) { m.y = H + 6; m.x = Math.random() * W; } }
+      const x = (((m.x + Math.sin(f / 90 + m.p) * 18) % W) + W) % W;
+      ctx.globalAlpha = (0.35 + 0.65 * Math.abs(Math.sin(f / 40 + m.p))) * (0.42 - 0.12 * night);
+      ctx.beginPath(); ctx.arc(x, m.y, m.r, 0, 6.283); ctx.fill();
+    }
+    if (!reduce) requestAnimationFrame(drawMotes);
+  }
+  sizeCanvas();
+  addEventListener('resize', () => { sizeCanvas(); if (reduce) drawMotes(0); });
+  if (reduce) drawMotes(0); else requestAnimationFrame(drawMotes);
+
+  // ── Nav: solid once the hero is behind you; the chapter you are in, lit ──
+  const nav = $('#nav');
+  const onScroll = () => nav.classList.toggle('solid', scrollY > innerHeight * 0.6);
+  addEventListener('scroll', onScroll, { passive: true }); onScroll();
+  const links = new Map($$('.nav ul a[href^="#"]').map(a => [a.getAttribute('href').slice(1), a]));
+  const chapters = $$('main section[id]');
+  const alias = { handoff: 'seat', chain: 'seat', lexicon: 'install' };
+  const spy = () => {
+    const mid = innerHeight * 0.45;
+    let cur = null;
+    for (const s of chapters) if (s.getBoundingClientRect().top <= mid) cur = s.id;
+    cur = alias[cur] || cur;
+    links.forEach((a, id) => a.classList.toggle('on', id === cur));
+  };
+  addEventListener('scroll', spy, { passive: true }); spy();
+
+  // ── The night falls on the hall ──
+  new IntersectionObserver(es => es.forEach(e => {
+    nightTarget = e.isIntersecting ? 1 : 0;
+    document.body.classList.toggle('is-night', e.isIntersecting);
+  }), { rootMargin: '-35% 0px -35% 0px' }).observe($('#night'));
+
+  // ── Reveal on scroll ──
+  const rv = new IntersectionObserver(es => es.forEach(e => {
+    if (e.isIntersecting) { e.target.classList.add('in'); rv.unobserve(e.target); }
+  }), { threshold: 0.14, rootMargin: '0px 0px -6% 0px' });
+  $$('.rv').forEach(el => rv.observe(el));
+
+  // ── The film ──
+  const fig = $('#film-fig'), video = $('#film-video');
+  const play = () => { fig.classList.add('playing'); video.controls = true; video.play().catch(() => {}); };
+  $('[data-play]').addEventListener('click', play);
+  video.addEventListener('pause', () => { if (video.ended) { fig.classList.remove('playing'); video.controls = false; video.load(); } });
+  $$('[data-watch]').forEach(b => b.addEventListener('click', () => {
+    $('#film').scrollIntoView({ behavior: reduce ? 'auto' : 'smooth', block: 'center' });
+    play();
+  }));
+
+  // ── Demos: each plays once when seen; replay runs it again ──
+  const sleep = (ms, dead) => new Promise((res, rej) => setTimeout(() => (dead() ? rej(0) : res()), ms));
+  const tween = (ms, fn, dead, ease = t => 1 - Math.pow(1 - t, 3)) => new Promise((res, rej) => {
+    const t0 = performance.now();
+    const step = now => { if (dead()) return rej(0); const t = Math.min(1, (now - t0) / ms); fn(ease(t)); t < 1 ? requestAnimationFrame(step) : res(); };
+    requestAnimationFrame(step);
+  });
+  const type = async (el, text, ms, dead) => { for (let i = 1; i <= text.length; i++) { el.textContent = text.slice(0, i); await sleep(ms, dead); } };
+  const hhmm = m => `${String(Math.floor(m / 60) % 24).padStart(2, '0')}:${String(Math.floor(m % 60)).padStart(2, '0')}`;
+  function demo(el, run, final) {
+    let token = 0;
+    const start = () => { const mine = ++token; run(() => mine !== token).catch(() => {}); };
+    const btn = $('.replay', el);
+    if (btn) btn.addEventListener('click', start);
+    if (reduce) { final(); return; }
+    const io = new IntersectionObserver(es => { if (es[0].isIntersecting) { io.disconnect(); start(); } }, { threshold: 0.45 });
+    io.observe(el);
+  }
+  const logLine = (box, html, cls = '') => { const s = document.createElement('span'); s.className = 'ln step ' + cls; s.innerHTML = html; box.appendChild(s); requestAnimationFrame(() => requestAnimationFrame(() => s.classList.add('on'))); };
+
+  // The prime fills when seen
+  new IntersectionObserver((es, o) => es.forEach(e => { if (e.isIntersecting) { e.target.classList.add('in'); o.disconnect(); } }), { threshold: 0.4 }).observe($('#prime'));
+
+  // V. The handoff
+  (() => {
+    const el = $('#handoff-demo'), steps = s => $(`[data-s="${s}"]`, el);
+    const fill = $('#ctx .bar i'), pct = $('#ctx .pct'), gauge = $('#ctx'), typed = $('.typed', el), note = $('#note');
+    const reset = () => { $$('.step', el).forEach(s => s.classList.remove('on')); fill.style.width = '0%'; pct.textContent = '0%'; gauge.classList.remove('hot'); typed.textContent = ''; note.classList.remove('on'); $$('.on', note).forEach(n => n.classList.remove('on')); };
+    const final = () => { $$('.step', el).forEach(s => s.classList.add('on')); fill.style.width = '61%'; pct.textContent = '61%'; gauge.classList.add('hot'); typed.textContent = '/handoff'; note.classList.add('on'); $$('p, .sig', note).forEach(n => n.classList.add('on')); };
+    demo(el, async dead => {
+      reset();
+      await sleep(350, dead); steps(1).classList.add('on');
+      await tween(2600, t => {
+        const v = Math.round(t * 61); fill.style.width = v + '%'; pct.textContent = v + '%';
+        if (v >= 34) steps(2).classList.add('on');
+        if (v >= 60) gauge.classList.add('hot');
+      }, dead, t => t);
+      steps(3).classList.add('on');
+      await sleep(800, dead); steps(4).classList.add('on');
+      await type(typed, '/handoff', 80, dead);
+      await sleep(550, dead); note.classList.add('on');
+      for (const n of $$('p, .sig', note)) { await sleep(450, dead); n.classList.add('on'); }
+    }, final);
+  })();
+
+  // VI. The chain
+  (() => {
+    const el = $('#chain-demo'), body = $('.chain-body', el), mark = $('.seat-mark', el), log = $('.chain-log', el), clock = $('.chain-clock .t', el);
+    const acct = k => $(`.acct[data-k="${k}"]`, el);
+    const set = (k, s, v, label) => { const a = acct(k); a.dataset.s = s; $('.meter i', a).style.setProperty('--v', v + '%'); $('.pc', a).textContent = Math.round(v) + '%'; $('.st', a).textContent = label; };
+    const moveTo = k => { const a = acct(k), b = body.getBoundingClientRect(), r = a.getBoundingClientRect(); mark.style.transform = `translate(${r.left - b.left + r.width / 2 - 19}px, ${r.top - b.top - 44}px)`; mark.dataset.at = k; };
+    const reset = () => {
+      set('alpha', 'limited', 97, 'LIMITED'); set('beta', 'full', 82, 'near limit'); set('gamma', 'active', 64, 'praetor'); set('delta', '', 12, 'headroom');
+      $$('.probe', el).forEach(p => { p.className = 'probe'; p.textContent = ''; });
+      log.innerHTML = ''; clock.textContent = '02:11'; moveTo('gamma');
+    };
+    const final = () => {
+      set('alpha', 'limited', 97, 'LIMITED'); set('beta', 'full', 82, 'near limit'); set('gamma', 'limited', 100, 'LIMITED'); set('delta', 'active', 12, 'praetor');
+      clock.textContent = '02:14'; moveTo('delta');
+      log.innerHTML = '<span class="ln r">× usage limit on gamma, mid-task · marked LIMITED</span><span class="ln v">→ relaunched on delta · told what happened, and where the transcript is</span>';
+    };
+    addEventListener('resize', () => { if (mark.dataset.at) moveTo(mark.dataset.at); });
+    reset();
+    demo(el, async dead => {
+      reset();
+      await sleep(600, dead);
+      await tween(2800, t => { const v = 64 + 36 * t; $('.meter i', acct('gamma')).style.setProperty('--v', v + '%'); $('.pc', acct('gamma')).textContent = Math.round(v) + '%'; clock.textContent = hhmm(131 + Math.floor(3 * t)); }, dead, t => t * t);
+      set('gamma', 'limited', 100, 'LIMITED');
+      logLine(log, '× usage limit on gamma, mid-task · marked LIMITED', 'r');
+      await sleep(900, dead);
+      for (const [k, ok] of [['alpha', 0], ['beta', 0], ['gamma', 0], ['delta', 1]]) {
+        const p = $('.probe', acct(k)); p.className = 'probe ' + (ok ? 'yes' : 'no'); p.textContent = ok ? '✓' : '×';
+        await sleep(360, dead);
+      }
+      moveTo('delta'); set('delta', 'active', 12, 'praetor');
+      await sleep(700, dead);
+      logLine(log, '→ relaunched on delta · told what happened, and where the transcript is', 'v');
+    }, final);
+  })();
+
+  // IX. The night
+  (() => {
+    const el = $('#night-demo'), beads = $('.beads', el), typed = $('.typed', el), log = $('.nd-log', el);
+    const clock = $('[data-clock]', el), spent = $('[data-spent]', el), wake = $('[data-wake]', el), clear = $('[data-chip="clear"]', el);
+    const CMD = ['curia', 'launch', 'praetor', '--repo api', '--everything', '--until 06:30', '--budget 200'];
+    // Each flag and its value stay on one line while the command types itself.
+    const typeCmd = async (n, dead) => {
+      const full = CMD.join(' ');
+      for (let i = 1; i <= (n ?? full.length); i++) {
+        let left = i, html = '';
+        for (const tok of CMD) { if (left <= 0) break; html += `<span style="white-space:nowrap">${tok.slice(0, left)}</span> `; left -= tok.length + 1; }
+        typed.innerHTML = html;
+        if (dead) await sleep(26, dead);
+      }
+    };
+    const WAIT = new Set([8, 21, 31]);
+    for (let i = 0; i < 36; i++) { const b = document.createElement('i'); if (WAIT.has(i)) b.className = 'wait'; beads.appendChild(b); }
+    const all = $$('i', beads), r = rng('night');
+    const order = all.map((_, i) => i).filter(i => !WAIT.has(i)).sort(() => r() - 0.5);
+    const START = 22 * 60, END = 28 * 60 + 29;
+    const reset = () => { typed.innerHTML = ''; all.forEach(b => b.classList.remove('done', 'lit')); clock.textContent = '22:00'; spent.textContent = '$0'; wake.textContent = 'waking 1'; clear.classList.remove('lit'); log.innerHTML = ''; };
+    const final = () => { typeCmd(); order.forEach(i => all[i].classList.add('done')); WAIT.forEach(i => all[i].classList.add('lit')); clock.textContent = hhmm(END); spent.textContent = '$117'; wake.textContent = 'waking 7'; clear.classList.add('lit'); log.innerHTML = '<span class="ln g">04:29 · board clear · 3 wait on a human · $117 of $200</span><span class="ln m">seven handoffs sent to you. Good morning.</span>'; };
+    demo(el, async dead => {
+      reset();
+      await sleep(300, dead);
+      await typeCmd(undefined, dead);
+      await sleep(500, dead);
+      let done = 0;
+      await tween(7000, t => {
+        clock.textContent = hhmm(START + (END - START) * t);
+        spent.textContent = '$' + Math.round(117 * t);
+        wake.textContent = 'waking ' + (1 + Math.min(6, Math.floor(t * 7)));
+        const want = Math.floor(t * order.length);
+        while (done < want) all[order[done++]].classList.add('done');
+      }, dead, t => t);
+      while (done < order.length) all[order[done++]].classList.add('done');
+      WAIT.forEach(i => all[i].classList.add('lit'));
+      await sleep(350, dead); clear.classList.add('lit');
+      logLine(log, '04:29 · board clear · 3 wait on a human · $117 of $200', 'g');
+      await sleep(700, dead);
+      logLine(log, 'seven handoffs sent to you. Good morning.', 'm');
+    }, final);
+  })();
+
+  // ── Copy the install lines, without the prompts ──
+  $$('[data-copy]').forEach(btn => btn.addEventListener('click', async () => {
+    const text = $$('.ln', document.getElementById(btn.dataset.copy)).map(l => l.textContent).join('\n');
+    try { await navigator.clipboard.writeText(text); btn.textContent = 'copied'; } catch { btn.textContent = 'select to copy'; }
+    setTimeout(() => { btn.textContent = 'copy'; }, 1800);
+  }));
+})();
+</script>
+</body>
+</html>
