@@ -4,7 +4,7 @@ https://github.com/user-attachments/assets/9d5e48b1-c447-4d05-9585-237c0170f2b7
 
 
 
-<h1 align="center">CVRIA</h1>
+<h1 align="center">Curia</h1>
 
 <p align="center"><b>The mechanism for a software society.</b><br>
 Persistent seats for your Claude Code agents: memory they write themselves,
