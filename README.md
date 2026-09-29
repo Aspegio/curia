@@ -1,6 +1,8 @@
-<p align="center">
-  <a href="https://curia.build/#film"><img src="docs/media/curia-poster.jpg" alt="Curia: From Factory to Society. Watch the film (4:37)" width="760"></a>
-</p>
+
+
+https://github.com/user-attachments/assets/9d5e48b1-c447-4d05-9585-237c0170f2b7
+
+
 
 <h1 align="center">CVRIA</h1>
 
