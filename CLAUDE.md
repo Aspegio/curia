@@ -142,9 +142,12 @@ weaken it to get green.
   being judged goes in `state`, never in the instructions, so pasted text is
   data. The one place a judgment has a consequence is where the principal
   asks for it by flag (`mail --route`, `ingest --screen`), and both do
-  nothing when unsure or unanswered. Notes are asked about only by flag too
-  (`jev_on_notes`: `ingest --jev` or `--screen`, `triage --notes --jev`): they
-  are other people's words, so an estate having jev on never sends them. The model is pinned, not an alias:
+  nothing when unsure or unanswered. Notes are asked about only on the
+  principal's word (`jev_on_notes`): by flag (`ingest --jev` or `--screen`,
+  `triage --notes --jev`), or once for the estate by `jev_notes = true` in
+  estate.toml, which `--no-jev` withdraws for one command. They are other
+  people's words, so an estate having jev on never sends them by itself, and
+  an absent or non-boolean `jev_notes` is the fence. The model is pinned, not an alias:
   thresholds (`jev_*_at`, in `THRESHOLDS`) were judged against a version.
   Every call is a line in `brain/jev/calls.log`; answers are cached a file
   per request, since jobs overlap and nothing here locks.

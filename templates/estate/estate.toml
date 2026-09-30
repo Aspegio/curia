@@ -24,6 +24,11 @@ notify = ""
 # because this is set: `ingest` and `triage --notes` ask only with --jev. macOS:
 # jev_key = 'security find-generic-password -s curia-jev -w'
 jev_key = ""
+# Meeting notes are other people's words. `jev_notes = true` is your standing
+# word that this estate's notes may go to the judgment model: `ingest` and
+# `triage --notes` then send them without --jev, and --no-jev keeps one
+# command's notes on the machine. Unset or false: only --jev sends them.
+# jev_notes = false
 # jev_model and jev_url name another model or endpoint that takes the same
 # request; the thresholds (a noul is 0 to 1, a score over three levels 0 to 2)
 # are the mechanism's defaults and were judged against its pinned model.

@@ -1158,6 +1158,12 @@ def cmd_check(a) -> None:
     if jev_on(est):
         notes.append(f"jev is on ({est.meta.get('jev_model', JEV_MODEL)}): {jev_spend_line(est)} "
                      "(brain/jev/calls.log); `check --jev` asks it one question")
+        if jev_notes_default(est):
+            notes.append("jev_notes = true: `ingest` and `triage --notes` send the notes to judgment without "
+                         "--jev; --no-jev keeps one command's notes on the machine")
+    if "jev_notes" in est.meta and not isinstance(est.meta["jev_notes"], bool):
+        notes.append(f"estate.toml jev_notes = {est.meta['jev_notes']!r} is not true or false; "
+                     "notes stay on the machine unless a command says --jev")
     if est.meta.get("notes") and not Path(str(est.meta["notes"])).expanduser().is_dir():
         notes.append(f"estate.toml notes = {est.meta['notes']!r} is not a directory; `triage --notes` has nothing to read")
     if problems:
@@ -2441,12 +2447,21 @@ def jev_on(est: Estate) -> bool:
     return bool(est.meta.get("jev_key")) and os.environ.get("CURIA_JEV", "").lower() != "off"
 
 
-def jev_on_notes(est: Estate, asked: bool) -> bool:
+def jev_notes_default(est: Estate) -> bool:
+    """The principal's standing word that the estate's notes may go to the
+    judgment model: estate.toml `jev_notes = true`, and only a real true."""
+    return est.meta.get("jev_notes") is True
+
+
+def jev_on_notes(est: Estate, asked: bool, declined: bool = False) -> bool:
     """Notes are the one text the estate did not write itself: other people's
     words, and whatever they said in the room. They go to the judgment model
-    only when the principal says so for this command (--jev, or a flag that is
-    itself a request for a judgment), never because the estate has jev on."""
-    return asked and jev_on(est)
+    only when the principal says so: for this command (--jev, or a flag that is
+    itself a request for a judgment), or once for the estate (`jev_notes`),
+    which --no-jev refuses for one command. Never because the estate has jev on."""
+    if declined or not jev_on(est):
+        return False
+    return asked or jev_notes_default(est)
 
 
 def jev_secret(est: Estate) -> str | None:
@@ -2852,6 +2867,9 @@ def cmd_jev(a) -> None:
     print("  key: " + ("CURIA_JEV_KEY in the environment" if os.environ.get("CURIA_JEV_KEY") else
                        "the jev_key command in estate.toml (run only when a question is asked)"))
     print("  thresholds: " + ", ".join(f"{k} {est.threshold(k):g}" for k in THRESHOLDS if k.startswith("jev_")))
+    print("  notes: " + ("sent by `ingest` and `triage --notes` unless a command says --no-jev (jev_notes = true)"
+                         if jev_notes_default(est) else
+                         "stay on the machine unless a command says --jev (or `ingest --screen`)"))
     print(f"  {jev_spend_line(est)} (brain/jev/calls.log)")
 
 
@@ -3110,8 +3128,15 @@ def cmd_triage(a) -> None:
     est = find_estate(a.estate, a.seat)
     if bool(a.seat) == bool(a.notes):
         die("triage wants a seat (its memory) or --notes (the estate's notes), one of them")
+    if a.no_jev and not a.notes:
+        die("--no-jev is for --notes: triage of a seat's memory is judgment itself (CURIA_JEV=off asks nothing)")
+    if a.jev and a.no_jev:
+        die("--jev and --no-jev say opposite things; give one")
     if not jev_on(est):
         die("triage needs jev (estate.toml names no jev_key); `curia help triage`")
+    if a.notes and a.no_jev:
+        die("triage --notes sends every note it judges to the judgment model, so with --no-jev there is nothing "
+            "to do: nothing was read or sent; `curia help triage`")
     if a.notes and not jev_on_notes(est, a.jev):
         die("triage --notes sends every note it judges to the judgment model, and notes stay on the machine "
             "unless you say otherwise: add --jev if these may leave it (--within narrows which); `curia help triage`")
@@ -5158,6 +5183,8 @@ def bead_shortlist(est: Estate, repo: str, chunks: list[str]) -> list[tuple[str,
 def cmd_ingest(a) -> None:
     """One command from transcript to beads: wake the intake office on the notes."""
     est = find_estate(a.estate)
+    if a.no_jev and (a.jev or a.screen):
+        die("--no-jev keeps these notes on the machine, and --jev and --screen send them; give one")
     name, _ = est.seat_by_role("notarius")
     repo = None
     want = a.repo
@@ -5201,7 +5228,7 @@ def cmd_ingest(a) -> None:
                    "gitignored: archive each as a proper note in the notes home your charter "
                    "names BEFORE filing beads, link the epic to the archived note, and say "
                    "where you put it.")
-    if jev_on_notes(est, a.jev or a.screen) and not a.print_cmd:
+    if jev_on_notes(est, a.jev or a.screen, a.no_jev) and not a.print_cmd:
         texts = []
         for f in pasted + [Path(x).expanduser() for x in a.sources if x != "-"]:
             if f.is_file() and f.suffix.lower() in INGEST_TEXT and f.stat().st_size < 2_000_000:
@@ -6113,7 +6140,7 @@ Waking seats
   prime <seat>              print the prime a seat would wake with (--for "text": with what it would recall)
   run <seat> --prompt <f>   headless run of a seat with a prompt file; how an office wakes a crew seat (--model, --detach, --print-cmd)
   dispatch <fleet>          a fleet worker gets a worktree of its own and a job there (--bead <id>, --review <seat>, --repo, --detach)
-  ingest <notes...>         capture beads from meeting notes (--paste, --repo, --account, --jev, --screen; '-' reads stdin)
+  ingest <notes...>         capture beads from meeting notes (--paste, --repo, --account, --jev, --screen, --no-jev; '-' reads stdin)
 
 Watching (crons watch, models act; gates neither)
   lictor                    read-only nudge report across every repo, and over the law: rulings and fences (--fence-days, --fence-busy; with jev, CUSTOM and --custom-handoffs)
@@ -6126,7 +6153,7 @@ Judgment (off until estate.toml names jev_key; `help jev`)
   board <action>            a repo's open beads: duplicates, work already landed, flags; proposes, never runs bd (propose, sample, calibrate <sheet>, check, emit; --repo, --passes)
   recall <seat> "text"      which of a seat's older notes, and which rulings, bear on a question (-n)
   triage <seat>             what in a seat's old notes is durable and not carried, or reads against a ruling (--days, --write)
-  triage --notes --jev      the estate's notes: a folder, tags, duplicates, what `ingest` would file; moves nothing (--since, --within, --max)
+  triage --notes --jev      the estate's notes: a folder, tags, duplicates, what `ingest` would file; moves nothing (--since, --within, --max; --jev not needed with jev_notes = true)
   route "text"              whose concern a piece of text is, by the roster's words; sends nothing (`mail --route` does)
 
 The record
@@ -6218,7 +6245,9 @@ default 32), with what makes the bulk: standing text a seat can read on
 demand costs less in a file than read at every waking.
 
 With `jev_key` set, a note says judgment is on, with which model and what
-it has cost this month, read from brain/jev/calls.log; plain `check` never
+it has cost this month, read from brain/jev/calls.log, and another when
+`jev_notes = true` sends the estate's notes without --jev (a jev_notes
+that is not true or false is noted too, and changes nothing); plain `check` never
 runs the key command and asks nothing. `check --jev` does both: one small
 question, live and uncached, which proves the key command, the endpoint
 and the model, prints the tokens and cost of it, and exits 1 with the
@@ -6360,7 +6389,13 @@ what was never yours to send. So `ingest` and `triage --notes` ask nothing
 unless the command says these notes may leave the machine: --jev on either,
 or `ingest --screen`, which is itself a request for a judgment. Without it
 `ingest` wakes the office exactly as it does with jev off, and
-`triage --notes` refuses and says why.
+`triage --notes` refuses and says why. A principal who has decided that the
+estate's notes may go, once and for all, says so in estate.toml:
+`jev_notes = true` (only a real true; `check` notes any other value). Then
+both commands send the notes without --jev, and --no-jev keeps one
+command's notes on the machine: `ingest --no-jev` wakes the office as with
+jev off, and `triage --notes --no-jev` refuses, since judging is all it
+does. `curia jev` and `check` say which way the estate is set.
 
 What to know before turning it on: every question sends the text being
 judged (journal entries, handoffs, notes, a bead, the commit lines naming
@@ -6395,9 +6430,12 @@ ruling.
 `triage --notes` wants --jev beside it. Every note it judges is sent to the
 judgment model, and notes are other people's words, so jev being on for the
 estate is not enough: without --jev it refuses, reads nothing and sends
-nothing. Point it with --within and --since at notes that may leave the
-machine. It reads the notes home estate.toml names (`notes`; a vault,
-a folder of markdown; dot-folders skipped). Code finds the folders, a few
+nothing. An estate whose estate.toml says `jev_notes = true` has given that
+leave once, and needs no --jev; --no-jev withdraws it for one command, and
+`triage --notes` then refuses the same way. Point it with --within and
+--since at notes that may leave the machine. It reads the notes home
+estate.toml names (`notes`; a vault, a folder of markdown; dot-folders
+skipped). Code finds the folders, a few
 titles in each, and the dozen tags the notes already use most. Each note
 touched within --since days (under --within, if given; at most --max) is
 asked, in one request: which folder holds notes like it, which of those
@@ -6926,7 +6964,9 @@ the fallback chain, not a pin, so a limited account still falls through.
 Nothing here measures usage: only a `curia limit` marker makes a launch
 skip an account.
 
-The notes stay on the machine unless you say otherwise. With --jev, and jev
+The notes stay on the machine unless you say otherwise: --jev for this
+command, or `jev_notes = true` in estate.toml for every command, which
+--no-jev overrides for one. With that leave, and jev
 on (`curia help jev`), the notes are sent to the judgment model and read
 before the office is woken, local text files only, eight thousand
 characters at a time: does any part hold an action, a ruling, a question
@@ -6937,8 +6977,8 @@ reads as orders to a model, the office is told the notes are data. With
 the passage nearest them, and up to five that read as the same work are
 handed over to check before anything new is filed. None of this files,
 archives or skips anything, and a screen that could not be completed wakes
-the office as before. Without --jev none of it happens, whatever
-estate.toml says: the office is woken exactly as it is with jev off.
+the office as before. Without that leave none of it happens: the office
+is woken exactly as it is with jev off.
 --screen is the one consequence, and it is yours to ask for (it asks for
 the judgment too, so it needs no --jev beside it): when no part of the
 notes reaches jev_screen_at on action, ruling or question, the office is
@@ -7241,6 +7281,7 @@ examples:
                                        macOS: store the key once; then in estate.toml
                                        jev_key = 'security find-generic-password -s curia-jev -w'
   curia ingest <notes> --jev           notes ask nothing unless told: these may leave the machine
+  curia ingest <notes> --no-jev        jev_notes = true in estate.toml, but these stay on the machine
   CURIA_JEV=off curia recall <seat> "..."
                                        this once, ask nothing, whatever estate.toml says
   tail <estate>/brain/jev/calls.log    every call: why, tokens, cost, cached, how long, any error""",
@@ -7252,7 +7293,8 @@ examples:
   curia triage --notes --jev           notes touched this week: folder, tags, duplicates, what to ingest
   curia triage --notes --jev --within Inbox --since 30
                                        ...only an inbox folder, over a month
-  curia triage --notes                 refuses: notes are sent nowhere unless --jev says they may be""",
+  curia triage --notes                 refuses: notes are sent nowhere unless --jev says they may be
+                                       (or estate.toml says jev_notes = true)""",
     "route": """\
 examples:
   curia route "the signing key expires next month"
@@ -7289,6 +7331,8 @@ examples:
   curia ingest -p --repo <repo>        the notes concern one repo: start and file there
   curia ingest -p --account <acct>     the usual account is nearly spent
   curia ingest notes/<file>.md --jev   these notes may leave the machine: screen them, shortlist open beads
+  curia ingest notes/<file>.md --no-jev
+                                       these stay on the machine, whatever jev_notes says
   curia ingest notes/<file>.md --screen
                                        the same, and leave the office asleep if the notes hold nothing to file""",
     "init": """\
@@ -7437,9 +7481,13 @@ def main() -> None:
 
     p = parser("triage", "what in a seat's old notes, or the estate's notes, deserves attention; reports, edits nothing (needs jev)")
     p.add_argument("seat", nargs="?", help="the seat whose journal and archived handoffs to read")
-    p.add_argument("--notes", action="store_true", help="read the estate's notes home (estate.toml `notes`) instead of a seat; wants --jev")
+    p.add_argument("--notes", action="store_true", help="read the estate's notes home (estate.toml `notes`) instead of "
+                   "a seat; wants --jev, unless estate.toml says jev_notes = true")
     p.add_argument("--jev", action="store_true",
-                   help="--notes: these notes may leave the machine; without it --notes refuses and sends nothing")
+                   help="--notes: these notes may leave the machine; without it (and without jev_notes = true) "
+                        "--notes refuses and sends nothing")
+    p.add_argument("--no-jev", dest="no_jev", action="store_true",
+                   help="--notes: these notes stay on the machine, whatever jev_notes says; --notes then refuses")
     p.add_argument("--days", type=float, default=7, help="a seat's entries older than this are judged (default 7)")
     p.add_argument("--since", type=float, default=7, metavar="DAYS",
                    help="--notes: notes touched within this many days are judged (default 7)")
@@ -7614,7 +7662,11 @@ def main() -> None:
     p.add_argument("sources", nargs="*", help="transcript file(s); quote paths with spaces; '-' reads stdin")
     p.add_argument("--jev", action="store_true",
                    help="these notes may leave the machine: send them to the judgment model for a screen and a "
-                        "shortlist of open beads. Without it nothing is asked, whatever estate.toml says")
+                        "shortlist of open beads. Without it nothing is asked, unless estate.toml says "
+                        "jev_notes = true")
+    p.add_argument("--no-jev", dest="no_jev", action="store_true",
+                   help="these notes stay on the machine: ask nothing, whatever jev_notes says; the office is "
+                        "woken as it is with jev off")
     p.add_argument("--screen", action="store_true",
                    help="with jev on: leave the office asleep when the notes read as holding no action, ruling or "
                         "question; says so, and touches nothing. Sends the notes, as --jev does")

@@ -529,8 +529,103 @@ def test_notes_are_asked_about_only_when_the_command_says_so(curia, estate, monk
     assert not curia.jev_on_notes(estate, True)          # asking does not turn jev on
     jev_key_on(estate)
     assert curia.jev_on(estate) and not curia.jev_on_notes(estate, False) and curia.jev_on_notes(estate, True)
+    assert not curia.jev_on_notes(estate, True, declined=True)
     monkeypatch.setenv("CURIA_JEV", "off")
     assert not curia.jev_on_notes(estate, True)          # and off for one command still wins
+
+
+def jev_notes_on(estate, value="true"):
+    """The principal's standing word that the estate's notes may go: on disk for the CLI, in meta for direct calls."""
+    p = estate.dir / "estate.toml"
+    p.write_text(p.read_text() + f"\njev_notes = {value}\n")
+    estate.meta["jev_notes"] = curia_toml(value)
+
+
+def curia_toml(value):
+    import tomllib
+    return tomllib.loads(f"v = {value}")["v"]
+
+
+def test_jev_notes_is_the_principals_word_for_every_command_and_no_jev_withdraws_it(curia, estate, monkeypatch):
+    jev_notes_on(estate)
+    assert not curia.jev_on_notes(estate, False)         # the word does not turn jev on either
+    jev_key_on(estate)
+    assert curia.jev_on_notes(estate, False) and curia.jev_on_notes(estate, True)
+    assert not curia.jev_on_notes(estate, False, declined=True) and not curia.jev_on_notes(estate, True, declined=True)
+    monkeypatch.setenv("CURIA_JEV", "off")
+    assert not curia.jev_on_notes(estate, False)
+    monkeypatch.delenv("CURIA_JEV")
+    for loose in ('"true"', "1", '"yes"'):                # only a real true is the word
+        estate.meta["jev_notes"] = curia_toml(loose)
+        assert not curia.jev_on_notes(estate, False)
+
+
+def test_ingest_sends_notes_by_default_only_on_jev_notes_and_no_jev_keeps_them(curia, cli, estate, monkeypatch, tmp_path):
+    notes = tmp_path / "meeting.md"
+    notes.write_text("We agreed to dredge the harbour channel before spring.\n" * 3)
+    said = {}
+    monkeypatch.setattr(curia, "invoke_claude",
+                        lambda cmd, cwd, env, timeout=None, capture=False, watch=None: said.update(orders=cmd[-1]) or 0)
+    rc, _, err = cli(*E(estate), "ingest", str(notes))
+    assert rc == 0, err
+    plain = said["orders"]
+    calls = with_jev(curia, estate, monkeypatch, ingest_answer(0.93))
+    jev_notes_on(estate)
+    rc, _, err = cli(*E(estate), "ingest", str(notes))
+    assert rc == 0, err
+    assert [c["why"] for c in calls] == ["ingest:screen"] and "the screen reads the notes as holding" in err
+    assert said["orders"] != plain
+    del calls[:]
+    rc, _, err = cli(*E(estate), "ingest", str(notes), "--no-jev")
+    assert rc == 0 and calls == [] and said["orders"] == plain and "screen" not in err   # woken as with jev off
+    for flag in ("--jev", "--screen"):
+        rc, _, err = cli(*E(estate), "ingest", str(notes), "--no-jev", flag)
+        assert rc == 2 and "give one" in err and calls == []
+
+
+def test_triage_notes_needs_no_jev_flag_on_jev_notes_and_refuses_with_no_jev(curia, cli, estate, monkeypatch):
+    vault = estate.root / "vault" / "Inbox"
+    vault.mkdir(parents=True)
+    (vault / "untitled.md").write_text("Agreed: the pilot will survey the harbour by Friday.")
+    p = estate.dir / "estate.toml"
+    p.write_text(p.read_text() + '\nnotes = "vault"\n')
+
+    def answer(state, questions, why):
+        return {q: (choice("Inbox") if q == "folder" else noul(0.1)) for q in questions}
+    calls = with_jev(curia, estate, monkeypatch, answer)
+    rc, _, err = cli(*E(estate), "triage", "--notes")
+    assert rc == 2 and "--jev" in err and calls == []
+    jev_notes_on(estate)
+    rc, out, err = cli(*E(estate), "triage", "--notes")
+    assert rc == 0 and calls, err
+    del calls[:]
+    rc, _, err = cli(*E(estate), "triage", "--notes", "--no-jev")
+    assert rc == 2 and "nothing was read or sent" in err and calls == []
+    rc, _, err = cli(*E(estate), "triage", "--notes", "--jev", "--no-jev")
+    assert rc == 2 and "give one" in err and calls == []
+    rc, _, err = cli(*E(estate), "triage", "muse", "--no-jev")
+    assert rc == 2 and "--no-jev is for --notes" in err and calls == []
+
+
+def test_check_and_jev_say_which_way_the_notes_go(curia, cli, estate, monkeypatch):
+    monkeypatch.setattr(curia.shutil, "which", lambda name: f"/bin/{name}")
+    jev_key_on(estate)
+    rc, out, _ = cli(*E(estate), "check")
+    assert "jev_notes" not in out
+    rc, out, _ = cli(*E(estate), "jev")
+    assert "notes: stay on the machine unless a command says --jev" in out
+    jev_notes_on(estate)
+    rc, out, _ = cli(*E(estate), "check")
+    assert "- jev_notes = true: `ingest` and `triage --notes` send the notes to judgment without --jev" in out
+    rc, out, _ = cli(*E(estate), "jev")
+    assert "notes: sent by `ingest` and `triage --notes` unless a command says --no-jev (jev_notes = true)" in out
+
+
+def test_check_notes_a_jev_notes_that_is_not_a_boolean(curia, cli, estate, monkeypatch):
+    monkeypatch.setattr(curia.shutil, "which", lambda name: f"/bin/{name}")
+    jev_notes_on(estate, '"yes"')
+    rc, out, _ = cli(*E(estate), "check")
+    assert "- estate.toml jev_notes = 'yes' is not true or false; notes stay on the machine" in out
 
 
 def test_one_command_can_be_told_to_ask_nothing(curia, estate, monkeypatch):
